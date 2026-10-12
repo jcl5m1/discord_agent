@@ -33,3 +33,13 @@ MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 
 KIMI_BIN: str = os.path.expanduser(os.environ.get("KIMI_BIN", "~/.kimi-code/bin/kimi"))
 KIMI_MODEL: str | None = os.environ.get("KIMI_MODEL") or None
+
+# --- Live web output through an existing Cloudflare Tunnel ---
+# Public base URL under which /agents/<slug>/<token>/<port>/ is reachable.
+# Empty = proxy/URL features disabled.
+PUBLIC_BASE_URL: str = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+PROXY_PORT: int = int(os.environ.get("AGENT_PROXY_PORT", "8471"))
+
+if PUBLIC_BASE_URL:
+    # Agent subprocesses can read this to know where their servers are exposed.
+    os.environ["AGENT_PUBLIC_BASE"] = PUBLIC_BASE_URL

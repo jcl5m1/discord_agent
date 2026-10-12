@@ -34,6 +34,14 @@ class Instance:
     workdir: str
     session_id: str | None = None
     last_message_id: str | None = None  # newest user message processed (catch-up marker)
+    web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
+
+    def ensure_web_token(self) -> str:
+        if not self.web_token:
+            import secrets
+
+            self.web_token = secrets.token_hex(8)
+        return self.web_token
 
 
 class InstanceManager:

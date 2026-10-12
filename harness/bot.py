@@ -13,6 +13,7 @@ import asyncio
 import io
 import logging
 import re
+import subprocess
 
 import discord
 
@@ -20,6 +21,9 @@ from . import config
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider
 from .render import render_html_to_png
+
+if config.PUBLIC_BASE_URL:
+    from . import proxy
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -42,6 +46,12 @@ store = InstanceManager()
 # Serialize turns within a channel; cap total concurrent turns globally.
 _channel_locks: dict[int, asyncio.Lock] = {}
 _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
+
+
+@client.event
+async def setup_hook() -> None:
+    if config.PUBLIC_BASE_URL:
+        await proxy.start_proxy(store)
 
 
 def _slug(name: str) -> str:
@@ -67,10 +77,50 @@ def _channel_lock(channel_id: int) -> asyncio.Lock:
     return _channel_locks[channel_id]
 
 
+def _listening_ports() -> set[int]:
+    """TCP ports currently listening on this machine (user-accessible ones)."""
+    try:
+        out = subprocess.run(
+            ["ss", "-tlnH"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return set()
+    ports = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            tail = parts[3].rsplit(":", 1)[-1]
+            if tail.isdigit():
+                port = int(tail)
+                if 1024 <= port <= 65535 and port != config.PROXY_PORT:
+                    ports.add(port)
+    return ports
+
+
+# Ports we have already posted a link for, per instance name.
+_announced_ports: dict[str, set[int]] = {}
+
+
+def _new_server_urls(inst: Instance, before: set[int], after: set[int]) -> list[str]:
+    """Build public URLs for servers that started listening during the turn."""
+    if not config.PUBLIC_BASE_URL:
+        return []
+    fresh = after - before - _announced_ports.setdefault(inst.name, set())
+    token = inst.ensure_web_token()
+    store.put(inst)
+    urls = [
+        f"{config.PUBLIC_BASE_URL}/agents/{_slug(inst.name)}/{token}/{port}/"
+        for port in sorted(fresh)
+    ]
+    _announced_ports[inst.name] |= fresh
+    return urls
+
+
 async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
     """Run one provider turn for an instance, streaming into status_msg."""
     provider = get_provider(inst.provider)
     loop = asyncio.get_running_loop()
+    ports_before = _listening_ports()
 
     buf = ""
     last_edit = 0.0
@@ -113,6 +163,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         return
 
     final_text = buf.strip() or "(no reply)"
+
+    # Live web servers: if the turn started listening on new ports, post links.
+    urls = _new_server_urls(inst, ports_before, _listening_ports())
+    if urls:
+        final_text += "\n\n🌐 live:" + "".join(f"\n<{u}>" for u in urls)
 
     # Rich output: if the reply contains a fenced ```html block, screenshot it
     # and attach the PNG (Discord can't render HTML inline).
@@ -256,6 +311,7 @@ async def cmd_new(
         provider=config.DEFAULT_PROVIDER,
         workdir=workdir or config.DEFAULT_WORKDIR,
     )
+    inst.ensure_web_token()
     store.put(inst)
     await interaction.followup.send(
         f"✅ created {channel.mention} — just chat in it. "
