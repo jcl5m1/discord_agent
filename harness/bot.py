@@ -135,7 +135,10 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     chunks = [
         final_text[i : i + DISCORD_MSG_LIMIT] for i in range(0, len(final_text), DISCORD_MSG_LIMIT)
     ]
-    await status_msg.edit(content=chunks[0], file=image)
+    if image:
+        await status_msg.edit(content=chunks[0], attachments=[image])
+    else:
+        await status_msg.edit(content=chunks[0])
     for chunk in chunks[1:]:
         await status_msg.channel.send(chunk)
     if source:
