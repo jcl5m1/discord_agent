@@ -135,6 +135,16 @@ Output formats you can choose from, in order of richness:
    image. Good for one-shot rich documents (tables, reports, layouts).
 3. Plain Markdown text — for everything else.
 Keep servers on ports {port_start}-{port_end} only; other ports are ignored.
+Annotation feedback (already wired up — nothing for you to enable): every HTML
+page you serve is automatically injected with the reviewjs annotate toolbar.
+The user can highlight text, draw, pin, and comment directly on the page;
+comments autosave server-side and follow them across devices. All comments for
+this instance accumulate in ONE file: {annotations_path}
+At the start of ANY turn that revises, updates, or follows up on a served page,
+read that file first — it is self-describing JSON whose comment entries carry
+'text' (the feedback), 'page', 'type', and 'resolved' fields. Treat unresolved
+comments as the user's change requests. After applying feedback you may tell
+the user they can mark comments resolved in the page UI.
 [end of harness capabilities]
 """
 
@@ -147,6 +157,7 @@ def _with_brief(inst: Instance, prompt: str) -> str:
         workdir=inst.workdir,
         port_start=config.AGENT_PORT_START,
         port_end=config.AGENT_PORT_END,
+        annotations_path=config.DATA_DIR / "annotations" / f"{_slug(inst.name)}.json",
     ) + "\n" + prompt
 
 
