@@ -1,0 +1,237 @@
+"""Discord bot: one channel per agent instance, one message per turn.
+
+Messages in a managed channel are forwarded to the instance's provider as a
+turn; the reply streams into a single bot message (edited in place), and the
+channel topic shows the agent's last message. If the harness (or the whole
+machine) restarts, the next message in the channel transparently resumes the
+stored provider session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+
+import discord
+
+from . import config
+from .instances import Instance, InstanceManager
+from .providers.base import get_provider
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("discord_agent")
+
+DISCORD_MSG_LIMIT = 2000
+TOPIC_LIMIT = 1024
+EDIT_INTERVAL = 1.0  # seconds between in-place message edits
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+
+client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
+
+store = InstanceManager()
+
+# Serialize turns within a channel; cap total concurrent turns globally.
+_channel_locks: dict[int, asyncio.Lock] = {}
+_global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
+
+
+def _slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-_]", "-", name.lower()).strip("-")
+    return slug or "agent"
+
+
+def _channel_lock(channel_id: int) -> asyncio.Lock:
+    if channel_id not in _channel_locks:
+        _channel_locks[channel_id] = asyncio.Lock()
+    return _channel_locks[channel_id]
+
+
+async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
+    """Run one provider turn for an instance, streaming into status_msg."""
+    provider = get_provider(inst.provider)
+    loop = asyncio.get_running_loop()
+
+    buf = ""
+    last_edit = 0.0
+    error: str | None = None
+
+    def display(text: str) -> str:
+        text = text.strip()
+        return text if len(text) <= DISCORD_MSG_LIMIT else text[: DISCORD_MSG_LIMIT - 20] + "\n…(truncated)"
+
+    try:
+        agen = provider.run_turn(inst.workdir, prompt, inst.session_id)
+        while True:
+            try:
+                event = await agen.__anext__()
+            except StopAsyncIteration:
+                break
+            if event.kind == "text":
+                buf += event.text
+            elif event.kind == "status":
+                log.info("[%s] %s", inst.name, event.text)
+            elif event.kind == "error":
+                error = event.text
+            elif event.kind == "done":
+                buf = event.text or buf
+                if event.session_id and event.session_id != inst.session_id:
+                    inst.session_id = event.session_id
+                    store.put(inst)
+                    log.info("[%s] session id captured: %s", inst.name, inst.session_id)
+
+            now = loop.time()
+            if buf and now - last_edit >= EDIT_INTERVAL:
+                last_edit = now
+                await status_msg.edit(content=display(buf) or "…")
+    except Exception:
+        log.exception("turn failed for %s", inst.name)
+        error = "harness error while running the agent (see logs)"
+
+    if error:
+        await status_msg.edit(content=f"❌ {display(error)}")
+        return
+
+    final_text = buf.strip() or "(no reply)"
+    # Final content: split across messages if over the limit.
+    chunks = [
+        final_text[i : i + DISCORD_MSG_LIMIT] for i in range(0, len(final_text), DISCORD_MSG_LIMIT)
+    ]
+    await status_msg.edit(content=chunks[0])
+    for chunk in chunks[1:]:
+        await status_msg.channel.send(chunk)
+
+    topic = final_text[:TOPIC_LIMIT]
+    try:
+        await status_msg.channel.edit(topic=topic)
+    except discord.Forbidden:
+        log.warning("missing permission to set channel topic for %s", inst.name)
+
+
+@client.event
+async def on_ready() -> None:
+    guild = discord.Object(id=config.GUILD_ID)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+    log.info("logged in as %s", client.user)
+
+
+@client.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or not message.guild:
+        return
+    inst = store.get(message.channel.id)
+    if inst is None:
+        return
+
+    async with _global_semaphore:
+        async with _channel_lock(message.channel.id):
+            async with message.channel.typing():
+                status_msg = await message.channel.send("🤔 …")
+                await _run_turn(inst, message.content, status_msg)
+    await message.add_reaction("✅")
+
+
+@tree.command(name="new", description="Create a new agent instance channel")
+@discord.app_commands.describe(
+    name="Instance name (becomes the channel name)",
+    workdir="Working directory for the agent (default: DEFAULT_WORKDIR)",
+    prompt="Optional first prompt to start the agent with",
+)
+async def cmd_new(
+    interaction: discord.Interaction, name: str, workdir: str | None = None, prompt: str | None = None
+) -> None:
+    await interaction.response.defer()
+
+    guild = interaction.guild
+    assert guild is not None
+
+    existing = store.by_name(name)
+    if existing is not None:
+        # Reopening a stopped/archived instance: new channel, same session.
+        channel = await guild.create_text_channel(
+            name=_slug(name), category=discord.Object(id=config.CATEGORY_ID)
+        )
+        existing.channel_id = channel.id
+        store.put(existing)
+        await channel.set_permissions(guild.default_role, send_messages=None)
+        await interaction.followup.send(
+            f"✅ reopened {channel.mention} — resuming session `{existing.session_id}` "
+            f"on next message."
+        )
+        if prompt:
+            await on_message_simple(channel, prompt)
+        return
+
+    channel = await guild.create_text_channel(
+        name=_slug(name), category=discord.Object(id=config.CATEGORY_ID)
+    )
+    inst = Instance(
+        channel_id=channel.id,
+        name=name,
+        provider=config.DEFAULT_PROVIDER,
+        workdir=workdir or config.DEFAULT_WORKDIR,
+    )
+    store.put(inst)
+    await interaction.followup.send(
+        f"✅ created {channel.mention} — just chat in it. "
+        f"Provider: `{inst.provider}`, workdir: `{inst.workdir}`"
+    )
+    if prompt:
+        await on_message_simple(channel, prompt)
+
+
+async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
+    inst = store.get(channel.id)
+    if inst is None:
+        return
+    async with _global_semaphore:
+        async with _channel_lock(channel.id):
+            async with channel.typing():
+                status_msg = await channel.send("🤔 …")
+                await _run_turn(inst, prompt, status_msg)
+
+
+@tree.command(name="stop", description="Close an agent channel (session is kept for resume)")
+@discord.app_commands.describe(name="Instance name to stop")
+async def cmd_stop(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer()
+    inst = store.by_name(name)
+    if not inst:
+        await interaction.followup.send(f"❌ no instance named '{name}'")
+        return
+    channel = interaction.guild.get_channel(inst.channel_id) if interaction.guild else None
+    if isinstance(channel, discord.TextChannel):
+        await channel.set_permissions(interaction.guild.default_role, send_messages=False)
+    await interaction.followup.send(
+        f"✅ stopped '{name}' — channel locked, session retained. "
+        f"Use `/new name:{name}` to reopen and resume."
+    )
+
+
+@tree.command(name="list", description="List all agent instances")
+async def cmd_list(interaction: discord.Interaction) -> None:
+    lines = [
+        f"• **{i.name}** — `{i.provider}` @ `{i.workdir}`"
+        + (f" (session: `{i.session_id}`)" if i.session_id else " (no session yet)")
+        for i in store.all()
+    ]
+    await interaction.response.send_message("\n".join(lines) or "no instances yet")
+
+
+def main() -> None:
+    if not config.BOT_TOKEN:
+        raise SystemExit("DISCORD_BOT_TOKEN is not set — copy .env.example to .env and fill it in")
+    if not config.GUILD_ID or not config.CATEGORY_ID:
+        raise SystemExit("DISCORD_GUILD_ID and DISCORD_CATEGORY_ID must be set in .env")
+    client.run(config.BOT_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
