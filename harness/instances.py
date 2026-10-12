@@ -33,6 +33,7 @@ class Instance:
     provider: str
     workdir: str
     session_id: str | None = None
+    last_message_id: str | None = None  # newest user message processed (catch-up marker)
 
 
 class InstanceManager:

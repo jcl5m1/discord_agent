@@ -120,6 +120,8 @@ async def on_ready() -> None:
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     log.info("logged in as %s", client.user)
+    for inst in store.all():
+        client.loop.create_task(_catch_up(inst))
 
 
 @client.event
@@ -129,17 +131,51 @@ async def on_message(message: discord.Message) -> None:
     inst = store.get(message.channel.id)
     if inst is None:
         return
+    await _process_user_message(inst, message)
 
+
+async def _process_user_message(inst: Instance, message: discord.Message) -> None:
     try:
         async with _global_semaphore:
             async with _channel_lock(message.channel.id):
                 async with message.channel.typing():
                     status_msg = await message.channel.send("🤔 …")
                     await _run_turn(inst, message.content, status_msg)
+        inst.last_message_id = str(message.id)
+        store.put(inst)
         await message.add_reaction("✅")
     except Exception:
         log.exception("message turn failed for %s", inst.name)
         await message.add_reaction("❌")
+
+
+async def _catch_up(inst: Instance) -> None:
+    """Process user messages that arrived while the harness was offline.
+
+    Uses the per-channel last-processed message id as a persistent marker, so
+    a restart after a crash or a long downtime still answers everything sent
+    to managed channels in the meantime.
+    """
+    if not inst.last_message_id:
+        return
+    channel = client.get_channel(inst.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        async for msg in channel.history(
+            after=discord.Object(id=int(inst.last_message_id)), oldest_first=True
+        ):
+            if msg.author.bot:
+                continue
+            await _process_user_message(inst, msg)
+    except discord.Forbidden:
+        log.warning(
+            "catch-up skipped for %s: bot lacks 'Read Message History' in that channel — "
+            "grant it to the bot's role (Server Settings → Roles → bot role)",
+            inst.name,
+        )
+    except Exception:
+        log.exception("catch-up failed for %s", inst.name)
 
 
 @tree.command(name="new", description="Create a new agent instance channel")
