@@ -39,6 +39,10 @@ KIMI_MODEL: str | None = os.environ.get("KIMI_MODEL") or None
 # Empty = proxy/URL features disabled.
 PUBLIC_BASE_URL: str = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 PROXY_PORT: int = int(os.environ.get("AGENT_PROXY_PORT", "8471"))
+# Reserved port range for agent-served web pages; the harness only announces
+# listening ports inside this range.
+AGENT_PORT_START: int = int(os.environ.get("AGENT_PORT_START", "8100"))
+AGENT_PORT_END: int = int(os.environ.get("AGENT_PORT_END", "8999"))
 
 if PUBLIC_BASE_URL:
     # Agent subprocesses can read this to know where their servers are exposed.

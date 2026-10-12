@@ -106,6 +106,7 @@ def _new_server_urls(inst: Instance, before: set[int], after: set[int]) -> list[
     if not config.PUBLIC_BASE_URL:
         return []
     fresh = after - before - _announced_ports.setdefault(inst.name, set())
+    fresh = {p for p in fresh if config.AGENT_PORT_START <= p <= config.AGENT_PORT_END}
     token = inst.ensure_web_token()
     store.put(inst)
     urls = [
@@ -114,6 +115,39 @@ def _new_server_urls(inst: Instance, before: set[int], after: set[int]) -> list[
     ]
     _announced_ports[inst.name] |= fresh
     return urls
+
+
+# Injected as a prefix on the FIRST turn of every session; the session then
+# carries it forward, so users never have to spell out serving instructions.
+_HARNESS_BRIEF = """\
+[harness capabilities — persistent for this session]
+You are running inside a Discord agent harness on a Linux host.
+Working directory: {workdir}
+Output formats you can choose from, in order of richness:
+1. Live web page — for interactive or visual output (demos, dashboards, forms,
+   games, visualizations). Build the page, then serve it in the background on a
+   port in the range {port_start}-{port_end}, detached so it outlives your turn:
+       cd <dir> && setsid nohup python3 -m http.server <port> >/dev/null 2>&1 &
+   (or any small server). The harness detects the server and posts a public URL
+   in the Discord channel automatically — you do not need to construct URLs.
+   Use this format whenever the result benefits from being interactive.
+2. Static HTML in a fenced ```html code block — the harness renders it to an
+   image. Good for one-shot rich documents (tables, reports, layouts).
+3. Plain Markdown text — for everything else.
+Keep servers on ports {port_start}-{port_end} only; other ports are ignored.
+[end of harness capabilities]
+"""
+
+
+def _with_brief(inst: Instance, prompt: str) -> str:
+    """Prepend the capability brief when this turn starts a new session."""
+    if inst.session_id is not None:
+        return prompt
+    return _HARNESS_BRIEF.format(
+        workdir=inst.workdir,
+        port_start=config.AGENT_PORT_START,
+        port_end=config.AGENT_PORT_END,
+    ) + "\n" + prompt
 
 
 async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
@@ -131,7 +165,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         return text if len(text) <= DISCORD_MSG_LIMIT else text[: DISCORD_MSG_LIMIT - 20] + "\n…(truncated)"
 
     try:
-        agen = provider.run_turn(inst.workdir, prompt, inst.session_id)
+        agen = provider.run_turn(inst.workdir, _with_brief(inst, prompt), inst.session_id)
         while True:
             try:
                 event = await agen.__anext__()
