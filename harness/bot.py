@@ -10,6 +10,7 @@ stored provider session.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 
@@ -18,6 +19,7 @@ import discord
 from . import config
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider
+from .render import render_html_to_png
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -45,6 +47,18 @@ _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
 def _slug(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-_]", "-", name.lower()).strip("-")
     return slug or "agent"
+
+
+_HTML_BLOCK_RE = re.compile(r"```html\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_html_block(text: str) -> str | None:
+    m = _HTML_BLOCK_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def _strip_html_block(text: str) -> str:
+    return _HTML_BLOCK_RE.sub("", text).strip()
 
 
 def _channel_lock(channel_id: int) -> asyncio.Lock:
@@ -99,13 +113,33 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         return
 
     final_text = buf.strip() or "(no reply)"
+
+    # Rich output: if the reply contains a fenced ```html block, screenshot it
+    # and attach the PNG (Discord can't render HTML inline).
+    image: discord.File | None = None
+    source: discord.File | None = None
+    html_block = _extract_html_block(final_text)
+    if html_block:
+        try:
+            png = await render_html_to_png(html_block)
+            image = discord.File(io.BytesIO(png), filename=f"{_slug(inst.name)}-output.png")
+            source = discord.File(
+                io.BytesIO(html_block.encode()), filename=f"{_slug(inst.name)}-output.html"
+            )
+            final_text = _strip_html_block(final_text) + "\n\n📎 rendered above · HTML source attached"
+        except Exception:
+            log.exception("HTML render failed for %s; falling back to text", inst.name)
+            final_text += "\n\n(html rendering failed — see raw source above)"
+
     # Final content: split across messages if over the limit.
     chunks = [
         final_text[i : i + DISCORD_MSG_LIMIT] for i in range(0, len(final_text), DISCORD_MSG_LIMIT)
     ]
-    await status_msg.edit(content=chunks[0])
+    await status_msg.edit(content=chunks[0], file=image)
     for chunk in chunks[1:]:
         await status_msg.channel.send(chunk)
+    if source:
+        await status_msg.channel.send(file=source)
 
     topic = final_text[:TOPIC_LIMIT]
     try:

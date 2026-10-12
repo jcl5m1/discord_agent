@@ -64,6 +64,8 @@ Discord channels and session IDs (`data/instances.json`).
 cp .env.example .env   # then fill in the three Discord values
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+# one-time: headless Chromium for rendering rich HTML output (kept repo-local)
+PLAYWRIGHT_BROWSERS_PATH=.pw-browsers .venv/bin/playwright install chromium
 ./run.sh
 ```
 
@@ -78,6 +80,17 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
 - `/list` shows all instances and their session IDs.
 - `/stop name:my-project` locks the channel; the session is kept.
 - `/new name:my-project` again reopens the channel and **resumes the same session**.
+
+### Rich output (tables, dashboards, styled HTML)
+
+Discord can't render HTML in messages. If the agent's reply contains a fenced
+` ```html ` block, the harness screenshots it with headless Chromium and posts
+the PNG inline, alongside the raw `.html` as an attachment. To use it, ask for
+what you want in an HTML code block, e.g.:
+
+> make me a styled HTML table of the files in this repo with their sizes, in a ```html block
+
+The image renders inline on mobile; tap the attachment for the source.
 
 ## Adding another provider (e.g. Claude)
 
