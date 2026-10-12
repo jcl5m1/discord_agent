@@ -121,7 +121,7 @@ async def on_ready() -> None:
     await tree.sync(guild=guild)
     log.info("logged in as %s", client.user)
     for inst in store.all():
-        client.loop.create_task(_catch_up(inst))
+        asyncio.get_running_loop().create_task(_catch_up(inst))
 
 
 @client.event
@@ -160,12 +160,14 @@ async def _catch_up(inst: Instance) -> None:
         return
     channel = client.get_channel(inst.channel_id)
     if not isinstance(channel, discord.TextChannel):
+        log.warning("catch-up: channel %s for %s not in cache", inst.channel_id, inst.name)
         return
+    log.info("catching up in #%s since message %s", channel.name, inst.last_message_id)
     try:
         async for msg in channel.history(
             after=discord.Object(id=int(inst.last_message_id)), oldest_first=True
         ):
-            if msg.author.bot:
+            if msg.type is not discord.MessageType.default or msg.author.bot:
                 continue
             await _process_user_message(inst, msg)
     except discord.Forbidden:
