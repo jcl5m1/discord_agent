@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import AsyncIterator
 
 from .. import config
@@ -30,6 +31,7 @@ class KimiProvider(AgentProvider):
         self, workdir: str, prompt: str, session_id: str | None = None
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(prompt, session_id)
+        os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=workdir,

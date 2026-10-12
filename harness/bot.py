@@ -130,12 +130,16 @@ async def on_message(message: discord.Message) -> None:
     if inst is None:
         return
 
-    async with _global_semaphore:
-        async with _channel_lock(message.channel.id):
-            async with message.channel.typing():
-                status_msg = await message.channel.send("🤔 …")
-                await _run_turn(inst, message.content, status_msg)
-    await message.add_reaction("✅")
+    try:
+        async with _global_semaphore:
+            async with _channel_lock(message.channel.id):
+                async with message.channel.typing():
+                    status_msg = await message.channel.send("🤔 …")
+                    await _run_turn(inst, message.content, status_msg)
+        await message.add_reaction("✅")
+    except Exception:
+        log.exception("message turn failed for %s", inst.name)
+        await message.add_reaction("❌")
 
 
 @tree.command(name="new", description="Create a new agent instance channel")
@@ -160,7 +164,6 @@ async def cmd_new(
         )
         existing.channel_id = channel.id
         store.put(existing)
-        await channel.set_permissions(guild.default_role, send_messages=None)
         await interaction.followup.send(
             f"✅ reopened {channel.mention} — resuming session `{existing.session_id}` "
             f"on next message."
@@ -208,7 +211,15 @@ async def cmd_stop(interaction: discord.Interaction, name: str) -> None:
         return
     channel = interaction.guild.get_channel(inst.channel_id) if interaction.guild else None
     if isinstance(channel, discord.TextChannel):
-        await channel.set_permissions(interaction.guild.default_role, send_messages=False)
+        try:
+            await channel.set_permissions(interaction.guild.default_role, send_messages=False)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"⚠️ couldn't lock the channel — the bot lacks the **Manage Roles** "
+                f"permission. Either re-invite it with that permission, or just ignore "
+                f"the channel. Session for '{name}' is retained either way."
+            )
+            return
     await interaction.followup.send(
         f"✅ stopped '{name}' — channel locked, session retained. "
         f"Use `/new name:{name}` to reopen and resume."
@@ -223,6 +234,20 @@ async def cmd_list(interaction: discord.Interaction) -> None:
         for i in store.all()
     ]
     await interaction.response.send_message("\n".join(lines) or "no instances yet")
+
+
+@tree.error
+async def on_command_error(interaction: discord.Interaction, error: Exception) -> None:
+    """Never leave a deferred interaction hanging at 'thinking...'."""
+    log.exception("command failed: %s", getattr(interaction.command, "name", "?"))
+    msg = f"❌ {str(error)[:500]}"
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg)
+        else:
+            await interaction.response.send_message(msg)
+    except discord.HTTPException:
+        pass
 
 
 def main() -> None:

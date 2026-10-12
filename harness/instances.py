@@ -67,6 +67,10 @@ class InstanceManager:
         return None
 
     def put(self, inst: Instance) -> None:
+        # Drop stale entries for the same instance (e.g. after a reopen moved
+        # it to a new channel) so by_name() never sees duplicates.
+        for cid in [c for c, i in self._instances.items() if i.name == inst.name and c != inst.channel_id]:
+            del self._instances[cid]
         self._instances[inst.channel_id] = inst
         self._save()
 

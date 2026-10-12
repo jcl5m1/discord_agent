@@ -46,7 +46,8 @@ Discord channels and session IDs (`data/instances.json`).
    - Scopes: check `bot` **and** `applications.commands`
    - Bot permissions: check **Manage Channels**, **View Channels**, **Send Messages**,
      **Manage Messages** (needed to edit the streaming reply), **Read Message History**,
-     **Change Nickname** (optional)
+     **Change Nickname** (optional). Add **Manage Roles** too if you want `/stop` to
+     lock channels (without it `/stop` still retains the session, it just can't lock).
    - Copy the generated URL at the bottom, open it in a browser, and invite the bot
      to your server.
 
