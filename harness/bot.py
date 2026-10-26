@@ -19,7 +19,7 @@ import discord
 
 from . import config
 from .instances import Instance, InstanceManager
-from .providers.base import get_provider
+from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
 
 if config.PUBLIC_BASE_URL:
@@ -176,7 +176,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         return text if len(text) <= DISCORD_MSG_LIMIT else text[: DISCORD_MSG_LIMIT - 20] + "\n…(truncated)"
 
     try:
-        agen = provider.run_turn(inst.workdir, _with_brief(inst, prompt), inst.session_id)
+        agen = provider.run_turn(
+            inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model
+        )
         while True:
             try:
                 event = await agen.__anext__()
@@ -317,14 +319,48 @@ async def _catch_up(inst: Instance) -> None:
         log.exception("catch-up failed for %s", inst.name)
 
 
+def _model_label(inst: Instance) -> str:
+    return get_provider(inst.provider).resolve_model(inst.model) or "CLI default"
+
+
+async def _model_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[discord.app_commands.Choice[str]]:
+    """Suggest model aliases for the provider being created or already in this channel."""
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    provider_name = getattr(interaction.namespace, "provider", None) or (
+        inst.provider if inst else config.DEFAULT_PROVIDER
+    )
+    try:
+        models = get_provider(provider_name).models
+    except KeyError:
+        return []
+    return [
+        discord.app_commands.Choice(name=f"{alias} ({model_id})", value=alias)
+        for alias, model_id in models.items()
+        if current.lower() in alias or current.lower() in model_id
+    ][:25]
+
+
 @tree.command(name="new", description="Create a new agent instance channel")
 @discord.app_commands.describe(
     name="Instance name (becomes the channel name)",
     workdir="Working directory for the agent (default: DEFAULT_WORKDIR)",
     prompt="Optional first prompt to start the agent with",
+    provider="Agent CLI to use (default: DEFAULT_PROVIDER)",
+    model="Model alias or ID (default: the provider's default, e.g. claude-opus-5-5)",
 )
+@discord.app_commands.choices(
+    provider=[discord.app_commands.Choice(name=p, value=p) for p in provider_names()]
+)
+@discord.app_commands.autocomplete(model=_model_autocomplete)
 async def cmd_new(
-    interaction: discord.Interaction, name: str, workdir: str | None = None, prompt: str | None = None
+    interaction: discord.Interaction,
+    name: str,
+    workdir: str | None = None,
+    prompt: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> None:
     await interaction.response.defer()
 
@@ -338,10 +374,12 @@ async def cmd_new(
             name=_slug(name), category=discord.Object(id=config.CATEGORY_ID)
         )
         existing.channel_id = channel.id
+        if model:
+            existing.model = model
         store.put(existing)
         await interaction.followup.send(
-            f"✅ reopened {channel.mention} — resuming session `{existing.session_id}` "
-            f"on next message."
+            f"✅ reopened {channel.mention} — resuming `{existing.provider}` session "
+            f"`{existing.session_id}` on next message (model: `{_model_label(existing)}`)."
         )
         if prompt:
             await on_message_simple(channel, prompt)
@@ -353,14 +391,15 @@ async def cmd_new(
     inst = Instance(
         channel_id=channel.id,
         name=name,
-        provider=config.DEFAULT_PROVIDER,
+        provider=provider or config.DEFAULT_PROVIDER,
         workdir=workdir or config.DEFAULT_WORKDIR,
+        model=model,
     )
     inst.ensure_web_token()
     store.put(inst)
     await interaction.followup.send(
         f"✅ created {channel.mention} — just chat in it. "
-        f"Provider: `{inst.provider}`, workdir: `{inst.workdir}`"
+        f"Provider: `{inst.provider}`, model: `{_model_label(inst)}`, workdir: `{inst.workdir}`"
     )
     if prompt:
         await on_message_simple(channel, prompt)
@@ -402,10 +441,31 @@ async def cmd_stop(interaction: discord.Interaction, name: str) -> None:
     )
 
 
+@tree.command(name="model", description="Show or change the model for this channel's agent")
+@discord.app_commands.describe(model="Model alias or ID (omit to show the current model)")
+@discord.app_commands.autocomplete(model=_model_autocomplete)
+async def cmd_model(interaction: discord.Interaction, model: str | None = None) -> None:
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if inst is None:
+        await interaction.response.send_message("❌ run this inside an agent channel")
+        return
+    if model is None:
+        await interaction.response.send_message(
+            f"model for **{inst.name}**: `{_model_label(inst)}`"
+        )
+        return
+    inst.model = model
+    store.put(inst)
+    await interaction.response.send_message(
+        f"✅ **{inst.name}** now uses `{_model_label(inst)}` from the next message "
+        f"(same session)."
+    )
+
+
 @tree.command(name="list", description="List all agent instances")
 async def cmd_list(interaction: discord.Interaction) -> None:
     lines = [
-        f"• **{i.name}** — `{i.provider}` @ `{i.workdir}`"
+        f"• **{i.name}** — `{i.provider}` / `{_model_label(i)}` @ `{i.workdir}`"
         + (f" (session: `{i.session_id}`)" if i.session_id else " (no session yet)")
         for i in store.all()
     ]

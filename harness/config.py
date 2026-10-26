@@ -34,6 +34,12 @@ MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 KIMI_BIN: str = os.path.expanduser(os.environ.get("KIMI_BIN", "~/.kimi-code/bin/kimi"))
 KIMI_MODEL: str | None = os.environ.get("KIMI_MODEL") or None
 
+CLAUDE_BIN: str = os.path.expanduser(os.environ.get("CLAUDE_BIN", "claude"))
+# Default model for new Claude instances (alias like "opus" or a full model ID).
+CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5"
+# Passed as --permission-mode; bypassPermissions mirrors kimi's auto policy.
+CLAUDE_PERMISSION_MODE: str = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
+
 # --- Live web output through an existing Cloudflare Tunnel ---
 # Public base URL under which /agents/<slug>/<token>/<port>/ is reachable.
 # Empty = proxy/URL features disabled.

@@ -7,7 +7,8 @@ Stored in data/instances.json (gitignored):
     "name": "my-project",
     "provider": "kimi",
     "workdir": "/home/user/code/my-project",
-    "session_id": "session_xxxx"
+    "session_id": "session_xxxx",
+    "model": "opus"
   }
 }
 
@@ -33,6 +34,7 @@ class Instance:
     provider: str
     workdir: str
     session_id: str | None = None
+    model: str | None = None  # alias or model ID; None = provider default
     last_message_id: str | None = None  # newest user message processed (catch-up marker)
     web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
 

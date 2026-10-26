@@ -39,14 +39,24 @@ class AgentProvider(ABC):
     """Interface every agent CLI integration must implement."""
 
     name: str = "abstract"
+    # Short model aliases -> full model IDs (offered as choices in Discord).
+    models: dict[str, str] = {}
+    # Model used when an instance has none set (None = the CLI's own default).
+    default_model: str | None = None
+
+    def resolve_model(self, model: str | None) -> str | None:
+        """Map an alias (or None) to the model ID passed to the CLI."""
+        model = model or self.default_model
+        return self.models.get(model, model) if model else None
 
     @abstractmethod
     def run_turn(
-        self, workdir: str, prompt: str, session_id: str | None = None
+        self, workdir: str, prompt: str, session_id: str | None = None, model: str | None = None
     ) -> AsyncIterator[StreamEvent]:
         """Run one prompt against the agent CLI.
 
         If session_id is given, resume that session; otherwise start a new one.
+        model is the instance's model (alias or ID); None means default_model.
         Yields StreamEvents as output arrives, ending with a "done" or "error"
         event whose text carries the final text / error message.
         """
@@ -72,5 +82,9 @@ def get_provider(name: str) -> AgentProvider:
     return _REGISTRY[name]()
 
 
+def provider_names() -> list[str]:
+    return sorted(_REGISTRY)
+
+
 # Import built-in providers so they self-register.
-from . import kimi  # noqa: E402,F401
+from . import claude, kimi  # noqa: E402,F401

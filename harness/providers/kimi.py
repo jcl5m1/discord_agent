@@ -18,19 +18,22 @@ from .base import AgentProvider, StreamEvent, register
 
 @register("kimi")
 class KimiProvider(AgentProvider):
-    def _build_cmd(self, prompt: str, session_id: str | None) -> list[str]:
+    default_model = config.KIMI_MODEL
+
+    def _build_cmd(self, prompt: str, session_id: str | None, model: str | None) -> list[str]:
         cmd = [config.KIMI_BIN]
         if session_id:
             cmd += ["--session", session_id]
-        if config.KIMI_MODEL:
-            cmd += ["--model", config.KIMI_MODEL]
+        model = self.resolve_model(model)
+        if model:
+            cmd += ["--model", model]
         cmd += ["-p", prompt, "--output-format", "stream-json"]
         return cmd
 
     async def run_turn(
-        self, workdir: str, prompt: str, session_id: str | None = None
+        self, workdir: str, prompt: str, session_id: str | None = None, model: str | None = None
     ) -> AsyncIterator[StreamEvent]:
-        cmd = self._build_cmd(prompt, session_id)
+        cmd = self._build_cmd(prompt, session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
         proc = await asyncio.create_subprocess_exec(
             *cmd,

@@ -1,6 +1,6 @@
 # discord_agent
 
-Chat with coding-agent instances (Kimi CLI, extensible to Claude and others) from
+Chat with coding-agent instances (Claude Code and Kimi CLI, extensible to others) from
 Discord — designed for driving agents from your phone.
 
 - **One agent instance = one Discord channel.** Create instances with `/new`; each
@@ -18,19 +18,22 @@ Discord — designed for driving agents from your phone.
 your phone (Discord)  ⇄  harness (this repo, discord.py bot)
                                 │  one subprocess per turn
                                 ▼
-                        kimi CLI (`kimi -p`, print mode)
-                                │  sessions persisted by kimi itself
+                        claude CLI (`claude -p`) or kimi CLI (`kimi -p`)
+                                │  sessions persisted by the CLI itself
                                 ▼
-                        ~/.kimi-code/sessions/
+                        ~/.claude/projects/  ·  ~/.kimi-code/sessions/
 ```
 
-Every message in a managed channel runs one `kimi -p "<message>"` invocation — or
-`kimi --session <id> -p "<message>"` once a session exists. Kimi's own session store
-is what makes instances durable; the harness just remembers the mapping between
-Discord channels and session IDs (`data/instances.json`).
+Every message in a managed channel runs one print-mode invocation — e.g.
+`claude --model claude-opus-5-5 -p "<message>"`, plus `--resume <id>` once a session
+exists (`kimi --session <id> -p ...` for Kimi). The CLI's own session store is what
+makes instances durable; the harness just remembers the mapping between Discord
+channels, providers, models and session IDs (`data/instances.json`).
 
-> **Note:** `kimi -p` runs under Kimi's `auto` permission policy (tool calls execute
-> without asking). Only point instances at working directories you trust.
+> **Note:** both providers run tools without asking — `claude -p` with
+> `--permission-mode bypassPermissions` (configurable via `CLAUDE_PERMISSION_MODE`),
+> `kimi -p` under Kimi's `auto` policy. Only point instances at working directories
+> you trust.
 
 ## Setup
 
@@ -77,7 +80,13 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
   creates `#my-project` under the agents category and optionally starts it with a prompt.
 - Just type in the channel — every message is a turn. Watch the 🤔 message update as
   the agent works. ✅ = turn finished, ❌ = error (check harness logs).
-- `/list` shows all instances and their session IDs.
+- `/new name:x provider:claude model:sonnet` picks the agent CLI and model.
+  `provider` defaults to `DEFAULT_PROVIDER`; Claude's model defaults to
+  `CLAUDE_MODEL` (`claude-opus-5-5`). Aliases `opus`, `sonnet`, `haiku`, `fable`
+  are autocompleted; any full model ID works too.
+- `/model` (inside an agent channel) shows the current model; `/model model:haiku`
+  switches it from the next message on, keeping the same session.
+- `/list` shows all instances with their provider, model and session IDs.
 - `/stop name:my-project` locks the channel; the session is kept.
 - `/new name:my-project` again reopens the channel and **resumes the same session**.
 
@@ -92,26 +101,27 @@ what you want in an HTML code block, e.g.:
 
 The image renders inline on mobile; tap the attachment for the source.
 
-## Adding another provider (e.g. Claude)
+## Adding another provider
 
-Implement the `AgentProvider` interface in `harness/providers/`:
+Implement the `AgentProvider` interface in `harness/providers/` (see `claude.py`
+for a complete example) and import it at the bottom of `base.py`:
 
 ```python
 from .base import AgentProvider, StreamEvent, register
 
-@register("claude")
-class ClaudeProvider(AgentProvider):
-    async def run_turn(self, workdir, prompt, session_id=None):
-        cmd = ["claude", "-p", prompt]
-        if session_id:
-            cmd += ["--resume", session_id]
+@register("mycli")
+class MyProvider(AgentProvider):
+    models = {"fast": "my-fast-model"}  # aliases offered in /new and /model
+    default_model = "fast"
+
+    async def run_turn(self, workdir, prompt, session_id=None, model=None):
+        cmd = ["mycli", "--model", self.resolve_model(model), "-p", prompt]
         # spawn, stream, yield StreamEvent(kind="text"/"done"/"error"),
         # and yield session_id on the "done" event
 ```
 
-Then set `DEFAULT_PROVIDER=claude` in `.env` (or extend `/new` with a provider arg).
-The harness, instance store, streaming UI, and resume-on-message logic are all
-provider-agnostic.
+It then shows up as a `provider` choice in `/new`. The harness, instance store,
+streaming UI, and resume-on-message logic are all provider-agnostic.
 
 ## Repository layout
 
@@ -122,6 +132,7 @@ harness/
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
 └── providers/
     ├── base.py         # AgentProvider ABC + registry
+    ├── claude.py       # Claude Code CLI provider
     └── kimi.py         # Kimi CLI provider
 .env.example            # all configuration keys, documented
 run.sh                  # starts the harness
