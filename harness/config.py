@@ -23,6 +23,24 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+# User-level bin dirs the agent CLIs install into (claude, muse: ~/.local/bin;
+# kimi: ~/.kimi-code/bin). systemd's default PATH has none of them, so they are
+# prepended here for this process and its agents, and baked into the unit files.
+USER_BIN_DIRS: list[str] = [
+    d for d in (
+        os.path.expanduser(p)
+        for p in (
+            "~/.local/bin", "~/.kimi-code/bin", "~/.npm-global/bin", "~/.cargo/bin", "~/bin",
+            "/usr/local/cuda/bin",  # nvcc etc. for agents doing GPU work
+        )
+    )
+    if os.path.isdir(d)
+]
+os.environ["PATH"] = os.pathsep.join(
+    [*USER_BIN_DIRS, *(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                       if p and p not in USER_BIN_DIRS)]
+)
+
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 BOT_TOKEN: str = os.environ.get("DISCORD_BOT_TOKEN", "")

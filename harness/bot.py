@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config
+from . import config, service
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -772,27 +772,13 @@ async def _run_cmd(*args: str, timeout: float = 300) -> tuple[int, str]:
     return proc.returncode or 0, out.decode("utf-8", "replace").strip()
 
 
-def _systemd_unit() -> str | None:
-    """Name of the systemd unit running this process, or None outside systemd."""
-    if not os.environ.get("INVOCATION_ID"):
-        return None
-    try:
-        with open("/proc/self/cgroup") as f:
-            for part in reversed(f.read().strip().split("/")):
-                if part.endswith(".service"):
-                    return part
-    except OSError:
-        pass
-    return None
-
-
 def _restart_harness() -> None:
     """Replace the running harness with a fresh one (after a code update).
 
     Under systemd the unit is restarted (its watchdog unit follows through
     BindsTo/Wants); otherwise the process re-execs itself in place, keeping its PID.
     """
-    unit = _systemd_unit()
+    unit = service.current_unit()
     log.warning("restarting harness (%s)", unit or "exec")
     if unit:
         # --no-block queues the job and returns before systemd kills this process.
@@ -859,6 +845,16 @@ async def cmd_update(interaction: discord.Interaction, force: bool = False) -> N
                 )
                 return
             lines.append("📦 dependencies updated")
+    # Unit-file sync runs from the new code, so template changes land with the pull.
+    rc, units_out = await _run_cmd(sys.executable, "-m", "harness.service")
+    if rc != 0:
+        await interaction.followup.send(
+            "\n".join(lines)
+            + f"\n❌ service file sync failed, not restarting:\n```\n{units_out[-1200:]}\n```"
+        )
+        return
+    if units_out.startswith("updated"):
+        lines.append(f"🛠️ systemd units {units_out}")
     lines.append("🔄 restarting…")
     await interaction.followup.send("\n".join(lines))
 
@@ -886,6 +882,13 @@ def main() -> None:
         raise SystemExit("DISCORD_BOT_TOKEN is not set — copy .env.example to .env and fill it in")
     if not config.GUILD_ID or not config.CATEGORY_ID:
         raise SystemExit("DISCORD_GUILD_ID and DISCORD_CATEGORY_ID must be set in .env")
+    # A plain `git pull` + restart (no /update) should still bring unit changes in.
+    try:
+        changed = service.sync()
+        if changed:
+            log.warning("systemd units updated: %s (env changes apply on next restart)", ", ".join(changed))
+    except Exception:
+        log.exception("systemd unit sync failed")
     client.run(config.BOT_TOKEN)
 
 

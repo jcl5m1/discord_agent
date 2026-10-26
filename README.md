@@ -104,6 +104,19 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
   if it runs under one, otherwise an in-place re-exec. It refuses while agent
   turns are running unless `force:True`, skips the restart when already up to
   date, and posts a confirmation once the new code is back online.
+  Before restarting it syncs the systemd unit files from `harness/service.py`
+  (see below), so unit changes ship with the pull.
+
+### Running as a systemd user service
+
+When the harness runs as the user unit `discord-agent.service`, it manages its
+own unit files: on every startup (and on `/update`) `harness/service.py`
+renders `discord-agent.service` and `discord-agent-watchdog.service` for this
+machine (repo path, venv, a PATH that includes `~/.local/bin` and
+`~/.kimi-code/bin`) into `~/.config/systemd/user/`, rewrites them only if they
+differ, and runs `systemctl --user daemon-reload`. A `git pull` plus restart is
+therefore all a machine needs. Run `python -m harness.service` to sync by hand.
+Started any other way (e.g. `run.sh`), the harness leaves unit files alone.
 
 ### Rich output (tables, dashboards, styled HTML)
 
