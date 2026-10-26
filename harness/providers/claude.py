@@ -11,11 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import time
 from typing import AsyncIterator
 
 from .. import config
 from .base import AgentProvider, StreamEvent, register
+
+log = logging.getLogger("discord_agent.claude")
+
+# Emit a warning when the CLI produces no stdout for this long; the turn keeps
+# waiting — the warning exists so a hung subprocess is visible in the logs.
+_STALL_WARN_INTERVAL = 300.0  # seconds
 
 
 @register("claude")
@@ -44,6 +52,7 @@ class ClaudeProvider(AgentProvider):
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(prompt, session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
+        started = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=workdir,
@@ -52,6 +61,10 @@ class ClaudeProvider(AgentProvider):
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,  # stream-json lines (tool results) can be large
         )
+        log.info(
+            "spawned claude pid=%d model=%s session=%s workdir=%s",
+            proc.pid, self.resolve_model(model), session_id or "new", workdir,
+        )
         final_text_parts: list[str] = []
         captured_session: str | None = None
         result_error: str | None = None
@@ -59,7 +72,18 @@ class ClaudeProvider(AgentProvider):
 
         assert proc.stdout is not None
         while True:
-            line = await proc.stdout.readline()
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=_STALL_WARN_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "claude pid=%d silent for %.0fs (elapsed %.0fs, %d tools so far) "
+                    "— subprocess has not exited; still waiting",
+                    proc.pid, _STALL_WARN_INTERVAL,
+                    time.monotonic() - started, tool_count,
+                )
+                continue
             if not line:
                 break
             line = line.decode("utf-8", "replace").strip()
@@ -89,6 +113,13 @@ class ClaudeProvider(AgentProvider):
         assert proc.stderr is not None
         stderr_data = await proc.stderr.read()
         returncode = await proc.wait()
+        log.info(
+            "claude pid=%d exited rc=%d after %.0fs (%d tools, %d reply chars)",
+            proc.pid, returncode, time.monotonic() - started,
+            tool_count, sum(len(p) for p in final_text_parts),
+        )
+        if stderr_data:
+            log.debug("claude pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
 
         final_text = "".join(final_text_parts).strip()
         if returncode != 0 or result_error:

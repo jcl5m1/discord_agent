@@ -84,11 +84,26 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
   `provider` defaults to `DEFAULT_PROVIDER`; Claude's model defaults to
   `CLAUDE_MODEL` (`claude-opus-5-5`). Aliases `opus`, `sonnet`, `haiku`, `fable`
   are autocompleted; any full model ID works too.
-- `/model` (inside an agent channel) shows the current model; `/model model:haiku`
-  switches it from the next message on, keeping the same session.
-- `/list` shows all instances with their provider, model and session IDs.
-- `/stop name:my-project` locks the channel; the session is kept.
+- `/model` (inside an agent channel) shows the current provider and model.
+  The `model` autocomplete lists every provider's models as `provider:alias`
+  (e.g. `claude:sonnet`, `kimi:k3`, `muse:spark-1.3`); picking one from another
+  provider switches provider too and starts a fresh session. Same-provider
+  changes keep the session.
+- `/list` shows active instances with their provider, model and session IDs;
+  stopped instances are listed separately at the bottom.
+- `/stop name:my-project` stops the instance (no replies, hidden from the active
+  list) and locks the channel; the session is kept.
+- `/resume name:my-project` brings a stopped instance back — unlocking its
+  channel, or recreating the channel if it was deleted in Discord while the
+  instance is still tracked. The session resumes on the next message.
+- `/delete name:my-project` stops the instance (if active) and removes it for
+  good — channel deleted, instance forgotten.
 - `/new name:my-project` again reopens the channel and **resumes the same session**.
+- `/update` (server admins) runs `git pull --ff-only`, reinstalls
+  `requirements.txt` if it changed, and restarts the harness — the systemd unit
+  if it runs under one, otherwise an in-place re-exec. It refuses while agent
+  turns are running unless `force:True`, skips the restart when already up to
+  date, and posts a confirmation once the new code is back online.
 
 ### Rich output (tables, dashboards, styled HTML)
 
@@ -123,6 +138,25 @@ class MyProvider(AgentProvider):
 It then shows up as a `provider` choice in `/new`. The harness, instance store,
 streaming UI, and resume-on-message logic are all provider-agnostic.
 
+## Liveness: progress updates and the watchdog
+
+While a turn runs long, the bot posts a short "⏳ still working" status in the
+channel every `STATUS_UPDATE_INTERVAL` seconds (default 30 min) with elapsed
+time, tool count, and how long since the agent last produced output.
+
+`run.sh` also starts a separate **watchdog process** (`harness/watchdog.py`)
+that can report failures the bot itself cannot. The bot rewrites
+`data/heartbeat.json` every `HEARTBEAT_INTERVAL` seconds (default 30); the
+watchdog checks it every `WATCHDOG_CHECK_INTERVAL` seconds (default 60) and
+posts an alert via the Discord REST API when:
+
+- the heartbeat is stale for more than `WATCHDOG_STALE_AFTER` seconds
+  (default 180) → 🔴 "harness appears down", then 🟢 when it recovers;
+- a turn produces no agent output for more than `WATCHDOG_STALL_AFTER` seconds
+  (default 1800) while the harness is alive → ⚠️ "agent may be hung".
+
+Alerts go to the channel with the active turn (or the last active channel).
+
 ## Repository layout
 
 ```
@@ -130,10 +164,12 @@ harness/
 ├── bot.py              # Discord client: slash commands, message turns, streaming replies
 ├── config.py           # .env loading and typed settings
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
+├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 └── providers/
     ├── base.py         # AgentProvider ABC + registry
     ├── claude.py       # Claude Code CLI provider
-    └── kimi.py         # Kimi CLI provider
+    ├── kimi.py         # Kimi CLI provider
+    └── muse.py         # Muse CLI provider (`muse exec --json`)
 .env.example            # all configuration keys, documented
-run.sh                  # starts the harness
+run.sh                  # starts the harness and the watchdog
 ```

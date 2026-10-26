@@ -35,6 +35,7 @@ class Instance:
     workdir: str
     session_id: str | None = None
     model: str | None = None  # alias or model ID; None = provider default
+    stopped: bool = False  # set by /stop, cleared when /new reopens the instance
     last_message_id: str | None = None  # newest user message processed (catch-up marker)
     web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
 

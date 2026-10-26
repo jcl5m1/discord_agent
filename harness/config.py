@@ -23,6 +23,8 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 BOT_TOKEN: str = os.environ.get("DISCORD_BOT_TOKEN", "")
 GUILD_ID: int = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 CATEGORY_ID: int = int(os.environ.get("DISCORD_CATEGORY_ID", "0"))
@@ -31,8 +33,28 @@ DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "kimi")
 DEFAULT_WORKDIR: str = os.environ.get("DEFAULT_WORKDIR", str(Path.home()))
 MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 
+# --- Liveness: in-channel progress updates + heartbeat for the watchdog ---
+# While a turn runs long, post a short "still working" status this often.
+STATUS_UPDATE_INTERVAL: int = int(os.environ.get("STATUS_UPDATE_INTERVAL", "1800"))
+# The bot rewrites data/heartbeat.json this often; the watchdog process reads it.
+HEARTBEAT_INTERVAL: int = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+HEARTBEAT_PATH: Path = DATA_DIR / "heartbeat.json"
+# Watchdog: check cadence, when the harness counts as down, when a silent turn
+# counts as stalled.
+WATCHDOG_CHECK_INTERVAL: int = int(os.environ.get("WATCHDOG_CHECK_INTERVAL", "60"))
+WATCHDOG_STALE_AFTER: int = int(os.environ.get("WATCHDOG_STALE_AFTER", "180"))
+WATCHDOG_STALL_AFTER: int = int(os.environ.get("WATCHDOG_STALL_AFTER", "1800"))
+
 KIMI_BIN: str = os.path.expanduser(os.environ.get("KIMI_BIN", "~/.kimi-code/bin/kimi"))
 KIMI_MODEL: str | None = os.environ.get("KIMI_MODEL") or None
+# Kimi's config.toml; its [models.*] tables populate /model autocomplete.
+KIMI_CONFIG: str = os.path.expanduser(os.environ.get("KIMI_CONFIG", "~/.kimi-code/config.toml"))
+
+MUSE_BIN: str = os.path.expanduser(os.environ.get("MUSE_BIN", "~/.local/bin/muse"))
+# Default model for new muse instances (empty = muse's own settings.json default).
+MUSE_MODEL: str | None = os.environ.get("MUSE_MODEL") or None
+# Passed as --reasoning-effort (empty = muse's default for the model).
+MUSE_EFFORT: str | None = os.environ.get("MUSE_EFFORT") or None
 
 CLAUDE_BIN: str = os.path.expanduser(os.environ.get("CLAUDE_BIN", "claude"))
 # Default model for new Claude instances (alias like "opus" or a full model ID).

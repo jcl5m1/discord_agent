@@ -87,4 +87,4 @@ def provider_names() -> list[str]:
 
 
 # Import built-in providers so they self-register.
-from . import claude, kimi  # noqa: E402,F401
+from . import claude, kimi, muse  # noqa: E402,F401
