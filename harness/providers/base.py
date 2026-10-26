@@ -8,6 +8,8 @@ own session store does.
 
 from __future__ import annotations
 
+import asyncio
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -49,6 +51,10 @@ class AgentProvider(ABC):
         model = model or self.default_model
         return self.models.get(model, model) if model else None
 
+    async def usage(self) -> str:
+        """Plan/quota status as the CLI reports it (shown by /usage)."""
+        return f"`{self.name}` has no usage command"
+
     @abstractmethod
     def run_turn(
         self, workdir: str, prompt: str, session_id: str | None = None, model: str | None = None
@@ -60,6 +66,28 @@ class AgentProvider(ABC):
         Yields StreamEvents as output arrives, ending with a "done" or "error"
         event whose text carries the final text / error message.
         """
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+async def run_text(*cmd: str, cwd: str | None = None, timeout: float = 60) -> str:
+    """Run a short CLI command; return its output with ANSI codes stripped.
+
+    Raises RuntimeError with the output when the command fails or times out.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"`{' '.join(cmd[:2])}` timed out after {timeout:.0f}s")
+    text = _ANSI.sub("", out.decode("utf-8", "replace")).strip()
+    if proc.returncode:
+        raise RuntimeError(text or f"exited with code {proc.returncode}")
+    return text
 
 
 _REGISTRY: dict[str, type[AgentProvider]] = {}

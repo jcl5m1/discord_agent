@@ -15,7 +15,7 @@ import time
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register
+from .base import AgentProvider, StreamEvent, register, run_text
 
 log = logging.getLogger("discord_agent.muse")
 
@@ -34,6 +34,9 @@ class MuseProvider(AgentProvider):
         "spark-1.2": "muse-spark-1.2",
     }
     default_model = config.MUSE_MODEL
+
+    async def usage(self) -> str:
+        return await run_text(config.MUSE_BIN, "usage")
 
     def _build_cmd(self, prompt: str, session_id: str | None, model: str | None) -> list[str]:
         cmd = [config.MUSE_BIN, "exec", "--json"]

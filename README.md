@@ -99,6 +99,10 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
 - `/delete name:my-project` stops the instance (if active) and removes it for
   good — channel deleted, instance forgotten.
 - `/new name:my-project` again reopens the channel and **resumes the same session**.
+- `/usage` shows plan usage / remaining quota as each CLI reports it
+  (`claude -p /usage`, `muse usage`, and kimi's account usage via a short-lived
+  local `kimi web` server). Defaults to the channel's provider, or all providers
+  outside agent channels; `provider:all` asks every CLI.
 - `/update` (server admins) runs `git pull --ff-only`, reinstalls
   `requirements.txt` if it changed, and restarts the harness — the systemd unit
   if it runs under one, otherwise an in-place re-exec. It refuses while agent

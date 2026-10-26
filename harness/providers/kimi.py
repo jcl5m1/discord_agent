@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import socket
 import time
 import tomllib
 from typing import AsyncIterator
@@ -39,6 +41,35 @@ def _load_models() -> dict[str, str]:
     return {key.rsplit("/", 1)[-1]: key for key in keys}
 
 
+_TOKEN_LINE = re.compile(r"Token:\s+(\S+)")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+async def _read_token(proc: asyncio.subprocess.Process) -> str:
+    """Read `kimi web` startup output until it prints its bearer token."""
+    assert proc.stdout is not None
+    seen = []
+    while line := await proc.stdout.readline():
+        text = _ANSI.sub("", line.decode("utf-8", "replace"))
+        seen.append(text)
+        if match := _TOKEN_LINE.search(text):
+            return match.group(1)
+    raise RuntimeError("kimi web exited before printing a token:\n" + "".join(seen)[-800:])
+
+
+def _format_usage(data: dict) -> str:
+    quota = data.get("quota") or {}
+    labels = {"limit5h": "5-hour window", "limit7d": "Weekly"}
+    lines = []
+    for key, entry in (quota.get("usages") or {}).items():
+        resets = entry.get("resetAt") or "?"
+        pct = 100 * (entry.get("usedRatio") or 0)
+        lines.append(f"{labels.get(key, key)}: {pct:.1f}% used, resets {resets}")
+    if quota.get("extraUsage"):
+        lines.append(f"Extra usage: {quota['extraUsage']}")
+    return "\n".join(lines) or f"no quota data ({data.get('kind', 'unknown')})"
+
+
 @register("kimi")
 class KimiProvider(AgentProvider):
     default_model = config.KIMI_MODEL
@@ -46,6 +77,41 @@ class KimiProvider(AgentProvider):
     @property
     def models(self) -> dict[str, str]:  # re-read so new kimi models show up live
         return _load_models()
+
+    async def usage(self) -> str:
+        """Quota from kimi's local web server, the only place the CLI exposes it.
+
+        A throwaway `kimi web` is started on a free loopback port, asked for
+        /api/v1/oauth/usage with the bearer token it prints, then stopped.
+        """
+        import aiohttp
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        proc = await asyncio.create_subprocess_exec(
+            config.KIMI_BIN, "web", "--no-open", "--port", str(port),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            token = await asyncio.wait_for(_read_token(proc), timeout=30)
+            async with aiohttp.ClientSession() as http:
+                async with http.get(
+                    f"http://127.0.0.1:{port}/api/v1/oauth/usage",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    body = await resp.json(content_type=None)
+        finally:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    proc.kill()
+        if body.get("code") != 0:
+            raise RuntimeError(f"kimi usage request failed: {body.get('msg')}")
+        return _format_usage(body.get("data") or {})
 
     def _build_cmd(self, prompt: str, session_id: str | None, model: str | None) -> list[str]:
         cmd = [config.KIMI_BIN]

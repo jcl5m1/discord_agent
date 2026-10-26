@@ -738,6 +738,33 @@ async def cmd_model(
     )
 
 
+async def _provider_usage(name: str) -> str:
+    try:
+        text = await get_provider(name).usage()
+    except Exception as e:
+        log.warning("usage for %s failed: %s", name, e)
+        text = f"❌ {e}"
+    return f"**{name}**\n```\n{text[:1700]}\n```"
+
+
+@tree.command(name="usage", description="Show plan usage / remaining quota as the agent CLI reports it")
+@discord.app_commands.describe(
+    provider="Which CLI to ask (default: this channel's provider, or all outside agent channels)"
+)
+@discord.app_commands.choices(
+    provider=[discord.app_commands.Choice(name=p, value=p) for p in [*provider_names(), "all"]]
+)
+async def cmd_usage(interaction: discord.Interaction, provider: str | None = None) -> None:
+    await interaction.response.defer()
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if provider is None:
+        provider = inst.provider if inst else "all"
+    names = provider_names() if provider == "all" else [provider]
+    log.info("/usage by %s: %s", interaction.user, ", ".join(names))
+    for block in await asyncio.gather(*(_provider_usage(n) for n in names)):
+        await interaction.followup.send(block)
+
+
 @tree.command(name="list", description="List all agent instances")
 async def cmd_list(interaction: discord.Interaction) -> None:
     active = [i for i in store.all() if not i.stopped and _channel_alive(i)]

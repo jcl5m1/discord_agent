@@ -17,7 +17,7 @@ import time
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register
+from .base import AgentProvider, StreamEvent, register, run_text
 
 log = logging.getLogger("discord_agent.claude")
 
@@ -36,6 +36,10 @@ class ClaudeProvider(AgentProvider):
         "fable": "claude-fable-5-1",
     }
     default_model = config.CLAUDE_MODEL
+
+    async def usage(self) -> str:
+        # Print mode answers the built-in /usage itself; no model call is made.
+        return await run_text(config.CLAUDE_BIN, "-p", "/usage", cwd=os.path.expanduser("~"))
 
     def _build_cmd(self, prompt: str, session_id: str | None, model: str | None) -> list[str]:
         cmd = [config.CLAUDE_BIN]
