@@ -11,17 +11,28 @@ dispatches each request to the agent server by path:
 The per-instance token (stored in the instance record) keeps random people on
 the internet from walking the URL space. HTTP only — websocket upgrades
 (vite-style live reload) are not proxied in v1.
+
+It also hosts the external-trigger endpoint (see harness/triggers.py), under
+the same tunnel path:
+
+    POST /agents/_triggers/<name>   (Authorization: Bearer <trigger token>)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from . import config
+from . import config, triggers
 from .instances import InstanceManager
+
+# bot callback: (trigger, event) -> result dict for the HTTP response
+OnTrigger = Callable[[triggers.Trigger, dict], Awaitable[dict]]
+_MAX_EVENT_BYTES = 64 * 1024
 
 log = logging.getLogger("discord_agent.proxy")
 
@@ -102,9 +113,47 @@ def _inject_shim(html: bytes, slug: str, token: str) -> bytes:
 _runner: web.AppRunner | None = None
 
 
-def build_app(store: InstanceManager) -> web.Application:
+async def _trigger(request: web.Request) -> web.Response:
+    """Fire a trigger: authenticate, rate-limit/dedupe, hand the event to the bot."""
+    on_trigger: OnTrigger | None = request.app.get("on_trigger")
+    if request.method != "POST":
+        return web.json_response({"error": "POST only"}, status=405)
+    tstore = triggers.TriggerStore()  # re-read: CLI edits apply without a restart
+    trig = tstore.get(request.match_info["name"])
+    # Same answer for unknown trigger and bad token (no name probing).
+    if trig is None or not triggers.check_token(trig, request.headers.get("Authorization")):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    if on_trigger is None:
+        return web.json_response({"error": "triggers not available"}, status=503)
+    if request.content_length and request.content_length > _MAX_EVENT_BYTES:
+        return web.json_response({"error": "event too large"}, status=413)
+    raw = await request.read()
+    if len(raw) > _MAX_EVENT_BYTES:
+        return web.json_response({"error": "event too large"}, status=413)
+    try:
+        event = json.loads(raw or b"{}")
+    except ValueError:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(event, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+    reason = triggers.admit(trig, event)
+    tstore.put(trig)  # persist rate-limit / dedupe bookkeeping
+    if reason:
+        log.info("trigger %s dropped: %s", trig.name, reason)
+        return web.json_response({"status": "dropped", "reason": reason}, status=200)
+    try:
+        result = await on_trigger(trig, event)
+    except Exception:
+        log.exception("trigger %s failed", trig.name)
+        return web.json_response({"error": "harness error"}, status=500)
+    log.info("trigger %s fired: %s", trig.name, result)
+    return web.json_response(result, status=202 if result.get("status") == "started" else 200)
+
+
+def build_app(store: InstanceManager, on_trigger: OnTrigger | None = None) -> web.Application:
     app = web.Application()
     app["store"] = store
+    app["on_trigger"] = on_trigger
 
     async def handle(request: web.Request) -> web.StreamResponse:
         m = _PATH_RE.match(request.path)
@@ -157,6 +206,7 @@ def build_app(store: InstanceManager) -> web.Application:
             log.exception("proxy to %s failed", url)
             return web.Response(status=502, text="agent server not reachable")
 
+    app.router.add_route("*", "/agents/_triggers/{name}", _trigger)
     app.router.add_route("*", "/agents/{slug}/{token}/__annotate_blob", _annotate_blob)
     app.router.add_route("*", "/agents/{tail:.*}", handle)
 
@@ -176,9 +226,9 @@ def _slug(name: str) -> str:
     return s or "agent"
 
 
-async def start_proxy(store: InstanceManager) -> None:
+async def start_proxy(store: InstanceManager, on_trigger: OnTrigger | None = None) -> None:
     global _runner
-    app = build_app(store)
+    app = build_app(store, on_trigger)
     _runner = web.AppRunner(app)
     await _runner.setup()
     site = web.TCPSite(_runner, "127.0.0.1", config.PROXY_PORT)

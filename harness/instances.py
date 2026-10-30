@@ -59,6 +59,7 @@ class Instance:
     last_message_id: str | None = None  # newest user message processed (catch-up marker)
     web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
     wa_group: str | None = None  # WhatsApp group JID user part (mirror chat), if any
+    origin: str | None = None  # "trigger:<name>" when created by an external trigger
 
     def __post_init__(self) -> None:
         # Subprocesses get workdir as cwd verbatim, so "~" must be expanded here

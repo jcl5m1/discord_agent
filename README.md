@@ -184,6 +184,46 @@ On first run, earlier reboots are backfilled from the journal.
 downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
 downtime only counts while the machine was up and monitored.
 
+## External triggers (CI failures, GitHub Actions, webhooks)
+
+Other systems can start or continue an agent turn by calling a token-protected
+endpoint on the same public URL the agent web servers use:
+
+```bash
+curl -fsS -X POST "$PUBLIC_BASE_URL/agents/_triggers/<name>" \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"workflow": "CI", "url": "https://github.com/...", "sha": "abc123"}'
+```
+
+Each trigger names an **instance** (a template filled from the event, e.g.
+`ci-{repo}`, or a fixed existing name) and a **prompt** template. Triggered
+instances are ordinary instances:
+
+- **existing, live instance** — the event runs as its next turn (the session resumes);
+- **missing instance** — a channel is created in the agents category and a new
+  session starts (trigger's workdir/provider/model, else the defaults), exactly like `/new`;
+- **channel deleted** — recreated, like `/resume`;
+- **`/stop`ped instance** — skipped (default), or resumed if the trigger has `if_stopped: resume`.
+
+So `/stop`, `/resume`, `/delete`, `/model` and `/list` all work on them. The
+channel shows a `⚡ trigger … fired` note before the turn.
+
+Manage triggers on the host (the token is printed once; only its SHA-256 is
+stored in `data/triggers.json`); `/triggers` lists them in Discord:
+
+```bash
+.venv/bin/python -m harness.triggers add ci-myrepo \
+    --instance "ci-myrepo" --workdir ~/code/myrepo --provider claude \
+    --prompt "The {workflow} run on {branch} failed: {url}. Diagnose and fix, or ask me." \
+    --dedupe "{workflow}:{sha}" --max-per-hour 6
+.venv/bin/python -m harness.triggers list | rotate <name> | remove <name>
+```
+
+Safety: unknown trigger and bad token both get 401; events are capped at 64 KB;
+each trigger is rate-limited and can de-duplicate on a key; event values are
+inserted as single, length-capped lines and the full event is appended as a
+fenced block that the agent is told is untrusted data, not instructions.
+
 ## Adding another provider
 
 Implement the `AgentProvider` interface in `harness/providers/` (see `claude.py`

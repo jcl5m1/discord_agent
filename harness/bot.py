@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config, service, uptime
+from . import config, service, triggers, uptime
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -78,7 +78,7 @@ def _fmt_duration(seconds: float) -> str:
 async def setup_hook() -> None:
     global wa
     if config.PUBLIC_BASE_URL:
-        await proxy.start_proxy(store)
+        await proxy.start_proxy(store, fire_trigger)
     if config.WHATSAPP_ENABLED:
         wa = WhatsAppBridge(store, _process_whatsapp_message)
         try:
@@ -650,6 +650,93 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
             async with channel.typing():
                 status_msg = await channel.send("🤔 …")
                 await _run_turn(inst, prompt, status_msg)
+
+
+async def fire_trigger(trig: triggers.Trigger, event: dict) -> dict:
+    """Run an external trigger's event as a turn (see harness/triggers.py).
+
+    Same lifecycle as /new and /resume: an existing live instance gets the
+    event as its next turn; a missing instance gets a new channel and session;
+    a deleted channel is recreated; a /stop'ped instance is skipped unless the
+    trigger says if_stopped=resume.
+    """
+    guild = client.get_guild(config.GUILD_ID)
+    if guild is None:
+        return {"status": "error", "reason": "guild not available"}
+    name = triggers.instance_name(trig, event)
+    inst = store.by_name(name) or next(
+        (i for i in store.all() if i.name.lower() == name.lower()), None
+    )
+    if inst is not None:
+        name = inst.name
+    created = recreated = was_stopped = False
+    if inst is not None and inst.stopped:
+        if trig.if_stopped != "resume":
+            return {"status": "skipped", "reason": f"instance '{name}' is stopped", "instance": name}
+        inst.stopped = False
+        was_stopped = True
+    channel = guild.get_channel(inst.channel_id) if inst else None
+    if inst is None:
+        channel = await guild.create_text_channel(
+            name=_slug(name), category=discord.Object(id=config.CATEGORY_ID),
+            reason=f"trigger {trig.name}",
+        )
+        inst = Instance(
+            channel_id=channel.id, name=name,
+            provider=trig.provider or config.DEFAULT_PROVIDER,
+            workdir=trig.workdir or config.DEFAULT_WORKDIR,
+            model=trig.model, origin=f"trigger:{trig.name}",
+        )
+        inst.ensure_web_token()
+        created = True
+    elif not isinstance(channel, discord.TextChannel):
+        channel = await guild.create_text_channel(
+            name=_slug(name), category=discord.Object(id=config.CATEGORY_ID),
+            reason=f"trigger {trig.name}",
+        )
+        inst.channel_id = channel.id
+        recreated = True
+    elif was_stopped:
+        try:  # resumed after /stop: unlock like /resume does
+            await channel.set_permissions(guild.default_role, send_messages=None)
+        except discord.Forbidden:
+            log.warning("no permission to unlock channel for %s", inst.name)
+    store.put(inst)
+    summary = ", ".join(f"{k}={triggers.clean_value(v)[:80]}" for k, v in list(event.items())[:6])
+    await channel.send(
+        f"⚡ trigger `{trig.name}` fired"
+        + (" — new instance" if created else " — channel recreated" if recreated else "")
+        + (f"\n> {summary}" if summary else "")
+    )
+    prompt = triggers.build_prompt(trig, event)
+    asyncio.get_running_loop().create_task(_run_trigger_turn(channel, prompt, trig.name))
+    return {"status": "started", "instance": name, "channel_id": str(channel.id),
+            "created": created, "recreated": recreated}
+
+
+async def _run_trigger_turn(channel: discord.TextChannel, prompt: str, trig_name: str) -> None:
+    try:
+        await on_message_simple(channel, prompt)
+    except Exception:
+        log.exception("trigger %s turn failed", trig_name)
+
+
+@tree.command(name="triggers", description="List external triggers (manage them with python -m harness.triggers)")
+async def cmd_triggers(interaction: discord.Interaction) -> None:
+    items = triggers.TriggerStore().all()
+    if not items:
+        await interaction.response.send_message(
+            "No triggers. Add one on the host: `.venv/bin/python -m harness.triggers add <name> ...`"
+        )
+        return
+    lines = [
+        f"• `{t.name}` → instance `{t.instance}` ({t.provider or config.DEFAULT_PROVIDER}"
+        f"{'/' + t.model if t.model else ''}), if stopped: {t.if_stopped}, "
+        f"{len(t.fired_at)}/{t.max_per_hour} in the last hour"
+        for t in items
+    ]
+    url = f"{config.PUBLIC_BASE_URL}/agents/_triggers/<name>" if config.PUBLIC_BASE_URL else "(PUBLIC_BASE_URL not set)"
+    await interaction.response.send_message("\n".join(lines) + f"\nEndpoint: `POST {url}`")
 
 
 def _channel_alive(inst: Instance) -> bool:
