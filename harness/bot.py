@@ -21,13 +21,15 @@ import time
 
 import discord
 
-from . import config, service
+from . import config, service, uptime
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
 
 if config.PUBLIC_BASE_URL:
     from . import proxy
+if config.WHATSAPP_ENABLED:
+    from .whatsapp import WhatsAppBridge
 
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL, logging.INFO),
@@ -47,6 +49,8 @@ client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 
 store = InstanceManager()
+# WhatsApp mirror; None when WHATSAPP_OWNER is unset. Created in setup_hook.
+wa: "WhatsAppBridge | None" = None
 
 # Serialize turns within a channel; cap total concurrent turns globally.
 _channel_locks: dict[int, asyncio.Lock] = {}
@@ -72,9 +76,22 @@ def _fmt_duration(seconds: float) -> str:
 
 @client.event
 async def setup_hook() -> None:
+    global wa
     if config.PUBLIC_BASE_URL:
         await proxy.start_proxy(store)
+    if config.WHATSAPP_ENABLED:
+        wa = WhatsAppBridge(store, _process_whatsapp_message)
+        try:
+            await wa.start()
+        except Exception:
+            log.exception("whatsapp bridge failed to start; continuing Discord-only")
+            wa = None
     asyncio.get_running_loop().create_task(_heartbeat_loop())
+
+
+def _wa_task(coro) -> None:
+    """Fire-and-forget a WhatsApp send so mirroring never delays Discord."""
+    asyncio.get_running_loop().create_task(coro)
 
 
 async def _heartbeat_loop() -> None:
@@ -113,12 +130,15 @@ async def _progress_updates(inst: Instance, channel: discord.abc.Messageable, tu
         silent = _fmt_duration(time.time() - turn["last_event_at"])
         log.info("[%s] still running: %s elapsed, %d tools, last output %s ago",
                  inst.name, elapsed, turn["tools"], silent)
+        note = (
+            f"⏳ **{inst.name}** still working — {elapsed} elapsed, "
+            f"{turn['tools']} tool calls, last output {silent} ago "
+            f"(model `{turn['model']}`)"
+        )
+        if wa:
+            _wa_task(wa.send_text(inst, note))
         try:
-            await channel.send(
-                f"⏳ **{inst.name}** still working — {elapsed} elapsed, "
-                f"{turn['tools']} tool calls, last output {silent} ago "
-                f"(model `{turn['model']}`)"
-            )
+            await channel.send(note)
         except discord.HTTPException:
             log.warning("[%s] progress update failed to send", inst.name)
 
@@ -257,6 +277,8 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     progress = asyncio.get_running_loop().create_task(
         _progress_updates(inst, status_msg.channel, turn)
     )
+    if wa:
+        _wa_task(wa.typing(inst))
 
     def display(text: str) -> str:
         text = text.strip()
@@ -305,6 +327,8 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 inst.name, loop.time() - started, error,
             )
             await status_msg.edit(content=f"❌ {display(error)}")
+            if wa:
+                _wa_task(wa.send_text(inst, f"❌ {error}"))
             return
 
         log.info(
@@ -322,6 +346,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # and attach the PNG (Discord can't render HTML inline).
         image: discord.File | None = None
         source: discord.File | None = None
+        png: bytes | None = None
         html_block = _extract_html_block(final_text)
         if html_block:
             try:
@@ -333,7 +358,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 final_text = _strip_html_block(final_text) + "\n\n📎 rendered above · HTML source attached"
             except Exception:
                 log.exception("HTML render failed for %s; falling back to text", inst.name)
+                png = None
                 final_text += "\n\n(html rendering failed — see raw source above)"
+
+        if wa:
+            _wa_task(_mirror_reply(inst, final_text, png, html_block))
 
         # Final content: split across messages if over the limit.
         chunks = [
@@ -383,9 +412,25 @@ async def on_message(message: discord.Message) -> None:
     await _process_user_message(inst, message)
 
 
+async def _mirror_reply(
+    inst: Instance, text: str, png: bytes | None, html_block: str | None
+) -> None:
+    """Echo a finished agent reply into the instance's WhatsApp group, in order."""
+    assert wa is not None
+    await wa.typing(inst, False)
+    await wa.send_text(inst, text)
+    if png:
+        await wa.send_image(inst, png, caption=f"{inst.name} output")
+        await wa.send_document(
+            inst, html_block.encode(), f"{_slug(inst.name)}-output.html", "text/html"
+        )
+
+
 async def _process_user_message(inst: Instance, message: discord.Message) -> None:
     global _last_channel_id
     _last_channel_id = message.channel.id
+    if wa:
+        _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* (Discord):\n{message.content}"))
     try:
         async with _global_semaphore:
             async with _channel_lock(message.channel.id):
@@ -399,6 +444,41 @@ async def _process_user_message(inst: Instance, message: discord.Message) -> Non
     except Exception:
         log.exception("message turn failed for %s", inst.name)
         await message.add_reaction("❌")
+
+
+async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> None:
+    """A turn typed in the instance's WhatsApp group: echo to Discord, then run it."""
+    global _last_channel_id
+    assert wa is not None
+    # WhatsApp connects (and replays queued messages) before Discord is ready.
+    await client.wait_until_ready()
+    if inst.stopped:
+        await wa.send_text(inst, f"⏸️ {inst.name} is stopped — `/resume name:{inst.name}` in Discord.")
+        return
+    channel = client.get_channel(inst.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        await wa.send_text(inst, f"⚠️ {inst.name}'s Discord channel is gone — `/resume` it there first.")
+        return
+    _last_channel_id = channel.id
+    echo = f"📱 **{sender}** (WhatsApp):\n{text}"
+    try:
+        mirror = await channel.send(echo[:DISCORD_MSG_LIMIT])
+    except discord.HTTPException:
+        log.exception("[%s] could not mirror whatsapp message to Discord", inst.name)
+        mirror = None
+    try:
+        async with _global_semaphore:
+            async with _channel_lock(channel.id):
+                async with channel.typing():
+                    status_msg = await channel.send("🤔 …")
+                    await _run_turn(inst, text, status_msg)
+        if mirror:
+            await mirror.add_reaction("✅")
+    except Exception:
+        log.exception("whatsapp turn failed for %s", inst.name)
+        if mirror:
+            await mirror.add_reaction("❌")
+        await wa.send_text(inst, "❌ harness error while running the agent (see logs)")
 
 
 async def _catch_up(inst: Instance) -> None:
@@ -523,6 +603,8 @@ async def cmd_new(
         elif model:
             existing.model = model
         store.put(existing)
+        if wa:
+            _wa_task(wa.ensure_group(existing))
         await interaction.followup.send(
             f"✅ reopened {channel.mention} — "
             + (f"resuming `{existing.provider}` session `{existing.session_id}`"
@@ -545,6 +627,8 @@ async def cmd_new(
     )
     inst.ensure_web_token()
     store.put(inst)
+    if wa:
+        await wa.ensure_group(inst)  # before the first prompt, so its reply is mirrored
     await interaction.followup.send(
         f"✅ created {channel.mention} — just chat in it. "
         f"Provider: `{inst.provider}`, model: `{_model_label(inst)}`, workdir: `{inst.workdir}`"
@@ -559,6 +643,8 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     if inst is None:
         return
     _last_channel_id = channel.id
+    if wa:
+        _wa_task(wa.send_text(inst, f"💬 (Discord prompt):\n{prompt}"))
     async with _global_semaphore:
         async with _channel_lock(channel.id):
             async with channel.typing():
@@ -609,6 +695,8 @@ async def cmd_stop(interaction: discord.Interaction, name: str) -> None:
     inst.stopped = True
     store.put(inst)
     log.info("[%s] instance stopped by %s", inst.name, interaction.user)
+    if wa:
+        _wa_task(wa.send_text(inst, f"⏸️ {name} stopped — session kept; `/resume name:{name}` in Discord."))
     if isinstance(channel, discord.TextChannel):
         try:
             await channel.set_permissions(interaction.guild.default_role, send_messages=False)
@@ -656,6 +744,11 @@ async def cmd_resume(interaction: discord.Interaction, name: str) -> None:
         recreated = True
     inst.stopped = False
     store.put(inst)
+    if wa:
+        if inst.wa_group:
+            _wa_task(wa.send_text(inst, f"▶️ {name} resumed."))
+        else:
+            _wa_task(wa.ensure_group(inst))
     log.info(
         "[%s] instance resumed by %s (channel %s)",
         inst.name, interaction.user, "recreated" if recreated else "unlocked",
@@ -685,6 +778,9 @@ async def cmd_delete(interaction: discord.Interaction, name: str) -> None:
         except discord.Forbidden:
             log.warning("no permission to delete channel for %s", inst.name)
     store.remove(inst.channel_id)
+    if wa and inst.wa_group:
+        await wa.send_text(inst, f"🗑️ {name} deleted — this group is no longer connected.")
+        await wa.leave_group(inst)
     note = " (auto-stopped first)" if was_active else ""
     await interaction.followup.send(
         f"🗑️ deleted '{name}'{note} — channel removed and instance forgotten. "
@@ -765,6 +861,57 @@ async def cmd_usage(interaction: discord.Interaction, provider: str | None = Non
         await interaction.followup.send(block)
 
 
+@tree.command(name="whatsapp", description="WhatsApp mirror status, or link the bot account")
+@discord.app_commands.describe(
+    phone="Bot account's number (with country code); default WHATSAPP_BOT_NUMBER, else a QR"
+)
+@discord.app_commands.default_permissions(administrator=True)
+async def cmd_whatsapp(interaction: discord.Interaction, phone: str | None = None) -> None:
+    if not config.WHATSAPP_ENABLED:
+        await interaction.response.send_message(
+            "WhatsApp mirror is off — set `WHATSAPP_OWNER` in `.env` and restart."
+        )
+        return
+    if wa is None:
+        await interaction.response.send_message("❌ WhatsApp bridge failed to start (see logs).")
+        return
+    if wa.linked:
+        groups = [i for i in store.all() if i.wa_group]
+        await interaction.response.send_message(
+            f"✅ WhatsApp linked — {len(groups)} group(s) mirrored to owner `{config.WHATSAPP_OWNER}`."
+        )
+        return
+    phone = phone or config.WHATSAPP_BOT_NUMBER
+    if phone:
+        await interaction.response.defer()
+        try:
+            code = await wa.pair_code(phone)
+        except Exception as e:
+            await interaction.followup.send(f"❌ pairing code failed: {e}")
+            return
+        await interaction.followup.send(
+            f"On the **bot** phone: WhatsApp → Linked devices → Link a device → "
+            f"*Link with phone number instead* → enter **`{code}`**"
+        )
+        return
+    png = wa.qr_png()
+    if png is None:
+        await interaction.response.send_message("⏳ still connecting to WhatsApp — try again in a few seconds.")
+        return
+    await interaction.response.send_message(
+        "Scan with the **bot** phone (WhatsApp → Linked devices → Link a device). "
+        "QR codes rotate quickly — rerun `/whatsapp` if it expires, or pass `phone:` for a code.",
+        file=discord.File(io.BytesIO(png), filename="whatsapp-qr.png"),
+    )
+
+
+@tree.command(name="uptime", description="Internet and system uptime: outages, availability, history")
+@discord.app_commands.describe(recent="How many recent outages to list (default 5)")
+async def cmd_uptime(interaction: discord.Interaction, recent: int = 5) -> None:
+    text = uptime.summary(recent=max(0, min(recent, 25)))
+    await interaction.response.send_message(text[:DISCORD_MSG_LIMIT])
+
+
 @tree.command(name="list", description="List all agent instances")
 async def cmd_list(interaction: discord.Interaction) -> None:
     active = [i for i in store.all() if not i.stopped and _channel_alive(i)]
@@ -808,6 +955,10 @@ def _restart_harness() -> None:
     unit = service.current_unit()
     log.warning("restarting harness (%s)", unit or "exec")
     if unit:
+        # The uptime monitor isn't bound to the bot; restart it so it runs new code too.
+        subprocess.run(
+            ["systemctl", "--user", "--no-block", "try-restart", service.UPTIME_UNIT], check=False
+        )
         # --no-block queues the job and returns before systemd kills this process.
         subprocess.Popen(["systemctl", "--user", "--no-block", "restart", unit])
     else:

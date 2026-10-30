@@ -133,6 +133,57 @@ what you want in an HTML code block, e.g.:
 
 The image renders inline on mobile; tap the attachment for the source.
 
+### WhatsApp mirror (optional)
+
+Every instance can also get a WhatsApp group, so you can talk to the same
+session from either app. Both sides stay in sync: what you type in Discord is
+echoed into the group, what you type in the group is echoed into the channel
+(and runs as a turn), and every agent reply, progress note, rendered image and
+live-page link goes to both.
+
+It needs a **separate WhatsApp account** for the bot (a second number; the
+WhatsApp Business app on a spare SIM or eSIM works). The harness links to it as
+a companion device, the way WhatsApp Web does, using
+[neonize](https://github.com/krypton-byte/neonize) (whatsmeow). That is an
+unofficial client, so keep it to a dedicated number you could afford to lose.
+
+1. Set `WHATSAPP_OWNER` in `.env` to *your own* number with country code, then
+   restart the harness.
+2. Run `/whatsapp` in Discord and scan the QR with the **bot** phone (WhatsApp →
+   Linked devices → Link a device), or run `/whatsapp phone:<bot number>` to get
+   a code for "Link with phone number instead". With `WHATSAPP_BOT_NUMBER` set
+   in `.env`, plain `/whatsapp` gives that code. The link is stored in
+   `data/whatsapp.db` and survives restarts.
+3. Once linked, the bot creates a group named `<instance>-bot` for each active
+   instance with you in it. New ones get theirs on `/new` or `/resume`. If your
+   privacy settings block being added to groups, the bot sends you an invite
+   link instead.
+
+Only messages from `WHATSAPP_OWNER` are acted on; anyone else in a group is
+ignored. Only text is forwarded, so captions count but bare media doesn't.
+`/stop` and `/resume` post a note in the group, and `/delete` leaves it.
+Slash commands stay Discord-only.
+
+### Uptime log (`/uptime`)
+
+A third user unit, `discord-agent-uptime.service`, tracks how often the
+internet drops and how long the machine is down. It runs independently of the
+bot, so it keeps logging while the harness is restarting or crashed. Every 10 s
+(`UPTIME_INTERVAL`) it TCP-connects to 1.1.1.1, 8.8.8.8 and 9.9.9.9
+(`UPTIME_TARGETS`); the internet counts as up if any answers, and two failed
+checks in a row open an outage, dated from the first failure.
+
+Only state changes go to `data/uptime.jsonl`: internet down/up, monitor
+start/stop (noting when the system was shutting down), reboots, and gaps such as
+suspend. A tiny `data/uptime_state.json` is overwritten every check with a
+"last alive" time. After a reboot (a new kernel boot id) the system counts as
+down from that time, or from the clean-shutdown stop, until the new boot.
+On first run, earlier reboots are backfilled from the journal.
+
+`/uptime` shows current state, availability with outage count and total
+downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
+downtime only counts while the machine was up and monitored.
+
 ## Adding another provider
 
 Implement the `AgentProvider` interface in `harness/providers/` (see `claude.py`
@@ -181,7 +232,9 @@ harness/
 ├── bot.py              # Discord client: slash commands, message turns, streaming replies
 ├── config.py           # .env loading and typed settings
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
+├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
+├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats
 └── providers/
     ├── base.py         # AgentProvider ABC + registry
     ├── claude.py       # Claude Code CLI provider

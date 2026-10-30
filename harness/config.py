@@ -48,7 +48,7 @@ GUILD_ID: int = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 CATEGORY_ID: int = int(os.environ.get("DISCORD_CATEGORY_ID", "0"))
 
 DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "kimi")
-DEFAULT_WORKDIR: str = os.environ.get("DEFAULT_WORKDIR", str(Path.home()))
+DEFAULT_WORKDIR: str = os.path.expanduser(os.environ.get("DEFAULT_WORKDIR", str(Path.home())))
 MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 
 # --- Liveness: in-channel progress updates + heartbeat for the watchdog ---
@@ -79,6 +79,25 @@ CLAUDE_BIN: str = os.path.expanduser(os.environ.get("CLAUDE_BIN", "claude"))
 CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5"
 # Passed as --permission-mode; bypassPermissions mirrors kimi's auto policy.
 CLAUDE_PERMISSION_MODE: str = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
+
+# --- Uptime log (discord-agent-uptime.service, /uptime) ---
+# Seconds between internet checks; only state changes are logged.
+UPTIME_INTERVAL: float = float(os.environ.get("UPTIME_INTERVAL", "10"))
+# host:port pairs probed with a TCP connect; the internet is up if any answers.
+UPTIME_TARGETS: list[tuple[str, int]] = [
+    (hp.rsplit(":", 1)[0], int(hp.rsplit(":", 1)[1]))
+    for hp in os.environ.get("UPTIME_TARGETS", "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53").split(",")
+    if ":" in hp
+]
+
+# --- WhatsApp mirror (optional) ---
+# Owner's WhatsApp number with country code (e.g. 15551234567). Setting it
+# enables the bridge: the harness links as a device of a separate bot account
+# and creates one "<name>-bot" group per instance with this number in it.
+WHATSAPP_OWNER: str = os.environ.get("WHATSAPP_OWNER", "").strip()
+WHATSAPP_ENABLED: bool = bool(WHATSAPP_OWNER)
+# The bot account's own number; lets /whatsapp hand out a pairing code by default.
+WHATSAPP_BOT_NUMBER: str = os.environ.get("WHATSAPP_BOT_NUMBER", "").strip()
 
 # --- Live web output through an existing Cloudflare Tunnel ---
 # Public base URL under which /agents/<slug>/<token>/<port>/ is reachable.

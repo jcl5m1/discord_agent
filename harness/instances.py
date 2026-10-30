@@ -8,7 +8,8 @@ Stored in data/instances.json (gitignored):
     "provider": "kimi",
     "workdir": "/home/user/code/my-project",
     "session_id": "session_xxxx",
-    "model": "opus"
+    "model": "opus",
+    "wa_group": "120363000000000000"
   }
 }
 
@@ -19,12 +20,31 @@ harness resumes it on every new message, so instances survive harness restarts.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger(__name__)
+
+
+def _claude_project_dir(cwd: str) -> Path:
+    """Where Claude Code keeps session transcripts for a given cwd."""
+    return Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def _migrate_claude_session(old_cwd: str, new_cwd: str, session_id: str) -> None:
+    """Move a transcript so `claude --resume` still finds it under the new cwd."""
+    src = _claude_project_dir(old_cwd) / f"{session_id}.jsonl"
+    dst = _claude_project_dir(new_cwd) / f"{session_id}.jsonl"
+    if src.exists() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+        log.info("migrated claude session %s: %s -> %s", session_id, src.parent, dst.parent)
 
 
 @dataclass
@@ -38,6 +58,12 @@ class Instance:
     stopped: bool = False  # set by /stop, cleared when /new reopens the instance
     last_message_id: str | None = None  # newest user message processed (catch-up marker)
     web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
+    wa_group: str | None = None  # WhatsApp group JID user part (mirror chat), if any
+
+    def __post_init__(self) -> None:
+        # Subprocesses get workdir as cwd verbatim, so "~" must be expanded here
+        # or it becomes a literal directory under the harness's own cwd.
+        self.workdir = os.path.abspath(os.path.expanduser(self.workdir))
 
     def ensure_web_token(self) -> str:
         if not self.web_token:
@@ -57,8 +83,20 @@ class InstanceManager:
         if not self.path.exists():
             return
         raw = json.loads(self.path.read_text())
+        migrated = False
         for cid, data in raw.items():
-            self._instances[int(cid)] = Instance(channel_id=int(cid), **data)
+            inst = Instance(channel_id=int(cid), **data)
+            self._instances[int(cid)] = inst
+            if inst.workdir != data["workdir"]:
+                # Saved before workdirs were normalized; the old value resolved
+                # relative to the harness cwd, so that's where its sessions live.
+                migrated = True
+                if inst.provider == "claude" and inst.session_id:
+                    _migrate_claude_session(
+                        os.path.abspath(data["workdir"]), inst.workdir, inst.session_id
+                    )
+        if migrated:
+            self._save()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

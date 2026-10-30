@@ -25,6 +25,7 @@ from . import config
 UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 BOT_UNIT = "discord-agent.service"
 WATCHDOG_UNIT = "discord-agent-watchdog.service"
+UPTIME_UNIT = "discord-agent-uptime.service"
 # systemd's default PATH; the user bin dirs from config are put in front of it.
 _SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 
@@ -64,6 +65,23 @@ WorkingDirectory={repo}
 Environment=PATH={path}
 ExecStart={python} -m harness.watchdog
 Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""",
+    UPTIME_UNIT: """\
+# Managed by harness/service.py — local edits are overwritten on the next sync.
+[Unit]
+Description=Discord agent harness uptime log (internet + system up/down events)
+# Deliberately not bound to the bot: it must keep logging while the harness is down.
+
+[Service]
+Type=simple
+WorkingDirectory={repo}
+Environment=PATH={path}
+ExecStart={python} -m harness.uptime
+Restart=always
 RestartSec=5
 
 [Install]
@@ -123,6 +141,10 @@ def sync(unit: str | None = None) -> list[str]:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         # A watchdog unit installed for the first time must also start at login.
         subprocess.run(["systemctl", "--user", "enable", "--quiet", *_TEMPLATES], check=False)
+        # The uptime unit runs independently of the bot, so (re)start it here:
+        # nothing else would pick up a freshly installed or changed unit.
+        if UPTIME_UNIT in changed:
+            subprocess.run(["systemctl", "--user", "--no-block", "restart", UPTIME_UNIT], check=False)
     return changed
 
 
