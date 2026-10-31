@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config, service, triggers, uptime
+from . import config, files, service, triggers, uptime
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -234,6 +234,14 @@ read that file first — it is self-describing JSON whose comment entries carry
 'text' (the feedback), 'page', 'type', and 'resolved' fields. Treat unresolved
 comments as the user's change requests. After applying feedback you may tell
 the user they can mark comments resolved in the page UI.
+Shared files for this channel: {files_dir}
+Save charts, images, logs, reports and data you want to show or keep for this
+discussion there (organise by topic in subfolders, e.g. charts/, logs/, data/).
+Everything in it is served read-only at {files_url}<path> -- a stable,
+unguessable public link; image links posted in your reply display inline in
+Discord, and the folder URL itself is a browsable index. The user can list them
+with /files. Prefer this over ad-hoc share folders or temporary servers for
+static files.
 [end of harness capabilities]
 """
 
@@ -242,11 +250,17 @@ def _with_brief(inst: Instance, prompt: str) -> str:
     """Prepend the capability brief when this turn starts a new session."""
     if inst.session_id is not None:
         return prompt
+    folder = files.files_dir(_slug(inst.name))
+    folder.mkdir(parents=True, exist_ok=True)
+    token = inst.ensure_web_token()
+    store.put(inst)
     return _HARNESS_BRIEF.format(
         workdir=inst.workdir,
         port_start=config.AGENT_PORT_START,
         port_end=config.AGENT_PORT_END,
         annotations_path=config.DATA_DIR / "annotations" / f"{_slug(inst.name)}.json",
+        files_dir=folder,
+        files_url=files.files_url(_slug(inst.name), token) or "(not served: PUBLIC_BASE_URL unset) ",
     ) + "\n" + prompt
 
 
@@ -737,6 +751,34 @@ async def cmd_triggers(interaction: discord.Interaction) -> None:
     ]
     url = f"{config.PUBLIC_BASE_URL}/agents/_triggers/<name>" if config.PUBLIC_BASE_URL else "(PUBLIC_BASE_URL not set)"
     await interaction.response.send_message("\n".join(lines) + f"\nEndpoint: `POST {url}`")
+
+
+@tree.command(name="files", description="List this channel's shared files (charts, logs, reports) with links")
+@discord.app_commands.describe(folder="Only this subfolder (e.g. charts)")
+async def cmd_files(interaction: discord.Interaction, folder: str | None = None) -> None:
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if inst is None:
+        await interaction.response.send_message("❌ run this inside an agent channel")
+        return
+    slug = _slug(inst.name)
+    token = inst.ensure_web_token()
+    store.put(inst)
+    base = files.files_url(slug, token)
+    entries = files.listing(slug, folder or "")
+    head = f"📁 `{files.files_dir(slug)}`" + (f" — index: {base}" if base else "")
+    if not entries:
+        await interaction.response.send_message(head + "\n(no files yet)")
+        return
+    msg, shown = head, 0
+    for e in entries:  # newest first, until the message is full
+        line = (f"\n• [{e.path}](<{base}{e.path}>) · {files.human_size(e.size)}" if base
+                else f"\n• `{e.path}` · {files.human_size(e.size)}")
+        if len(msg) + len(line) > DISCORD_MSG_LIMIT - 60:
+            break
+        msg, shown = msg + line, shown + 1
+    if shown < len(entries):
+        msg += f"\n…and {len(entries) - shown} older (see the index)"
+    await interaction.response.send_message(msg)
 
 
 def _channel_alive(inst: Instance) -> bool:

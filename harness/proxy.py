@@ -16,6 +16,10 @@ It also hosts the external-trigger endpoint (see harness/triggers.py), under
 the same tunnel path:
 
     POST /agents/_triggers/<name>   (Authorization: Bearer <trigger token>)
+
+and each instance's shared files folder (see harness/files.py), read-only:
+
+    GET /agents/<instance-slug>/<token>/files/<path>
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from collections.abc import Awaitable, Callable
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from . import config, triggers
+from . import config, files, triggers
 from .instances import InstanceManager
 
 # bot callback: (trigger, event) -> result dict for the HTTP response
@@ -150,6 +154,31 @@ async def _trigger(request: web.Request) -> web.Response:
     return web.json_response(result, status=202 if result.get("status") == "started" else 200)
 
 
+async def _files(request: web.Request) -> web.StreamResponse:
+    if request.method not in ("GET", "HEAD"):
+        return web.Response(status=405, text="read-only")
+    slug, token = request.match_info["slug"], request.match_info["token"]
+    inst = next((i for i in request.app["store"].all() if _slug(i.name) == slug), None)
+    if inst is None or inst.web_token is None or token != inst.web_token:
+        return web.Response(status=403, text="bad token")
+    rel = request.match_info["path"]
+    target = files.resolve(slug, rel)
+    if target is None or any(part.startswith(".") for part in rel.split("/") if part):
+        return web.Response(status=404, text="not found")
+    if target.is_file():
+        return web.FileResponse(target, headers={"Cache-Control": "no-cache"})
+    if target.is_dir() or rel == "":
+        if rel and not rel.endswith("/"):
+            raise web.HTTPFound(request.path + "/")
+        base = f"/agents/{slug}/{token}/files/"
+        return web.Response(text=files.index_html(slug, rel.strip("/"), base), content_type="text/html")
+    return web.Response(status=404, text="not found")
+
+
+async def _files_root_redirect(request: web.Request) -> web.Response:
+    raise web.HTTPFound(request.path + "/")
+
+
 def build_app(store: InstanceManager, on_trigger: OnTrigger | None = None) -> web.Application:
     app = web.Application()
     app["store"] = store
@@ -208,6 +237,8 @@ def build_app(store: InstanceManager, on_trigger: OnTrigger | None = None) -> we
 
     app.router.add_route("*", "/agents/_triggers/{name}", _trigger)
     app.router.add_route("*", "/agents/{slug}/{token}/__annotate_blob", _annotate_blob)
+    app.router.add_route("*", "/agents/{slug}/{token}/files/{path:.*}", _files)
+    app.router.add_route("*", "/agents/{slug}/{token}/files", _files_root_redirect)
     app.router.add_route("*", "/agents/{tail:.*}", handle)
 
     async def on_startup(app: web.Application) -> None:

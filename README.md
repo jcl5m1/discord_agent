@@ -184,6 +184,26 @@ On first run, earlier reboots are backfilled from the journal.
 downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
 downtime only counts while the machine was up and monitored.
 
+## Shared files (`/files`)
+
+Every instance has a persistent folder for the files its discussion produces:
+charts, logs, reports, data. The agent is told about it in its session brief.
+
+```
+data/files/<instance-slug>/<path>
+  -> {PUBLIC_BASE_URL}/agents/<instance-slug>/<web-token>/files/<path>
+```
+
+- Served read-only by the harness proxy (GET/HEAD only), guarded by the same
+  per-instance token as live web pages: links are public but unguessable.
+- Image links posted in Discord show inline, so the agent can show a chart by
+  saving a PNG and linking it, without running a server.
+- The folder URL (`.../files/`) is a browsable index, newest first.
+- Dotfiles are hidden and not served; paths can't escape the folder.
+- `/files [folder]` in a channel lists its files with links.
+- Files are kept when an instance is stopped or deleted; remove
+  `data/files/<slug>/` by hand to clean up.
+
 ## External triggers (CI failures, GitHub Actions, webhooks)
 
 Other systems can start or continue an agent turn by calling a token-protected
