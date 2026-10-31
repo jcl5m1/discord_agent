@@ -1,6 +1,6 @@
 # discord_agent
 
-Chat with coding-agent instances (Claude Code and Kimi CLI, extensible to others) from
+Chat with coding-agent instances (Claude Code, Kimi Code and Muse, extensible to others) from
 Discord — designed for driving agents from your phone.
 
 - **One agent instance = one Discord channel.** Create instances with `/new`; each
@@ -11,6 +11,42 @@ Discord — designed for driving agents from your phone.
 - **Sessions survive restarts.** The harness stores each instance's provider session
   ID on disk. If the harness (or the whole machine) goes down, the next message in
   the channel transparently resumes the agent exactly where it left off.
+
+## Install in one line
+
+On a Linux machine (Ubuntu/Debian or anything with systemd), run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.sh | bash
+```
+
+That single command does the full setup, asking questions as it goes:
+
+1. **Prerequisites:** installs `git`/`curl` if missing (via apt, needs sudo)
+   and `uv`, which also provides Python 3.12.
+2. **Code:** clones this repo to `~/discord_agent` (`--dir <path>` to change),
+   or pulls if it's already there.
+3. **Dependencies:** builds the venv and installs headless Chromium for HTML
+   rendering.
+4. **Agent CLIs:** for Claude Code, Kimi Code and Muse, offers to install each
+   one with its official installer, checks whether it's logged in, and if not
+   runs that CLI's own login (`claude auth login`, `kimi login`, `muse login`).
+   Your agent credentials stay with each CLI and never pass through the
+   harness.
+5. **Discord:** walks you through creating the bot in the developer portal (the
+   one manual step), then asks for the bot token, server ID and category ID.
+6. **Options:** default agent and working directory, plus optional WhatsApp
+   numbers and public URL. Writes `.env` (mode 600).
+7. **Checks:** verifies the token, server, category and Message Content intent
+   against Discord. If the bot isn't in your server yet, it prints the invite
+   link with the right permissions.
+8. **Services:** installs and starts the bot, watchdog and uptime systemd user
+   services, with lingering on so they run at boot.
+
+Rerunning it is safe: anything already installed or logged in is skipped,
+current settings are the defaults, and the old `.env` is kept as `.env.bak`.
+Use `--no-service` to skip systemd and start with `./run.sh` instead. To pass
+options through the pipe: `curl -fsSL … | bash -s -- --dir ~/agents --no-service`.
 
 ## How it works
 
@@ -37,28 +73,9 @@ channels, providers, models and session IDs (`data/instances.json`).
 
 ## Setup
 
-### Quick start: `setup.sh`
-
-On a new Linux machine, one command installs or updates everything:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.sh | bash
-```
-
-It clones the repo to `~/discord_agent` (`--dir <path>` to change), builds the
-venv (Python 3.12 via `uv` when available) and headless Chromium, then asks for
-the bot token, server ID and category ID, plus optional WhatsApp numbers and
-public URL. It writes `.env` (mode 600) and checks the token, server, category
-and Message Content intent against Discord. If the bot isn't in your server yet
-it prints the invite link with the right permissions. Finally it installs and
-starts the systemd user services, turning on lingering so they run at boot.
-Rerunning it is safe: current values are the defaults, and the old `.env` is
-kept as `.env.bak`. `--no-service` skips systemd so you can use `./run.sh`.
-
-The agent CLIs themselves (`claude`, `kimi`, `muse`) aren't installed by the
-script; it reports which ones it finds. Steps 1–3 below are the manual
-equivalent, and step 1 (creating the bot in the developer portal) is needed
-either way.
+The [one-line install](#install-in-one-line) does all of this automatically;
+the steps below are the manual equivalent. Step 1, creating the bot in the
+developer portal, is needed either way.
 
 ### 1. Create the Discord bot (one-time)
 
@@ -325,7 +342,7 @@ harness/
     ├── kimi.py         # Kimi CLI provider
     └── muse.py         # Muse CLI provider (`muse exec --json`)
 .env.example            # all configuration keys, documented
-setup.sh                # one-shot installer: clone, venv, .env prompts, services
+setup.sh                # one-line installer: prereqs, clone, venv, agent CLIs + logins, .env, services
 run.sh                  # starts the harness and the watchdog
 ```
 

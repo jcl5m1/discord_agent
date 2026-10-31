@@ -4,14 +4,22 @@
 #   curl -fsSL https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.sh | bash
 #   # or, from a checkout:  ./setup.sh
 #
-# Clones (or updates) the repo, builds the venv, asks for the Discord IDs and
-# token (plus optional WhatsApp / public-URL settings), writes .env, checks the
-# token against Discord, and installs the systemd user services.
-# Safe to rerun: current .env values are offered as defaults.
+# Everything in one go: installs missing prerequisites (git, curl, uv), clones
+# (or updates) the repo, builds the venv, installs the agent CLIs you pick
+# (claude, kimi, muse) and walks you through each one's own login, asks for the
+# Discord IDs and token (plus optional WhatsApp / public-URL settings), writes
+# .env, checks it all against Discord, and installs the systemd user services.
+# Safe to rerun: anything already installed or logged in is left as is, and
+# current .env values are offered as defaults.
 #
 # Options:  --dir <path>   install location (default: this checkout, else ~/discord_agent)
 #           --no-service   skip systemd install/start (use ./run.sh instead)
 set -euo pipefail
+
+# Under `curl ... | bash`, bash reads this script from stdin as it goes, so any
+# command that touches stdin would swallow the rest of it. Wrapping everything in
+# one block makes bash parse the whole file before running anything.
+{
 
 REPO_URL="https://github.com/jcl5m1/discord_agent.git"
 DIR="${DISCORD_AGENT_DIR:-}"
@@ -20,7 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dir) DIR="$2"; shift 2 ;;
     --no-service) WITH_SERVICE=0; shift ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -52,24 +60,27 @@ yesno() {  # yesno "Question" y|n
   [[ "$ans" =~ ^[Yy] ]]
 }
 
+# Where the installers below put their binaries; make them usable in this run.
+export PATH="$HOME/.local/bin:$HOME/.kimi-code/bin:$PATH"
+
 # --- 1. prerequisites ---
-bold "1/7 Checking prerequisites"
-for cmd in git curl; do
-  command -v "$cmd" >/dev/null || die "$cmd is required (e.g. sudo apt install $cmd)"
-done
-if command -v uv >/dev/null; then
-  info "uv found — the venv will use Python 3.12 (uv downloads it if needed)"
-else
-  command -v python3 >/dev/null || die "python3 is required (or install uv: https://docs.astral.sh/uv/)"
-  python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
-    || die "Python 3.10+ is required (found $(python3 --version))"
-  python3 -c 'import venv, ensurepip' 2>/dev/null \
-    || die "python3 venv support missing (e.g. sudo apt install python3-venv)"
-  info "using $(python3 --version) (installing uv is recommended for a pinned 3.12)"
+bold "1/8 Prerequisites"
+missing=()
+for cmd in git curl; do command -v "$cmd" >/dev/null || missing+=("$cmd"); done
+if [ ${#missing[@]} -gt 0 ]; then
+  command -v apt-get >/dev/null || die "please install: ${missing[*]}"
+  info "installing ${missing[*]} (needs sudo)"
+  sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" || die "could not install ${missing[*]}"
 fi
+if ! command -v uv >/dev/null; then
+  # uv also provides the pinned Python, so no system python packages are needed.
+  info "installing uv (Python package manager) into ~/.local/bin"
+  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null || die "uv install failed"
+fi
+info "git, curl and uv ready — the venv will use Python 3.12 (uv downloads it if needed)"
 
 # --- 2. code ---
-bold "2/7 Getting the code"
+bold "2/8 Getting the code"
 if [ -z "$DIR" ]; then
   here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
   if [ -n "$here" ] && [ -f "$here/harness/bot.py" ]; then DIR=$here; else DIR="$HOME/discord_agent"; fi
@@ -85,15 +96,9 @@ fi
 cd "$DIR"
 
 # --- 3. venv + dependencies ---
-bold "3/7 Installing Python dependencies"
-if command -v uv >/dev/null; then
-  [ -x .venv/bin/python ] || uv venv --python 3.12 .venv
-  uv pip install --python .venv/bin/python -q -r requirements.txt
-else
-  [ -x .venv/bin/python ] || python3 -m venv .venv
-  .venv/bin/python -m pip install -q --upgrade pip
-  .venv/bin/python -m pip install -q -r requirements.txt
-fi
+bold "3/8 Installing Python dependencies"
+[ -x .venv/bin/python ] || uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -q -r requirements.txt
 info "installing headless Chromium for HTML rendering (repo-local .pw-browsers)"
 if ! PLAYWRIGHT_BROWSERS_PATH=.pw-browsers .venv/bin/playwright install chromium >/dev/null; then
   warn "Chromium download failed — rerun setup later; only HTML rendering is affected"
@@ -111,8 +116,71 @@ then
   warn "  sudo $DIR/.venv/bin/playwright install-deps chromium"
 fi
 
-# --- 4. Discord bot (manual, one-time) ---
-bold "4/7 Discord bot"
+# --- 4. agent CLIs: install + log in ---
+bold "4/8 Agent CLIs"
+info "The harness drives these CLIs; each keeps its own login under your home dir."
+cli_path() {
+  case $1 in
+    claude) command -v claude || true ;;
+    kimi)   command -v kimi || ls ~/.kimi-code/bin/kimi 2>/dev/null || true ;;
+    muse)   command -v muse || ls ~/.local/bin/muse 2>/dev/null || true ;;
+  esac
+}
+cli_logged_in() {
+  case $1 in
+    claude) claude auth status --json 2>/dev/null | grep -q '"loggedIn": *true' ;;
+    kimi)   "$(cli_path kimi)" provider list 2>/dev/null | grep -q 'source=oauth' ;;
+    muse)   [ -n "${META_API_KEY:-}" ] || [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/muse/auth.json" ] ;;
+  esac
+}
+cli_install() {  # official installers
+  case $1 in
+    claude) curl -fsSL https://claude.ai/install.sh | bash ;;
+    kimi)   curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash ;;
+    muse)   curl -fsSL https://api.meta.ai/muse-launcher.sh | bash ;;
+  esac
+}
+cli_login() {  # each CLI's own interactive login, on the real terminal
+  case $1 in
+    claude) claude auth login < "$TTY" ;;
+    kimi)   "$(cli_path kimi)" login < "$TTY" ;;
+    muse)   "$(cli_path muse)" login < "$TTY" ;;
+  esac
+}
+cli_label() {
+  case $1 in
+    claude) echo "Claude Code (Anthropic account)" ;;
+    kimi)   echo "Kimi Code (Moonshot account)" ;;
+    muse)   echo "Muse (Meta account)" ;;
+  esac
+}
+READY=()
+for cli in claude kimi muse; do
+  path=$(cli_path $cli)
+  if [ -z "$path" ]; then
+    def=n; [ $cli = claude ] && def=y
+    yesno "Install $(cli_label $cli)?" $def || continue
+    cli_install $cli || { warn "$cli install failed — skipping"; continue; }
+    hash -r; path=$(cli_path $cli)
+    [ -n "$path" ] || { warn "$cli installed but not found on PATH — skipping"; continue; }
+  fi
+  if cli_logged_in $cli; then
+    info "$cli: $path — logged in ✓"; READY+=("$cli"); continue
+  fi
+  if yesno "$cli is installed but not logged in. Log in now?" y; then
+    cli_login $cli || true
+  fi
+  if cli_logged_in $cli; then
+    info "$cli: logged in ✓"; READY+=("$cli")
+  else
+    login_cmd="$cli login"; [ $cli = claude ] && login_cmd="claude auth login"
+    warn "$cli: not logged in — run '$login_cmd' later (or rerun setup), or turns will fail"
+  fi
+done
+[ ${#READY[@]} -gt 0 ] || warn "no agent CLI is ready — the bot will start but can't run turns yet"
+
+# --- 5. Discord bot (manual, one-time) ---
+bold "5/8 Discord bot"
 cur() { [ -f .env ] && sed -n "s/^$1=//p" .env | tail -1 | sed 's/^"\(.*\)"$/\1/' || true; }
 if [ -z "$(cur DISCORD_BOT_TOKEN)" ]; then
   cat <<'EOF'
@@ -128,7 +196,7 @@ EOF
 fi
 
 # --- 5. configuration ---
-bold "5/7 Configuration (Enter keeps the value in brackets)"
+bold "6/8 Configuration (Enter keeps the value in brackets)"
 ask TOKEN    "Discord bot token" "$(cur DISCORD_BOT_TOKEN)" secret
 ask GUILD    "Server (guild) ID" "$(cur DISCORD_GUILD_ID)"
 ask CATEGORY "Category ID for agent channels" "$(cur DISCORD_CATEGORY_ID)"
@@ -136,7 +204,9 @@ ask CATEGORY "Category ID for agent channels" "$(cur DISCORD_CATEGORY_ID)"
 [[ "$GUILD" =~ ^[0-9]{15,22}$ ]] || die "server ID should be a long number, got '$GUILD'"
 [[ "$CATEGORY" =~ ^[0-9]{15,22}$ ]] || die "category ID should be a long number, got '$CATEGORY'"
 
-ask PROVIDER "Default agent CLI (claude | kimi | muse)" "$(cur DEFAULT_PROVIDER | grep . || echo claude)"
+prov_def=$(cur DEFAULT_PROVIDER)
+if [ ${#READY[@]} -gt 0 ] && [[ ! " ${READY[*]} " =~ " $prov_def " ]]; then prov_def=${READY[0]}; fi
+ask PROVIDER "Default agent CLI (ready: ${READY[*]:-none})" "${prov_def:-claude}"
 [[ "$PROVIDER" =~ ^(claude|kimi|muse)$ ]] || die "provider must be claude, kimi or muse"
 ask WORKDIR  "Default working directory for new agents" "$(cur DEFAULT_WORKDIR | grep . || echo "$HOME")"
 
@@ -187,7 +257,7 @@ EOF
 info "wrote $DIR/.env (mode 600)"
 
 # --- 6. checks ---
-bold "6/7 Checking Discord and agent CLIs"
+bold "7/8 Checking Discord"
 # The token goes in via a file descriptor so it never shows up in `ps`.
 api() { curl -s -w '\n%{http_code}' -H @<(printf 'Authorization: Bot %s\n' "$TOKEN") "https://discord.com/api/v10$1"; }
 jget() { .venv/bin/python -c "import json,sys; d=json.loads(sys.stdin.read() or '{}'); print(d.get('$1', ''))"; }
@@ -219,19 +289,11 @@ else
     warn "category $CATEGORY not visible to the bot (HTTP $ccode)"
   fi
 fi
-for cli in claude kimi muse; do
-  case $cli in
-    claude) path=$(command -v claude || true) ;;
-    kimi)   path=$(ls ~/.kimi-code/bin/kimi 2>/dev/null || command -v kimi || true) ;;
-    muse)   path=$(ls ~/.local/bin/muse 2>/dev/null || command -v muse || true) ;;
-  esac
-  if [ -n "$path" ]; then info "$cli: $path"
-  elif [ "$cli" = "$PROVIDER" ]; then warn "$cli (your default) is not installed — install and log in before chatting"
-  else info "$cli: not installed (optional)"; fi
-done
+[[ " ${READY[*]} " =~ " $PROVIDER " ]] \
+  || warn "default provider $PROVIDER isn't installed and logged in — rerun setup to fix"
 
 # --- 7. services ---
-bold "7/7 Services"
+bold "8/8 Services"
 if [ "$WITH_SERVICE" = 0 ] || ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
   info "skipping systemd — start the harness with: $DIR/run.sh"
   exit 0
@@ -260,3 +322,4 @@ bold "Done"
 info "In Discord: /new name:my-project prompt:hello"
 [ -n "$WA_OWNER" ] && info "WhatsApp: run /whatsapp in Discord to link the bot account"
 exit 0
+}
