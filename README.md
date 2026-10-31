@@ -328,3 +328,9 @@ harness/
 setup.sh                # one-shot installer: clone, venv, .env prompts, services
 run.sh                  # starts the harness and the watchdog
 ```
+
+## License
+
+Copyright 2026 Johnny Lee
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
