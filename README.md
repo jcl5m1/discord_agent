@@ -37,6 +37,29 @@ channels, providers, models and session IDs (`data/instances.json`).
 
 ## Setup
 
+### Quick start: `setup.sh`
+
+On a new Linux machine, one command installs or updates everything:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.sh | bash
+```
+
+It clones the repo to `~/discord_agent` (`--dir <path>` to change), builds the
+venv (Python 3.12 via `uv` when available) and headless Chromium, then asks for
+the bot token, server ID and category ID, plus optional WhatsApp numbers and
+public URL. It writes `.env` (mode 600) and checks the token, server, category
+and Message Content intent against Discord. If the bot isn't in your server yet
+it prints the invite link with the right permissions. Finally it installs and
+starts the systemd user services, turning on lingering so they run at boot.
+Rerunning it is safe: current values are the defaults, and the old `.env` is
+kept as `.env.bak`. `--no-service` skips systemd so you can use `./run.sh`.
+
+The agent CLIs themselves (`claude`, `kimi`, `muse`) aren't installed by the
+script; it reports which ones it finds. Steps 1–3 below are the manual
+equivalent, and step 1 (creating the bot in the developer portal) is needed
+either way.
+
 ### 1. Create the Discord bot (one-time)
 
 1. Go to <https://discord.com/developers/applications> → **New Application** → give
@@ -49,7 +72,8 @@ channels, providers, models and session IDs (`data/instances.json`).
    - Scopes: check `bot` **and** `applications.commands`
    - Bot permissions: check **Manage Channels**, **View Channels**, **Send Messages**,
      **Manage Messages** (needed to edit the streaming reply), **Read Message History**,
-     **Change Nickname** (optional). Add **Manage Roles** too if you want `/stop` to
+     **Add Reactions** (✅/❌ on turns), **Attach Files** and **Embed Links** (rendered
+     images, HTML source), **Change Nickname** (optional). Add **Manage Roles** too if you want `/stop` to
      lock channels (without it `/stop` still retains the session, it just can't lock).
    - Copy the generated URL at the bottom, open it in a browser, and invite the bot
      to your server.
@@ -301,5 +325,6 @@ harness/
     ├── kimi.py         # Kimi CLI provider
     └── muse.py         # Muse CLI provider (`muse exec --json`)
 .env.example            # all configuration keys, documented
+setup.sh                # one-shot installer: clone, venv, .env prompts, services
 run.sh                  # starts the harness and the watchdog
 ```
