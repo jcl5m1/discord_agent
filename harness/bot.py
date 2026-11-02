@@ -1142,9 +1142,7 @@ async def cmd_update(interaction: discord.Interaction, force: bool = False) -> N
         lines.append(log_out[:1200])
         _, changed = await _run_cmd("git", "diff", "--name-only", old, new)
         if "requirements.txt" in changed.split():
-            rc, pip_out = await _run_cmd(
-                sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"
-            )
+            rc, pip_out = await _run_cmd(*service.pip_install_cmd())
             if rc != 0:
                 await interaction.followup.send(
                     "\n".join(lines)

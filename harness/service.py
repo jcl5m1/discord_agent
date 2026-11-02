@@ -16,6 +16,7 @@ system-level unit) is left alone.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,17 @@ RestartSec=5
 WantedBy=default.target
 """,
 }
+
+
+def pip_install_cmd() -> list[str]:
+    """Command that installs requirements.txt into this venv.
+
+    Venvs built by uv (including setup.sh's) have no pip module, so prefer uv.
+    """
+    uv = shutil.which("uv")
+    if uv:
+        return [uv, "pip", "install", "--python", sys.executable, "-q", "-r", "requirements.txt"]
+    return [sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"]
 
 
 def current_unit() -> str | None:
