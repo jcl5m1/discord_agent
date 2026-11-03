@@ -47,6 +47,12 @@ BOT_TOKEN: str = os.environ.get("DISCORD_BOT_TOKEN", "")
 GUILD_ID: int = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 CATEGORY_ID: int = int(os.environ.get("DISCORD_CATEGORY_ID", "0"))
 
+# Channels (names or IDs) where any bot sharing this server may take commands;
+# elsewhere this bot only takes them in its own category and instance channels.
+SHARED_CHANNELS: set[str] = {
+    c.strip() for c in os.environ.get("DISCORD_SHARED_CHANNELS", "general").split(",") if c.strip()
+}
+
 DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "kimi")
 DEFAULT_WORKDIR: str = os.path.expanduser(os.environ.get("DEFAULT_WORKDIR", str(Path.home())))
 MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))

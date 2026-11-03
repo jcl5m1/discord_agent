@@ -205,6 +205,17 @@ ignored. Only text is forwarded, so captions count but bare media doesn't.
 `/stop` and `/resume` post a note in the group, and `/delete` leaves it.
 Slash commands stay Discord-only.
 
+### Several bots on one server
+
+Each machine runs its own bot with its own category. A bot only takes slash
+commands in its category, its instance channels and `DISCORD_SHARED_CHANNELS`
+(default `general`). Elsewhere it refuses with a short reply only you can see, so
+picking the wrong bot's command can't run anything on the wrong machine.
+
+Discord still lists every bot's commands in the picker. Its channel settings under
+Server Settings → Integrations don't hide them from a server owner, so the picker
+can't be cleaned up for an admin account. Each bot needs this code to be guarded.
+
 ### Uptime log (`/uptime`)
 
 A third user unit, `discord-agent-uptime.service`, tracks how often the
@@ -333,6 +344,7 @@ harness/
 ├── bot.py              # Discord client: slash commands, message turns, streaming replies
 ├── config.py           # .env loading and typed settings
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
+├── guard.py            # keeps slash commands to this bot's own channels
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 ├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats

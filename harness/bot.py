@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config, files, service, triggers, uptime
+from . import config, files, guard, service, triggers, uptime
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -46,7 +46,31 @@ intents.message_content = True
 intents.guilds = True
 
 client = discord.Client(intents=intents)
-tree = discord.app_commands.CommandTree(client)
+
+
+class GuardedCommandTree(discord.app_commands.CommandTree):
+    """Refuse commands in channels that belong to another bot on this server."""
+
+    async def interaction_check(self, interaction: discord.Interaction, /) -> bool:
+        channel = client.get_channel(interaction.channel_id) if interaction.channel_id else None
+        if channel is None:  # DMs, or not in the cache: nothing to judge it by
+            return True
+        if _channel_allowed(channel):
+            return True
+        log.info("refused /%s in #%s: not this bot's channel",
+                 getattr(interaction.command, "name", "?"), getattr(channel, "name", "?"))
+        # Autocomplete requests run through here too, and can't take a message.
+        if interaction.type is discord.InteractionType.application_command:
+            await interaction.response.send_message(
+                f"⛔ #{channel.name} belongs to another bot, so **{client.user.name}** isn't "
+                f"taking commands here. Use that bot's command, or run it in "
+                f"{' / '.join('#' + c for c in sorted(config.SHARED_CHANNELS))}.",
+                ephemeral=True,
+            )
+        return False
+
+
+tree = GuardedCommandTree(client)
 
 store = InstanceManager()
 # WhatsApp mirror; None when WHATSAPP_OWNER is unset. Created in setup_hook.
@@ -410,6 +434,15 @@ async def on_ready() -> None:
     asyncio.get_running_loop().create_task(_announce_update())
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
+
+
+def _channel_allowed(channel) -> bool:
+    return guard.channel_allowed(
+        channel,
+        category_id=config.CATEGORY_ID,
+        shared=config.SHARED_CHANNELS,
+        instance_channel_ids={i.channel_id for i in store.all()},
+    )
 
 
 @client.event
