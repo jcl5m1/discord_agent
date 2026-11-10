@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config, files, guard, service, triggers, uptime
+from . import config, discord_markdown, files, guard, service, triggers, uptime
 from .instances import Instance, InstanceManager
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -246,7 +246,9 @@ Output formats you can choose from, in order of richness:
    Use this format whenever the result benefits from being interactive.
 2. Static HTML in a fenced ```html code block — the harness renders it to an
    image. Good for one-shot rich documents (tables, reports, layouts).
-3. Plain Markdown text — for everything else.
+3. Plain Markdown text — for everything else. Discord can't display Markdown
+   tables, so the harness turns them into lists; prefer lists or short
+   paragraphs. Headings below ### show as bold text.
 Keep servers on ports {port_start}-{port_end} only; other ports are ignored.
 Annotation feedback (already wired up — nothing for you to enable): every HTML
 page you serve is automatically injected with the reviewjs annotate toolbar.
@@ -319,8 +321,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         _wa_task(wa.typing(inst))
 
     def display(text: str) -> str:
-        text = text.strip()
-        return text if len(text) <= DISCORD_MSG_LIMIT else text[: DISCORD_MSG_LIMIT - 20] + "\n…(truncated)"
+        text = discord_markdown.adapt(text.strip())
+        if len(text) <= DISCORD_MSG_LIMIT:
+            return text
+        # First chunk cuts at a line break and closes any open code block.
+        return discord_markdown.split_message(text, DISCORD_MSG_LIMIT - 20)[0] + "\n…(truncated)"
 
     try:
         try:
@@ -399,13 +404,14 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 png = None
                 final_text += "\n\n(html rendering failed — see raw source above)"
 
+        # Tables and deep headings don't render in Discord (or WhatsApp).
+        final_text = discord_markdown.adapt(final_text)
+
         if wa:
             _wa_task(_mirror_reply(inst, final_text, png, html_block))
 
-        # Final content: split across messages if over the limit.
-        chunks = [
-            final_text[i : i + DISCORD_MSG_LIMIT] for i in range(0, len(final_text), DISCORD_MSG_LIMIT)
-        ]
+        # Split over the limit at line breaks, keeping code blocks intact.
+        chunks = discord_markdown.split_message(final_text, DISCORD_MSG_LIMIT)
         if image:
             await status_msg.edit(content=chunks[0], attachments=[image])
         else:

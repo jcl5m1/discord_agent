@@ -174,6 +174,15 @@ what you want in an HTML code block, e.g.:
 
 The image renders inline on mobile; tap the attachment for the source.
 
+### Markdown in Discord
+
+Discord shows only part of Markdown, so replies are adapted before posting
+(`harness/discord_markdown.py`). Tables become an aligned code block when narrow
+enough for a phone, otherwise a list with one entry per row. Headings below `###`
+become bold lines, and `---` dividers are dropped. Replies over Discord's
+2000-character limit are split at line breaks, and a code block cut by a split is
+closed and reopened so both halves render. Code blocks are never changed.
+
 ### WhatsApp mirror (optional)
 
 Every instance can also get a WhatsApp group, so you can talk to the same
@@ -344,6 +353,7 @@ harness/
 ├── bot.py              # Discord client: slash commands, message turns, streaming replies
 ├── config.py           # .env loading and typed settings
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
+├── discord_markdown.py # adapts replies to Discord's Markdown, splits long ones
 ├── guard.py            # keeps slash commands to this bot's own channels
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls

@@ -42,7 +42,8 @@ def group_name(inst: Instance) -> str:
 
 
 def to_whatsapp_markdown(text: str) -> str:
-    """Adapt Discord markdown: **bold** -> *bold*, <url> -> url, ~~x~~ -> ~x~."""
+    """Adapt Discord markdown: **bold** -> *bold*, <url> -> url, ~~x~~ -> ~x~, # x -> *x*."""
+    text = re.sub(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"**\1**", text, flags=re.MULTILINE)
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.DOTALL)
     text = re.sub(r"~~(.+?)~~", r"~\1~", text, flags=re.DOTALL)
     return re.sub(r"<(https?://[^>\s]+)>", r"\1", text)
