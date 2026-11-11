@@ -23,6 +23,7 @@ import discord
 
 from . import config, discord_markdown, files, guard, service, triggers, uptime
 from .instances import Instance, InstanceManager
+from .pending import PendingTurn, PendingTurns
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
 
@@ -75,6 +76,9 @@ tree = GuardedCommandTree(client)
 store = InstanceManager()
 # WhatsApp mirror; None when WHATSAPP_OWNER is unset. Created in setup_hook.
 wa: "WhatsAppBridge | None" = None
+
+# User messages waiting for (or in) a turn, so edits and deletes reach the agent.
+pending = PendingTurns()
 
 # Serialize turns within a channel; cap total concurrent turns globally.
 _channel_locks: dict[int, asyncio.Lock] = {}
@@ -479,24 +483,87 @@ async def _mirror_reply(
         )
 
 
-async def _process_user_message(inst: Instance, message: discord.Message) -> None:
+async def _react(message: discord.Message, emoji: str) -> None:
+    try:
+        await message.add_reaction(emoji)
+    except discord.NotFound:  # deleted in the meantime
+        pass
+
+
+async def _process_user_message(
+    inst: Instance, message: discord.Message, turn: PendingTurn | None = None
+) -> None:
+    """Run a turn for a Discord message (or for an edit of one, when turn is given).
+
+    Registered before the first await, so an edit or delete that arrives while
+    the message waits for the channel is applied to it.
+    """
     global _last_channel_id
+    turn = turn or pending.add(message.id, message.content)
     _last_channel_id = message.channel.id
     if wa:
-        _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* (Discord):\n{message.content}"))
+        verb = "edited" if turn.edit_of is not None else "(Discord)"
+        _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* {verb}:\n{turn.content}"))
     try:
         async with _global_semaphore:
             async with _channel_lock(message.channel.id):
+                if turn.deleted:
+                    log.info("[%s] message %s deleted before its turn; skipped", inst.name, message.id)
+                    return
+                turn.started = True
                 async with message.channel.typing():
                     status_msg = await message.channel.send("🤔 …")
-                    await _run_turn(inst, message.content, status_msg)
+                    await _run_turn(inst, turn.prompt(), status_msg)
         if store.get(message.channel.id) is inst:  # not /delete'd mid-turn
             inst.last_message_id = str(message.id)
             store.put(inst)
-        await message.add_reaction("✅")
+        await _react(message, "✅")
     except Exception:
         log.exception("message turn failed for %s", inst.name)
-        await message.add_reaction("❌")
+        await _react(message, "❌")
+    finally:
+        pending.finish(turn)
+
+
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    data = payload.data
+    if "content" not in data or (data.get("author") or {}).get("bot"):
+        return
+    inst = store.get(payload.channel_id)
+    if inst is None or inst.stopped:
+        return
+    outcome, turn = pending.edit(payload.message_id, data["content"])
+    if outcome == "updated":
+        log.info("[%s] queued message %s edited before its turn", inst.name, payload.message_id)
+        await _react(payload.message, "✏️")
+    elif outcome == "followup":
+        log.info("[%s] message %s edited after the agent saw it; follow-up queued",
+                 inst.name, payload.message_id)
+        asyncio.get_running_loop().create_task(
+            _process_user_message(inst, payload.message, turn)
+        )
+
+
+def _drop_deleted(channel_id: int, message_ids) -> None:
+    inst = store.get(channel_id)
+    if inst is None:
+        return
+    for message_id in message_ids:
+        if pending.delete(message_id):
+            log.info("[%s] message %s deleted while queued; dropped", inst.name, message_id)
+            if wa:
+                _wa_task(wa.send_text(inst, "🗑️ a queued Discord message was deleted before the agent saw it"))
+
+
+@client.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
+    _drop_deleted(payload.channel_id, [payload.message_id])
+
+
+@client.event
+async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent) -> None:
+    _drop_deleted(payload.channel_id, payload.message_ids)
 
 
 async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> None:

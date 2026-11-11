@@ -121,6 +121,12 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
   creates `#my-project` under the agents category and optionally starts it with a prompt.
 - Just type in the channel — every message is a turn. Watch the 🤔 message update as
   the agent works. ✅ = turn finished, ❌ = error (check harness logs).
+- Editing or deleting a message works the way you'd expect. A message still
+  waiting its turn (✏️ = edit received) is sent with its latest text, or dropped
+  if you delete it. If the agent already has the message, an edit queues a
+  follow-up turn that shows the agent both versions. Deleting a message whose turn
+  is running doesn't stop it. Edits to messages from before the harness last
+  restarted are ignored.
 - `/new name:x provider:claude model:sonnet` picks the agent CLI and model.
   `provider` defaults to `DEFAULT_PROVIDER`; Claude's model defaults to
   `CLAUDE_MODEL` (`claude-opus-5-5`). Aliases `opus`, `sonnet`, `haiku`, `fable`
@@ -355,6 +361,7 @@ harness/
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
 ├── discord_markdown.py # adapts replies to Discord's Markdown, splits long ones
 ├── guard.py            # keeps slash commands to this bot's own channels
+├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 ├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats
