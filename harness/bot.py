@@ -82,6 +82,8 @@ wa: "WhatsAppBridge | None" = None
 pending = PendingTurns()
 
 # Serialize turns within a channel; cap total concurrent turns globally.
+# Take the channel lock BEFORE the global slot, so messages queued behind a
+# busy channel don't hold global slots and starve other channels.
 _channel_locks: dict[int, asyncio.Lock] = {}
 _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
 
@@ -533,8 +535,8 @@ async def _process_user_message(
         verb = "edited" if turn.edit_of is not None else "(Discord)"
         _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* {verb}:\n{turn.content}"))
     try:
-        async with _global_semaphore:
-            async with _channel_lock(message.channel.id):
+        async with _channel_lock(message.channel.id):
+            async with _global_semaphore:
                 if turn.deleted:
                     log.info("[%s] message %s deleted before its turn; skipped", inst.name, message.id)
                     return
@@ -615,8 +617,8 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
         log.exception("[%s] could not mirror whatsapp message to Discord", inst.name)
         mirror = None
     try:
-        async with _global_semaphore:
-            async with _channel_lock(channel.id):
+        async with _channel_lock(channel.id):
+            async with _global_semaphore:
                 async with channel.typing():
                     status_msg = await channel.send("🤔 …")
                     await _run_turn(inst, text, status_msg)
@@ -955,8 +957,8 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     _last_channel_id = channel.id
     if wa:
         _wa_task(wa.send_text(inst, f"💬 (Discord prompt):\n{prompt}"))
-    async with _global_semaphore:
-        async with _channel_lock(channel.id):
+    async with _channel_lock(channel.id):
+        async with _global_semaphore:
             async with channel.typing():
                 status_msg = await channel.send("🤔 …")
                 await _run_turn(inst, prompt, status_msg)
