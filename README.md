@@ -129,16 +129,24 @@ The bot syncs its slash commands on startup and logs in. Leave it running.
 ### Windows
 
 The one-line PowerShell installer above installs any missing prerequisites,
-clones to `~\discord_agent`, builds the venv and installs Chromium, offers the
-Claude/Kimi/Muse installers and logins, securely asks for the Discord token,
-and can install current-user logon tasks for the harness/watchdog and uptime
-monitor. Existing settings are the defaults when rerunning it; `.env.bak` keeps
-the previous configuration. The token is never placed on the command line.
+clones to `~\discord_agent`, builds the venv and installs Chromium, and offers
+the Claude/Kimi/Muse installers and logins. On a new install it can import
+non-secret defaults from another machine over SSH; the bot token and category
+ID are always excluded and Linux paths are translated for Windows.
+
+The wizard securely asks for the Discord token, pauses while you invite the bot,
+validates the server/category/intent, and offers a Claude subscription when an
+API key would otherwise take precedence. It can run a real provider turn, then
+install or cleanly restart the current-user logon tasks and verify fresh bot and
+uptime heartbeats. Existing settings are the defaults when rerunning it;
+`.env.bak` keeps the previous configuration. The token is never placed on the
+command line.
 
 From an existing checkout, run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`.
 Options are `-Directory <path>`, `-NoService` (skip logon tasks), `-ConfigureOnly`
-(skip code, dependencies and CLI installation), and `-SkipChecks` (skip Discord
-API validation). Use Task Scheduler to stop or disable the tasks later.
+(skip code, dependencies and CLI installation), `-SkipChecks` (skip Discord API
+validation), and `-SkipProviderTest` (skip the real provider turn). Use Task
+Scheduler to stop or disable the tasks later.
 
 For a manual setup, edit `windows.env.example`, then run `.\save-token.ps1` to
 create `.env` and securely save the token. An optional `windows.config.local`

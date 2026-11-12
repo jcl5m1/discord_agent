@@ -2,7 +2,8 @@ param(
     [string]$Directory,
     [switch]$NoService,
     [switch]$ConfigureOnly,
-    [switch]$SkipChecks
+    [switch]$SkipChecks,
+    [switch]$SkipProviderTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +59,47 @@ function Read-BotToken([string]$Current) {
     return $token
 }
 
+function Read-ReferenceDefaults {
+    if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) { return @{} }
+    $sshHost = Read-Answer "Copy non-secret defaults from an SSH host (blank skips)"
+    if (-not $sshHost) { return @{} }
+    $remotePath = Read-Answer "Remote .env path" "~/github/jcl5m1/discord_agent/.env"
+    $python = @'
+import base64
+import os
+import sys
+path = os.path.expanduser(base64.b64decode(sys.argv[1]).decode("utf-8"))
+excluded = {"DISCORD_BOT_TOKEN", "DISCORD_CATEGORY_ID"}
+with open(path, encoding="utf-8") as source:
+    for line in source:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0]
+        if key not in excluded:
+            print(line)
+'@
+    $script64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($python))
+    $path64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remotePath))
+    $remoteCommand = "python3 -c `"import base64;exec(base64.b64decode('$script64'))`" '$path64'"
+    $output = & ssh -o BatchMode=yes $sshHost $remoteCommand
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not import reference defaults; continuing without them"
+        return @{}
+    }
+    $map = @{}
+    foreach ($line in $output) {
+        if ($line -match "^([A-Z_][A-Z0-9_]*)=(.*)$") {
+            $map[$matches[1]] = $matches[2]
+        }
+    }
+    if ($map["DEFAULT_WORKDIR"] -match "^/(home|Users)/") { $map["DEFAULT_WORKDIR"] = $HOME }
+    if ($map["KIMI_BIN"]) { $map["KIMI_BIN"] = Join-Path $HOME ".kimi-code\bin\kimi.exe" }
+    if ($map["MUSE_BIN"]) { $map["MUSE_BIN"] = Join-Path $HOME ".local\bin\muse.exe" }
+    Write-Info "Imported $($map.Count) non-secret settings; bot token and category ID were excluded"
+    return $map
+}
+
 function Update-UserPath {
     $directories = @(
         (Join-Path $HOME ".local\bin"),
@@ -106,12 +148,28 @@ function Get-AgentPath([string]$Name) {
     return $null
 }
 
+function Get-ClaudeStatus([string]$Path, [switch]$Subscription) {
+    $previousKey = [Environment]::GetEnvironmentVariable("ANTHROPIC_API_KEY", "Process")
+    try {
+        if ($Subscription) { Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }
+        return & $Path auth status --json 2>$null | Out-String | ConvertFrom-Json
+    }
+    finally {
+        if ($null -eq $previousKey) {
+            Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:ANTHROPIC_API_KEY = $previousKey
+        }
+    }
+}
+
 function Test-AgentLogin([string]$Name, [string]$Path) {
     if (-not $Path) { return $false }
     try {
         switch ($Name) {
             "claude" {
-                $status = (& $Path auth status --json 2>$null | Out-String | ConvertFrom-Json)
+                $status = Get-ClaudeStatus $Path
                 return $status.loggedIn -eq $true
             }
             "kimi" {
@@ -159,7 +217,44 @@ function Get-AgentLabel([string]$Name) {
 }
 
 function Invoke-DiscordApi([string]$Token, [string]$Path) {
-    return Invoke-RestMethod -Method Get -Uri "https://discord.com/api/v10$Path" -Headers @{ Authorization = "Bot $Token" }
+    return Invoke-RestMethod -Method Get -Uri "https://discord.com/api/v10$Path" -Headers @{ Authorization = "Bot $Token" } -UserAgent "DiscordBot (https://github.com/jcl5m1/discord_agent, 1.0)"
+}
+
+function Test-ProviderTurn([string]$Python, [string]$Provider, [string]$Workdir) {
+    $providerScript = @'
+import asyncio
+import os
+import sys
+from harness.providers.base import get_provider
+
+async def main():
+    provider = sys.argv[1]
+    workdir = os.path.expanduser(sys.argv[2])
+    model = "haiku" if provider == "claude" else None
+    final = None
+    async for event in get_provider(provider).run_turn(
+        workdir,
+        "Reply with exactly DISCORD_AGENT_SETUP_OK and nothing else. Do not use tools.",
+        model=model,
+    ):
+        if event.kind in ("done", "error"):
+            final = event
+    if final is None or final.kind != "done":
+        raise RuntimeError(final.text if final else "provider returned no result")
+    print(final.text)
+
+asyncio.run(main())
+'@
+    $providerScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($providerScript))
+    $providerCommand = "import base64;exec(base64.b64decode('$providerScript64'))"
+    $ErrorActionPreference = "Continue"
+    $output = & $Python -c $providerCommand $Provider $Workdir 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Provider test failed:`n$($output.Trim())"
+        return $false
+    }
+    Write-Info "Provider test passed: $($output.Trim())"
+    return $true
 }
 
 function Write-Configuration(
@@ -371,6 +466,10 @@ asyncio.run(main())
         $values = Get-EnvMap (Join-Path $Directory $template)
         foreach ($key in $values.Keys) { $defaults[$key] = $values[$key] }
     }
+    if ($existing.Count -eq 0) {
+        $reference = Read-ReferenceDefaults
+        foreach ($key in $reference.Keys) { $defaults[$key] = $reference[$key] }
+    }
     foreach ($key in $existing.Keys) { $defaults[$key] = $existing[$key] }
 
     if (-not $existing.ContainsKey("DISCORD_BOT_TOKEN") -or -not $existing["DISCORD_BOT_TOKEN"]) {
@@ -395,6 +494,23 @@ asyncio.run(main())
     if (-not $providerDefault) { $providerDefault = "claude" }
     $provider = Read-Answer "Default agent CLI (ready: $($ready -join ', '))" $providerDefault
     if (@("claude", "kimi", "muse") -notcontains $provider) { throw "Provider must be claude, kimi, or muse" }
+    $claudePath = Get-AgentPath "claude"
+    $claudeUseSubscription = "$($defaults["CLAUDE_USE_SUBSCRIPTION"])" -match "^(?i)(1|true|yes)$"
+    if ($provider -eq "claude" -and $env:ANTHROPIC_API_KEY) {
+        try {
+            $subscriptionStatus = Get-ClaudeStatus $claudePath -Subscription
+            if ($subscriptionStatus.loggedIn) {
+                $plan = if ($subscriptionStatus.planTier) { $subscriptionStatus.planTier } else { $subscriptionStatus.subscriptionType }
+                $claudeUseSubscription = Read-YesNo "Use your Claude subscription ($plan) instead of ANTHROPIC_API_KEY?" $claudeUseSubscription
+            }
+            elseif ($claudeUseSubscription) {
+                Write-Warning "No Claude subscription login is available; run 'claude auth login' without ANTHROPIC_API_KEY"
+            }
+        }
+        catch {
+            Write-Warning "Could not check the Claude subscription login: $($_.Exception.Message)"
+        }
+    }
     $workdirDefault = if ($defaults["DEFAULT_WORKDIR"]) { $defaults["DEFAULT_WORKDIR"] } else { $HOME }
     $workdir = Read-Answer "Default working directory for new agents" $workdirDefault
 
@@ -406,13 +522,13 @@ asyncio.run(main())
         $whatsAppBot = (Read-Optional "The bot's separate WhatsApp number" $defaults["WHATSAPP_BOT_NUMBER"]) -replace "\D", ""
     }
     $kimiPath = Get-AgentPath "kimi"
-    $claudePath = Get-AgentPath "claude"
     $musePath = Get-AgentPath "muse"
     $answers = @{
         DISCORD_BOT_TOKEN = $token
         DISCORD_GUILD_ID = $guild
         DISCORD_CATEGORY_ID = $category
         DEFAULT_PROVIDER = $provider
+        CLAUDE_USE_SUBSCRIPTION = $claudeUseSubscription.ToString().ToLower()
         DEFAULT_WORKDIR = $workdir
         PUBLIC_BASE_URL = $publicUrl
         WHATSAPP_OWNER = $whatsAppOwner
@@ -430,23 +546,35 @@ asyncio.run(main())
             $me = Invoke-DiscordApi $token "/users/@me"
             $botId = $me.id
             Write-Info "Token OK - bot is $($me.username)"
-            $app = Invoke-DiscordApi $token "/applications/@me"
-            $intentMask = (1 -shl 18) -bor (1 -shl 19)
-            if (([int64]$app.flags -band $intentMask) -eq 0) {
-                Write-Warning "Message Content Intent appears to be off; enable it in the developer portal"
-            }
         }
         catch {
             Write-Warning "Discord rejected the token or the API is unavailable: $($_.Exception.Message)"
         }
         if ($botId) {
             try {
-                $guildInfo = Invoke-DiscordApi $token "/guilds/$guild"
-                Write-Info "Bot is in server '$($guildInfo.name)'"
+                $app = Invoke-DiscordApi $token "/applications/@me"
+                $intentMask = (1 -shl 18) -bor (1 -shl 19)
+                if (([int64]$app.flags -band $intentMask) -eq 0) {
+                    Write-Warning "Message Content Intent appears to be off; enable it in the developer portal"
+                }
             }
             catch {
-                $invite = "https://discord.com/oauth2/authorize?client_id=$botId&scope=bot+applications.commands&permissions=268561488"
-                Write-Warning "The bot is not in that server yet. Invite it with:`n  $invite"
+                Write-Warning "Could not check Message Content Intent: $($_.Exception.Message)"
+            }
+            $guildInfo = $null
+            $invite = "https://discord.com/oauth2/authorize?client_id=$botId&scope=bot+applications.commands&permissions=268561488"
+            for ($attempt = 1; $attempt -le 3 -and -not $guildInfo; $attempt++) {
+                try {
+                    $guildInfo = Invoke-DiscordApi $token "/guilds/$guild"
+                    Write-Info "Bot is in server '$($guildInfo.name)'"
+                }
+                catch {
+                    Write-Warning "The bot is not in that server yet. Invite it with:`n  $invite"
+                    if ($attempt -lt 3) {
+                        $retry = Read-Answer "Press Enter after inviting the bot, or type 'skip'"
+                        if ($retry -match "^(?i)skip$") { break }
+                    }
+                }
             }
             try {
                 $categoryInfo = Invoke-DiscordApi $token "/channels/$category"
@@ -465,20 +593,50 @@ asyncio.run(main())
     if ($ready.Count -gt 0 -and $ready -notcontains $provider) {
         Write-Warning "Default provider $provider is not installed and logged in"
     }
+    if (-not $SkipProviderTest -and $ready -contains $provider -and (Test-Path -LiteralPath $venvPython)) {
+        if (Read-YesNo "Run a small $provider turn to verify the saved configuration?" $true) {
+            $null = Test-ProviderTurn $venvPython $provider $workdir
+        }
+    }
 
     Write-Step "7/7 Windows logon tasks"
     if ($NoService) {
         Write-Info "Skipping logon tasks; start the harness with: $Directory\run.ps1"
     }
     elseif (Read-YesNo "Install and start the bot, watchdog, and uptime logon tasks?" $true) {
+        $serviceStarted = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         & (Join-Path $Directory "install-windows-tasks.ps1") -Start
-        Start-Sleep -Seconds 3
-        $task = Get-ScheduledTask -TaskName "Discord Agent"
-        if ($task.State -eq "Running") {
-            Write-Info "Discord Agent is running"
+        Start-Sleep -Seconds 5
+        $tasks = Get-ScheduledTask -TaskName "Discord Agent", "Discord Agent Uptime"
+        foreach ($task in $tasks) {
+            if ($task.State -eq "Running") {
+                Write-Info "$($task.TaskName) is running"
+            }
+            else {
+                Write-Warning "$($task.TaskName) is not running; check Task Scheduler (state: $($task.State))"
+            }
+        }
+        $runtimeCheck = @'
+import json
+import sys
+import time
+from pathlib import Path
+started = float(sys.argv[1])
+for name, key in (("heartbeat.json", "ts"), ("uptime_state.json", "last_alive")):
+    data = json.loads((Path("data") / name).read_text())
+    stamp = data[key]
+    assert started - 5 <= stamp <= time.time() + 5, f"{name} is stale"
+    assert time.time() - stamp < 90, f"{name} is not updating"
+print("Bot heartbeat and uptime state are fresh")
+'@
+        $runtimeCheck64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($runtimeCheck))
+        $runtimeCommand = "import base64;exec(base64.b64decode('$runtimeCheck64'))"
+        & $venvPython -c $runtimeCommand $serviceStarted 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Bot heartbeat and uptime state are fresh"
         }
         else {
-            Write-Warning "Discord Agent is not running; check Task Scheduler (state: $($task.State))"
+            Write-Warning "Tasks started, but fresh heartbeat files were not detected"
         }
     }
     else {
