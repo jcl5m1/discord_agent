@@ -47,6 +47,12 @@ def _migrate_claude_session(old_cwd: str, new_cwd: str, session_id: str) -> None
         log.info("migrated claude session %s: %s -> %s", session_id, src.parent, dst.parent)
 
 
+def normalize_workdir(path: str) -> str:
+    """Subprocesses get workdir as cwd verbatim, so "~" must be expanded here
+    or it becomes a literal directory under the harness's own cwd."""
+    return os.path.abspath(os.path.expanduser(path))
+
+
 @dataclass
 class Instance:
     channel_id: int
@@ -62,9 +68,7 @@ class Instance:
     origin: str | None = None  # "trigger:<name>" when created by an external trigger
 
     def __post_init__(self) -> None:
-        # Subprocesses get workdir as cwd verbatim, so "~" must be expanded here
-        # or it becomes a literal directory under the harness's own cwd.
-        self.workdir = os.path.abspath(os.path.expanduser(self.workdir))
+        self.workdir = normalize_workdir(self.workdir)
 
     def ensure_web_token(self) -> str:
         if not self.web_token:

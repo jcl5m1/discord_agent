@@ -23,7 +23,7 @@ from pathlib import Path
 import discord
 
 from . import config, discord_markdown, files, guard, logins, service, triggers, uptime, workdirs
-from .instances import Instance, InstanceManager
+from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
 from .providers.base import get_provider, provider_names
 from .render import render_html_to_png
@@ -82,6 +82,8 @@ wa: "WhatsAppBridge | None" = None
 pending = PendingTurns()
 
 # Serialize turns within a channel; cap total concurrent turns globally.
+# Take the channel lock BEFORE the global slot, so messages queued behind a
+# busy channel don't hold global slots and starve other channels.
 _channel_locks: dict[int, asyncio.Lock] = {}
 _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
 
@@ -388,7 +390,17 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 "[%s] turn failed after %.0fs: %.300s",
                 inst.name, loop.time() - started, error,
             )
-            await status_msg.edit(content=f"❌ {display(error)}")
+            if inst.session_id and _SESSION_IN_USE_RE.search(error):
+                await status_msg.edit(
+                    content=display(
+                        f"❌ {error}\n\nAnother `{inst.provider}` process still has this session "
+                        "open, maybe a turn from this instance's old channel or a terminal on "
+                        "this machine. Start a fresh session, or retry once it's closed."
+                    ),
+                    view=SessionInUseView(inst, prompt),
+                )
+            else:
+                await status_msg.edit(content=f"❌ {display(error)}")
             if wa:
                 _wa_task(wa.send_text(inst, f"❌ {error}"))
             return
@@ -523,8 +535,8 @@ async def _process_user_message(
         verb = "edited" if turn.edit_of is not None else "(Discord)"
         _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* {verb}:\n{turn.content}"))
     try:
-        async with _global_semaphore:
-            async with _channel_lock(message.channel.id):
+        async with _channel_lock(message.channel.id):
+            async with _global_semaphore:
                 if turn.deleted:
                     log.info("[%s] message %s deleted before its turn; skipped", inst.name, message.id)
                     return
@@ -605,8 +617,8 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
         log.exception("[%s] could not mirror whatsapp message to Discord", inst.name)
         mirror = None
     try:
-        async with _global_semaphore:
-            async with _channel_lock(channel.id):
+        async with _channel_lock(channel.id):
+            async with _global_semaphore:
                 async with channel.typing():
                     status_msg = await channel.send("🤔 …")
                     await _run_turn(inst, text, status_msg)
@@ -738,30 +750,17 @@ async def cmd_new(
 
     existing = store.by_name(name)
     if existing is not None:
-        # Reopening a stopped/archived instance: new channel, same session.
-        channel = await guild.create_text_channel(
-            name=_slug(name), category=discord.Object(id=config.CATEGORY_ID)
-        )
-        existing.channel_id = channel.id
-        existing.stopped = False
-        if provider and provider != existing.provider:
-            # Session ids are provider-specific, so a provider switch starts over.
-            existing.provider = provider
-            existing.session_id = None
-            existing.model = model
-        elif model:
-            existing.model = model
-        store.put(existing)
-        if wa:
-            _wa_task(wa.ensure_group(existing))
-        await interaction.followup.send(
-            f"✅ reopened {channel.mention} — "
-            + (f"resuming `{existing.provider}` session `{existing.session_id}`"
-               if existing.session_id else f"new `{existing.provider}` session")
-            + f" on next message (model: `{_model_label(existing)}`)."
-        )
-        if prompt:
-            await on_message_simple(channel, prompt)
+        options = dict(provider=provider, model=model, workdir=workdir, prompt=prompt)
+        switching = provider is not None and provider != existing.provider
+        if existing.session_id is None or switching:
+            # Nothing to resume (session ids are provider-specific): just reopen.
+            channel, msg = await _reopen_instance(guild, existing, fresh=True, **options)
+            await interaction.followup.send(msg)
+            if prompt:
+                await on_message_simple(channel, prompt)
+            return
+        view = ReopenView(existing, owner_id=interaction.user.id, **options)
+        view.message = await interaction.followup.send(view.question(), view=view, wait=True)
         return
 
     channel = await guild.create_text_channel(
@@ -786,6 +785,170 @@ async def cmd_new(
         await on_message_simple(channel, prompt)
 
 
+def _instance_turn_running(inst: Instance) -> bool:
+    """A turn for this instance is running, possibly in a channel it has since left."""
+    return any(t["instance"] == inst.name for t in _active_turns.values())
+
+
+async def _reopen_instance(
+    guild: discord.Guild,
+    inst: Instance,
+    *,
+    fresh: bool,
+    provider: str | None = None,
+    model: str | None = None,
+    workdir: str | None = None,
+    prompt: str | None = None,
+) -> tuple[discord.TextChannel, str]:
+    """Give an existing instance a new channel, resuming its session or starting fresh."""
+    channel = await guild.create_text_channel(
+        name=_slug(inst.name), category=discord.Object(id=config.CATEGORY_ID)
+    )
+    inst.channel_id = channel.id
+    inst.stopped = False
+    if provider and provider != inst.provider:
+        inst.provider = provider
+        inst.model = model
+        fresh = True  # session ids are provider-specific
+    elif model:
+        inst.model = model
+    note = ""
+    if fresh:
+        inst.session_id = None
+        if workdir:
+            inst.workdir = normalize_workdir(workdir)
+    elif workdir:
+        note = " The folder is unchanged: a resumed session keeps its own."
+    store.put(inst)
+    if wa:
+        _wa_task(wa.ensure_group(inst))
+    how = (f"resuming `{inst.provider}` session `{inst.session_id}`" if inst.session_id
+           else f"fresh `{inst.provider}` session")
+    log.info("[%s] reopened in #%s: %s", inst.name, channel.name, how)
+    return channel, (
+        f"✅ reopened {channel.mention}: {how} on the next message "
+        f"(model `{_model_label(inst)}`, workdir `{inst.workdir}`).{note}"
+    )
+
+
+class ReopenView(discord.ui.View):
+    """Resume / Start fresh / Cancel, for /new with a name that already exists."""
+
+    def __init__(self, inst: Instance, *, owner_id: int, **options):
+        super().__init__(timeout=600)
+        self.inst = inst
+        self.owner_id = owner_id
+        self.options = options
+        self.message: discord.Message | None = None
+        self._done = False
+
+    def question(self) -> str:
+        text = (
+            f"**{self.inst.name}** already exists: `{self.inst.provider}` session "
+            f"`{self.inst.session_id}` in `{self.inst.workdir}`. Resume that conversation in "
+            "the new channel, or start a fresh session?"
+        )
+        if _instance_turn_running(self.inst):
+            text += ("\n⏳ A turn for it is still running in its old channel. Resume becomes "
+                     "possible once it finishes; Start fresh works now.")
+        return text
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Only whoever ran `/new` can choose.", ephemeral=True)
+            return False
+        return True
+
+    async def _choose(self, interaction: discord.Interaction, fresh: bool) -> None:
+        if self._done:
+            await interaction.response.send_message("Already chosen.", ephemeral=True)
+            return
+        if store.by_name(self.inst.name) is not self.inst:
+            self._done = True
+            await interaction.response.edit_message(
+                content=f"**{self.inst.name}** was deleted in the meantime; run `/new` again.", view=None
+            )
+            return
+        if not fresh and _instance_turn_running(self.inst):
+            # Two turns on one session is exactly what makes the CLI refuse it.
+            await interaction.response.send_message(
+                "⏳ Its old channel still has a turn running on that session. Wait for it to "
+                "finish and press Resume again, or Start fresh now.",
+                ephemeral=True,
+            )
+            return
+        self._done = True
+        self.stop()
+        await interaction.response.edit_message(
+            content="✨ Starting fresh…" if fresh else "▶️ Resuming…", view=None
+        )
+        prompt = self.options.pop("prompt", None)
+        channel, msg = await _reopen_instance(interaction.guild, self.inst, fresh=fresh, **self.options)
+        await interaction.edit_original_response(content=msg)
+        if prompt:
+            await on_message_simple(channel, prompt)
+
+    @discord.ui.button(label="Resume", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def resume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._choose(interaction, fresh=False)
+
+    @discord.ui.button(label="Start fresh", emoji="✨", style=discord.ButtonStyle.secondary)
+    async def start_fresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._choose(interaction, fresh=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._done = True
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled; nothing changed.", view=None)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None and not self._done:
+            try:
+                await self.message.edit(content="Timed out; nothing changed. Run `/new` again.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+# Agent CLIs refuse a session another process still has open (kimi says "in use
+# by another Kimi Code CLI instance").
+_SESSION_IN_USE_RE = re.compile(r"in use by another|session (is )?(already )?in use", re.IGNORECASE)
+
+
+class SessionInUseView(discord.ui.View):
+    """Recovery buttons on a turn that failed because its session is locked elsewhere."""
+
+    def __init__(self, inst: Instance, prompt: str):
+        super().__init__(timeout=3600)
+        self.inst = inst
+        self.prompt = prompt
+        self._done = False
+
+    async def _retry(self, interaction: discord.Interaction, fresh: bool) -> None:
+        if self._done:
+            await interaction.response.send_message("Already handled.", ephemeral=True)
+            return
+        self._done = True
+        self.stop()
+        if fresh and store.get(self.inst.channel_id) is self.inst:
+            self.inst.session_id = None
+            store.put(self.inst)
+            log.info("[%s] session in use elsewhere; starting fresh", self.inst.name)
+        await interaction.response.edit_message(
+            content=interaction.message.content + ("\n✨ Started a fresh session." if fresh else "\n🔁 Retrying."),
+            view=None,
+        )
+        asyncio.get_running_loop().create_task(on_message_simple(interaction.channel, self.prompt))
+
+    @discord.ui.button(label="Start fresh & retry", emoji="✨", style=discord.ButtonStyle.primary)
+    async def fresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._retry(interaction, fresh=True)
+
+    @discord.ui.button(label="Retry", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._retry(interaction, fresh=False)
+
+
 async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     global _last_channel_id
     inst = store.get(channel.id)
@@ -794,8 +957,8 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     _last_channel_id = channel.id
     if wa:
         _wa_task(wa.send_text(inst, f"💬 (Discord prompt):\n{prompt}"))
-    async with _global_semaphore:
-        async with _channel_lock(channel.id):
+    async with _channel_lock(channel.id):
+        async with _global_semaphore:
             async with channel.typing():
                 status_msg = await channel.send("🤔 …")
                 await _run_turn(inst, prompt, status_msg)

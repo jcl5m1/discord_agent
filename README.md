@@ -215,7 +215,13 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   instance is still tracked. The session resumes on the next message.
 - `/delete name:my-project` stops the instance (if active) and removes it for
   good — channel deleted, instance forgotten.
-- `/new name:my-project` again reopens the channel and **resumes the same session**.
+- `/new name:my-project` again, for a name that already exists, asks whether to
+  **Resume** its conversation in the new channel or **Start fresh** (a new session,
+  using `workdir` if you give one). Resume waits until any turn still running in the
+  old channel finishes, because two turns can't share one session.
+- If a turn fails because its session is open in another process (kimi: "in use by
+  another Kimi Code CLI instance"), the error offers **Start fresh & retry** and
+  **Retry**.
 - `/usage` shows plan usage / remaining quota as each CLI reports it
   (`claude -p /usage`, `muse usage`, and kimi's account usage via a short-lived
   local `kimi web` server). Defaults to the channel's provider, or all providers
