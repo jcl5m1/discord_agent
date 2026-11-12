@@ -177,6 +177,10 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
 
 - `/new name:my-project workdir:/home/you/code/my-project prompt:give me a summary of this repo`
   creates `#my-project` under the agents category and optionally starts it with a prompt.
+  `workdir` browses folders as you type: it starts with your home folder (and
+  folders your agents already use), picking a folder ending in `/` lists its
+  subfolders next, and "use this folder" picks the one you're in. Typing filters
+  the current level; a name that doesn't exist yet is created.
 - Just type in the channel — every message is a turn. Watch the 🤔 message update as
   the agent works. ✅ = turn finished, ❌ = error (check harness logs).
 - Editing or deleting a message works the way you'd expect. A message still
@@ -421,6 +425,7 @@ harness/
 ├── guard.py            # keeps slash commands to this bot's own channels
 ├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
+├── workdirs.py         # folder-by-folder workdir suggestions for /new
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 ├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats
 └── providers/

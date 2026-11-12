@@ -18,10 +18,11 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import discord
 
-from . import config, discord_markdown, files, guard, logins, service, triggers, uptime
+from . import config, discord_markdown, files, guard, logins, service, triggers, uptime, workdirs
 from .instances import Instance, InstanceManager
 from .pending import PendingTurn, PendingTurns
 from .providers.base import get_provider, provider_names
@@ -653,6 +654,17 @@ def _model_label(inst: Instance) -> str:
     return get_provider(inst.provider).resolve_model(inst.model) or "CLI default"
 
 
+async def _workdir_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[discord.app_commands.Choice[str]]:
+    """Browse folders one level at a time, starting from the home directory."""
+    recent = sorted({i.workdir for i in store.all()})
+    return [
+        discord.app_commands.Choice(name=name, value=value)
+        for name, value in workdirs.suggest(current, Path.home(), recent)
+    ]
+
+
 async def _model_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[discord.app_commands.Choice[str]]:
@@ -697,7 +709,7 @@ def _split_model(provider: str | None, model: str | None) -> tuple[str | None, s
 @tree.command(name="new", description="Create a new agent instance channel")
 @discord.app_commands.describe(
     name="Instance name (becomes the channel name)",
-    workdir="Working directory for the agent (default: DEFAULT_WORKDIR)",
+    workdir="Folder to work in: pick folders one level at a time (default: DEFAULT_WORKDIR)",
     prompt="Optional first prompt to start the agent with",
     provider="Agent CLI to use (default: DEFAULT_PROVIDER)",
     model="provider:model from the list, or a bare alias/ID (default: the provider's default)",
@@ -705,7 +717,7 @@ def _split_model(provider: str | None, model: str | None) -> tuple[str | None, s
 @discord.app_commands.choices(
     provider=[discord.app_commands.Choice(name=p, value=p) for p in provider_names()]
 )
-@discord.app_commands.autocomplete(model=_model_autocomplete)
+@discord.app_commands.autocomplete(model=_model_autocomplete, workdir=_workdir_autocomplete)
 async def cmd_new(
     interaction: discord.Interaction,
     name: str,
