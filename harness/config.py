@@ -85,6 +85,9 @@ CLAUDE_BIN: str = os.path.expanduser(os.environ.get("CLAUDE_BIN", "claude"))
 CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5"
 # Passed as --permission-mode; bypassPermissions mirrors kimi's auto policy.
 CLAUDE_PERMISSION_MODE: str = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
+CLAUDE_USE_SUBSCRIPTION: bool = os.environ.get("CLAUDE_USE_SUBSCRIPTION", "").lower() in {"1", "true", "yes"}
+if CLAUDE_USE_SUBSCRIPTION:
+    os.environ.pop("ANTHROPIC_API_KEY", None)
 
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
 # Seconds between internet checks; only state changes are logged.

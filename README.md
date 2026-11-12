@@ -78,6 +78,10 @@ channels, providers, models and session IDs (`data/instances.json`).
 > `kimi -p` under Kimi's `auto` policy. Only point instances at working directories
 > you trust.
 
+If `ANTHROPIC_API_KEY` is set but you want Claude to use your claude.ai
+subscription login instead, set `CLAUDE_USE_SUBSCRIPTION=true` in `.env`. The
+harness removes the API key from its own environment and its Claude subprocesses.
+
 ## Setup
 
 The [one-line install](#install-in-one-line) does all of this automatically;
