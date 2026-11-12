@@ -148,18 +148,23 @@ function Get-AgentPath([string]$Name) {
     return $null
 }
 
-function Get-ClaudeStatus([string]$Path, [switch]$Subscription) {
-    $previousKey = [Environment]::GetEnvironmentVariable("ANTHROPIC_API_KEY", "Process")
+function Get-ClaudeStatus([string]$Path) {
+    $previousKeys = @{}
+    foreach ($name in @("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")) {
+        $previousKeys[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    }
     try {
-        if ($Subscription) { Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }
         return & $Path auth status --json 2>$null | Out-String | ConvertFrom-Json
     }
     finally {
-        if ($null -eq $previousKey) {
-            Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:ANTHROPIC_API_KEY = $previousKey
+        foreach ($name in $previousKeys.Keys) {
+            if ($null -eq $previousKeys[$name]) {
+                Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+            }
+            else {
+                [Environment]::SetEnvironmentVariable($name, $previousKeys[$name], "Process")
+            }
         }
     }
 }
@@ -178,7 +183,8 @@ function Test-AgentLogin([string]$Name, [string]$Path) {
             }
             "muse" {
                 $authPath = Join-Path $HOME ".config\muse\auth.json"
-                return -not [string]::IsNullOrWhiteSpace($env:META_API_KEY) -or (Test-Path -LiteralPath $authPath)
+                if (-not (Test-Path -LiteralPath $authPath)) { return $false }
+                return (Get-Content -LiteralPath $authPath -Raw) -match '"mechanism":\s*"oauth"'
             }
         }
     }
@@ -288,18 +294,49 @@ function Write-Configuration(
             $line
         }
     })
-    $extra = @($Existing.Keys | Where-Object { -not $seen.ContainsKey($_) } | Sort-Object)
+    # Provider API keys bill per token instead of your subscription; obsolete
+    # auth toggles are removed at the same time.
+    $dropped = @($Existing.Keys | Where-Object { $RemovedAuthVars -contains $_ } | Sort-Object)
+    if ($dropped.Count -gt 0) {
+        Write-Info "Removed unused provider auth settings from .env: $($dropped -join ', ')"
+    }
+    $extra = @($Existing.Keys | Where-Object { -not $seen.ContainsKey($_) -and $RemovedAuthVars -notcontains $_ } | Sort-Object)
     if ($extra.Count -gt 0) {
         $lines += ""
         $lines += "# --- kept from the previous .env ---"
         foreach ($key in $extra) { $lines += "$key=$($Existing[$key])" }
     }
     if (Test-Path -LiteralPath $envPath) {
-        Copy-Item -LiteralPath $envPath -Destination "$envPath.bak" -Force
+        # The backup keeps your previous settings, but not the auth settings removed above.
+        $backup = @([IO.File]::ReadAllLines($envPath) | Where-Object {
+            -not ($_ -match "^([A-Z_][A-Z0-9_]*)=" -and $RemovedAuthVars -contains $matches[1])
+        })
+        [IO.File]::WriteAllLines("$envPath.bak", [string[]]$backup, (New-Object System.Text.UTF8Encoding($false)))
         Write-Info "Previous .env saved as .env.bak"
     }
     [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
     Write-Info "Wrote $envPath"
+}
+
+# Keep in sync with AGENT_API_KEY_VARS in harness/config.py.
+$ApiKeyVars = @("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "META_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY")
+$RemovedAuthVars = $ApiKeyVars + @("CLAUDE_USE_SUBSCRIPTION")
+
+function Remove-StoredApiKeys {
+    # Windows keeps user environment variables permanently; the harness ignores
+    # these, but offer to delete them so the keys aren't stored at all.
+    foreach ($name in $ApiKeyVars) {
+        $stored = [Environment]::GetEnvironmentVariable($name, "User")
+        if ([string]::IsNullOrEmpty($stored)) { continue }
+        if (Read-YesNo "$name is stored in your Windows user environment. The harness ignores it and uses your subscription logins. Delete it?" $true) {
+            [Environment]::SetEnvironmentVariable($name, $null, "User")
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+            Write-Info "Deleted $name"
+        }
+        else {
+            Write-Info "Kept $name (the harness still ignores it)"
+        }
+    }
 }
 
 Update-UserPath
@@ -458,6 +495,7 @@ asyncio.run(main())
     }
     if ($ready.Count -eq 0) { Write-Warning "No agent CLI is ready; the bot can start but turns will fail" }
 
+    if (-not $ConfigureOnly) { Remove-StoredApiKeys }
     Write-Step "5/7 Configuration"
     $envPath = Join-Path $Directory ".env"
     $existing = Get-EnvMap $envPath
@@ -495,22 +533,6 @@ asyncio.run(main())
     $provider = Read-Answer "Default agent CLI (ready: $($ready -join ', '))" $providerDefault
     if (@("claude", "kimi", "muse") -notcontains $provider) { throw "Provider must be claude, kimi, or muse" }
     $claudePath = Get-AgentPath "claude"
-    $claudeUseSubscription = "$($defaults["CLAUDE_USE_SUBSCRIPTION"])" -match "^(?i)(1|true|yes)$"
-    if ($provider -eq "claude" -and $env:ANTHROPIC_API_KEY) {
-        try {
-            $subscriptionStatus = Get-ClaudeStatus $claudePath -Subscription
-            if ($subscriptionStatus.loggedIn) {
-                $plan = if ($subscriptionStatus.planTier) { $subscriptionStatus.planTier } else { $subscriptionStatus.subscriptionType }
-                $claudeUseSubscription = Read-YesNo "Use your Claude subscription ($plan) instead of ANTHROPIC_API_KEY?" $claudeUseSubscription
-            }
-            elseif ($claudeUseSubscription) {
-                Write-Warning "No Claude subscription login is available; run 'claude auth login' without ANTHROPIC_API_KEY"
-            }
-        }
-        catch {
-            Write-Warning "Could not check the Claude subscription login: $($_.Exception.Message)"
-        }
-    }
     $workdirDefault = if ($defaults["DEFAULT_WORKDIR"]) { $defaults["DEFAULT_WORKDIR"] } else { $HOME }
     $workdir = Read-Answer "Default working directory for new agents" $workdirDefault
 
@@ -528,7 +550,6 @@ asyncio.run(main())
         DISCORD_GUILD_ID = $guild
         DISCORD_CATEGORY_ID = $category
         DEFAULT_PROVIDER = $provider
-        CLAUDE_USE_SUBSCRIPTION = $claudeUseSubscription.ToString().ToLower()
         DEFAULT_WORKDIR = $workdir
         PUBLIC_BASE_URL = $publicUrl
         WHATSAPP_OWNER = $whatsAppOwner

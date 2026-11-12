@@ -78,9 +78,29 @@ channels, providers, models and session IDs (`data/instances.json`).
 > `kimi -p` under Kimi's `auto` policy. Only point instances at working directories
 > you trust.
 
-If `ANTHROPIC_API_KEY` is set but you want Claude to use your claude.ai
-subscription login instead, set `CLAUDE_USE_SUBSCRIPTION=true` in `.env`. The
-harness removes the API key from its own environment and its Claude subprocesses.
+### Signing in: subscriptions, not API keys
+
+The agents run on your subscription logins (Claude Pro/Max, Kimi Code, Muse).
+Provider API keys switch the CLIs to per-token billing, so the harness ignores
+them: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `META_API_KEY`,
+`MOONSHOT_API_KEY` and `KIMI_API_KEY` are removed from its environment and every
+agent's, and startup logs which ones it ignored. Set `ALLOW_AGENT_API_KEYS=true`
+only if you want API billing.
+
+Sign in from Discord with `/login` (server admins; replies only you can see):
+
+- `/login` shows each CLI's status: subscription, API billing, or not signed in.
+- `/login provider:kimi` or `provider:muse` posts a sign-in link and a code to
+  confirm. Approve it in any browser, such as your phone's, and the bot confirms
+  when the CLI has finished.
+- `/login provider:claude` posts a sign-in link. After you approve, the page shows
+  a code: send it with `/login provider:claude code:<the code>`.
+- `again:True` signs in again when a CLI is already signed in.
+
+The harness never stores credentials: each CLI keeps its own login, exactly as if
+you'd signed in at the machine. The setup scripts also drop any of those API keys
+from `.env` (and its backup), and on Windows offer to delete them from your user
+environment variables.
 
 ## Setup
 
@@ -135,10 +155,10 @@ non-secret defaults from another machine over SSH; the bot token and category
 ID are always excluded and Linux paths are translated for Windows.
 
 The wizard securely asks for the Discord token, pauses while you invite the bot,
-validates the server/category/intent, and offers a Claude subscription when an
-API key would otherwise take precedence. It can run a real provider turn, then
-install or cleanly restart the current-user logon tasks and verify fresh bot and
-uptime heartbeats. Existing settings are the defaults when rerunning it;
+validates the server/category/intent, and checks subscription logins while
+keeping provider API keys from taking precedence. It can run a real provider
+turn, then install or cleanly restart the current-user logon tasks and verify
+fresh bot and uptime heartbeats. Existing settings are the defaults when rerunning it;
 `.env.bak` keeps the previous configuration. The token is never placed on the
 command line.
 
@@ -165,6 +185,10 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
 
 - `/new name:my-project workdir:/home/you/code/my-project prompt:give me a summary of this repo`
   creates `#my-project` under the agents category and optionally starts it with a prompt.
+  `workdir` browses folders as you type: it starts with your home folder (and
+  folders your agents already use), picking a folder ending in `/` lists its
+  subfolders next, and "use this folder" picks the one you're in. Typing filters
+  the current level; a name that doesn't exist yet is created.
 - Just type in the channel — every message is a turn. Watch the 🤔 message update as
   the agent works. ✅ = turn finished, ❌ = error (check harness logs).
 - Editing or deleting a message works the way you'd expect. A message still
@@ -409,6 +433,7 @@ harness/
 ├── guard.py            # keeps slash commands to this bot's own channels
 ├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
+├── workdirs.py         # folder-by-folder workdir suggestions for /new
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 ├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats
 └── providers/

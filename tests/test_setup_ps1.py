@@ -109,39 +109,42 @@ class SetupWizardTests(unittest.TestCase):
         self.assertNotIn("/home/jcl5m1", config)
         self.assertIn(f"DEFAULT_WORKDIR={self.tmp.name}", config)
 
-    def test_claude_subscription_prompt_updates_setting(self):
+    def test_claude_login_check_ignores_api_key(self):
         fake_bin = Path(self.tmp.name) / "bin"
         fake_bin.mkdir()
         (fake_bin / "claude.cmd").write_text(
             "@echo off\n"
-            "echo {\"loggedIn\": true, \"subscriptionType\": \"max\", \"planTier\": \"max_20x\"}\n"
+            "if defined ANTHROPIC_API_KEY (\n"
+            "  echo {\"loggedIn\": false, \"authMethod\": \"api_key\"}\n"
+            ") else (\n"
+            "  echo {\"loggedIn\": true, \"authMethod\": \"claude.ai\"}\n"
+            ")\n"
         )
-        env = {
-            "ANTHROPIC_API_KEY": "external-key",
-            "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
-            "USERPROFILE": self.tmp.name,
-        }
+        with (self.repo / "windows.env.example").open("a", encoding="utf-8") as env_file:
+            env_file.write("DEFAULT_PROVIDER=kimi\n")
         answers = [
             "",
             "test-token",
             "123456789012345678",
             "234567890123456789",
-            "claude",
-            "y",
+            "",
             "C:\\work",
             "-",
             "-",
         ]
-        result = self.run_wizard(answers, env)
+        result = self.run_wizard(
+            answers,
+            {
+                "ANTHROPIC_API_KEY": "external-key",
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "USERPROFILE": self.tmp.name,
+            },
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         config = (self.repo / ".env").read_text(encoding="utf-8")
-        self.assertIn("CLAUDE_USE_SUBSCRIPTION=true", config)
-
-        result = self.run_wizard(["", "", "", "", "n", "", "", ""], env)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        config = (self.repo / ".env").read_text(encoding="utf-8")
-        self.assertIn("CLAUDE_USE_SUBSCRIPTION=false", config)
-        self.assertIn("DISCORD_BOT_TOKEN=test-token", config)
+        self.assertIn("DEFAULT_PROVIDER=claude", config)
+        self.assertIn("ALLOW_AGENT_API_KEYS=false", config)
+        self.assertNotIn("CLAUDE_USE_SUBSCRIPTION", config)
 
     def test_powershell_scripts_parse(self):
         for name in ("setup.ps1", "run.ps1", "save-token.ps1", "install-windows-tasks.ps1"):
