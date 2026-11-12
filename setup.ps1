@@ -120,7 +120,8 @@ function Test-AgentLogin([string]$Name, [string]$Path) {
             }
             "muse" {
                 $authPath = Join-Path $HOME ".config\muse\auth.json"
-                return -not [string]::IsNullOrWhiteSpace($env:META_API_KEY) -or (Test-Path -LiteralPath $authPath)
+                if (-not (Test-Path -LiteralPath $authPath)) { return $false }
+                return (Get-Content -LiteralPath $authPath -Raw) -match '"mechanism":\s*"oauth"'
             }
         }
     }
@@ -193,18 +194,48 @@ function Write-Configuration(
             $line
         }
     })
-    $extra = @($Existing.Keys | Where-Object { -not $seen.ContainsKey($_) } | Sort-Object)
+    # Provider API keys bill per token instead of your subscription; the harness
+    # ignores them, so don't carry them over.
+    $dropped = @($Existing.Keys | Where-Object { $ApiKeyVars -contains $_ } | Sort-Object)
+    if ($dropped.Count -gt 0) {
+        Write-Info "Removed from .env (the agents use your subscription logins): $($dropped -join ', ')"
+    }
+    $extra = @($Existing.Keys | Where-Object { -not $seen.ContainsKey($_) -and $ApiKeyVars -notcontains $_ } | Sort-Object)
     if ($extra.Count -gt 0) {
         $lines += ""
         $lines += "# --- kept from the previous .env ---"
         foreach ($key in $extra) { $lines += "$key=$($Existing[$key])" }
     }
     if (Test-Path -LiteralPath $envPath) {
-        Copy-Item -LiteralPath $envPath -Destination "$envPath.bak" -Force
+        # The backup keeps your previous settings, but not the API keys removed above.
+        $backup = @([IO.File]::ReadAllLines($envPath) | Where-Object {
+            -not ($_ -match "^([A-Z_][A-Z0-9_]*)=" -and $ApiKeyVars -contains $matches[1])
+        })
+        [IO.File]::WriteAllLines("$envPath.bak", [string[]]$backup, (New-Object System.Text.UTF8Encoding($false)))
         Write-Info "Previous .env saved as .env.bak"
     }
     [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
     Write-Info "Wrote $envPath"
+}
+
+# Keep in sync with AGENT_API_KEY_VARS in harness/config.py.
+$ApiKeyVars = @("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "META_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY")
+
+function Remove-StoredApiKeys {
+    # Windows keeps user environment variables permanently; the harness ignores
+    # these, but offer to delete them so the keys aren't stored at all.
+    foreach ($name in $ApiKeyVars) {
+        $stored = [Environment]::GetEnvironmentVariable($name, "User")
+        if ([string]::IsNullOrEmpty($stored)) { continue }
+        if (Read-YesNo "$name is stored in your Windows user environment. The harness ignores it and uses your subscription logins. Delete it?" $true) {
+            [Environment]::SetEnvironmentVariable($name, $null, "User")
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+            Write-Info "Deleted $name"
+        }
+        else {
+            Write-Info "Kept $name (the harness still ignores it)"
+        }
+    }
 }
 
 Update-UserPath
@@ -363,6 +394,7 @@ asyncio.run(main())
     }
     if ($ready.Count -eq 0) { Write-Warning "No agent CLI is ready; the bot can start but turns will fail" }
 
+    if (-not $ConfigureOnly) { Remove-StoredApiKeys }
     Write-Step "5/7 Configuration"
     $envPath = Join-Path $Directory ".env"
     $existing = Get-EnvMap $envPath

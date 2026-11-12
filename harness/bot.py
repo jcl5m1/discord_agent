@@ -21,7 +21,7 @@ import time
 
 import discord
 
-from . import config, discord_markdown, files, guard, service, triggers, uptime
+from . import config, discord_markdown, files, guard, logins, service, triggers, uptime
 from .instances import Instance, InstanceManager
 from .pending import PendingTurn, PendingTurns
 from .providers.base import get_provider, provider_names
@@ -455,6 +455,9 @@ async def on_ready() -> None:
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     log.info("logged in as %s", client.user)
+    if config.IGNORED_API_KEYS:
+        log.warning("ignoring agent API keys (subscription logins are used instead): %s",
+                    ", ".join(config.IGNORED_API_KEYS))
     asyncio.get_running_loop().create_task(_announce_update())
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
@@ -1090,6 +1093,119 @@ async def _provider_usage(name: str) -> str:
         log.warning("usage for %s failed: %s", name, e)
         text = f"❌ {e}"
     return f"**{name}**\n```\n{text[:1700]}\n```"
+
+
+# Sign-ins in progress, one per CLI (a new /login for the same CLI replaces it).
+_logins: dict[str, logins.LoginSession] = {}
+
+
+def _login_result(name: str, st: logins.Status, ok: bool, session: logins.LoginSession) -> str:
+    if st.logged_in and st.subscription:
+        return f"✅ **{logins.LABELS[name]}** is signed in: {st.detail}."
+    if st.logged_in:
+        return f"⚠️ **{logins.LABELS[name]}** is signed in, but with {st.detail}, not a subscription."
+    why = session.result_text() or ("timed out" if not ok else "unknown")
+    return f"❌ **{logins.LABELS[name]}** sign-in didn't complete: {why}"
+
+
+async def _finish_login(interaction: discord.Interaction, session: logins.LoginSession) -> None:
+    """For device-code logins: report once you've approved in the browser."""
+    ok = await session.wait()
+    if _logins.get(session.name) is session:
+        _logins.pop(session.name)
+    msg = _login_result(session.name, await logins.status(session.name), ok, session)
+    try:
+        await interaction.followup.send(msg, ephemeral=True)
+    except discord.HTTPException:  # interaction token expired (15 min)
+        channel = client.get_channel(interaction.channel_id)
+        if channel is not None:
+            await channel.send(msg)
+
+
+@tree.command(name="login", description="Agent sign-in: show status, or log in with your subscription")
+@discord.app_commands.describe(
+    provider="CLI to sign in (omit to see every CLI's status)",
+    code="Claude only: the code the sign-in page shows after you approve",
+    again="Sign in again even if already signed in with a subscription",
+)
+@discord.app_commands.choices(
+    provider=[discord.app_commands.Choice(name=logins.LABELS[p], value=p) for p in logins.PROVIDERS]
+)
+@discord.app_commands.default_permissions(administrator=True)
+async def cmd_login(
+    interaction: discord.Interaction,
+    provider: str | None = None,
+    code: str | None = None,
+    again: bool = False,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    if provider is None:
+        statuses = await asyncio.gather(*(logins.status(p) for p in logins.PROVIDERS))
+        lines = [
+            f"{'✅' if st.subscription else '⚠️' if st.logged_in else '❌' if st.installed else '➖'} "
+            f"**{logins.LABELS[p]}**: {st.detail}"
+            for p, st in zip(logins.PROVIDERS, statuses)
+        ]
+        if config.IGNORED_API_KEYS:
+            lines.append(f"🔑 ignoring API keys set on this machine: {', '.join(config.IGNORED_API_KEYS)}")
+        elif config.ALLOW_AGENT_API_KEYS:
+            lines.append("🔑 `ALLOW_AGENT_API_KEYS` is on: API keys in the environment are used")
+        lines.append("Sign in with `/login provider:<name>`.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    label = logins.LABELS[provider]
+    if code:
+        session = _logins.get(provider)
+        if session is None or not session.needs_code or session.done:
+            await interaction.followup.send(
+                f"No {label} sign-in is waiting for a code. Start one with `/login provider:{provider}`.",
+                ephemeral=True,
+            )
+            return
+        log.info("/login %s: code submitted by %s", provider, interaction.user)
+        await session.submit_code(code)
+        ok = await session.wait(timeout=90)
+        _logins.pop(provider, None)
+        st = await logins.status(provider)
+        await interaction.followup.send(_login_result(provider, st, ok, session), ephemeral=True)
+        return
+
+    st = await logins.status(provider)
+    if not st.installed:
+        await interaction.followup.send(
+            f"{label} isn't installed on this machine. Rerun the setup script to install it.",
+            ephemeral=True,
+        )
+        return
+    if st.subscription and not again:
+        await interaction.followup.send(
+            f"✅ {label} is already signed in: {st.detail}. Use `again:True` to sign in again.",
+            ephemeral=True,
+        )
+        return
+    if (old := _logins.pop(provider, None)) is not None:
+        old.cancel()
+    session = logins.LoginSession(provider)
+    log.info("/login %s started by %s", provider, interaction.user)
+    try:
+        await session.start()
+    except (logins.LoginError, OSError) as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        return
+    _logins[provider] = session
+    steps = [f"1. Open <{session.url}> and sign in with the account that has your {label} subscription."]
+    if session.confirm_code:
+        steps.append(f"2. Check the page shows the code **{session.confirm_code}**, then approve.")
+    if session.needs_code:
+        steps.append(
+            f"2. After you approve, the page shows a code. Send it with "
+            f"`/login provider:{provider} code:<the code>`."
+        )
+    else:
+        steps.append("3. I'll confirm here once it completes.")
+        asyncio.get_running_loop().create_task(_finish_login(interaction, session))
+    await interaction.followup.send("\n".join(steps), ephemeral=True)
 
 
 @tree.command(name="usage", description="Show plan usage / remaining quota as the agent CLI reports it")

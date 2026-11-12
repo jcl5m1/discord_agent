@@ -130,7 +130,7 @@ cli_logged_in() {
   case $1 in
     claude) claude auth status --json 2>/dev/null | grep -q '"loggedIn": *true' ;;
     kimi)   "$(cli_path kimi)" provider list 2>/dev/null | grep -q 'source=oauth' ;;
-    muse)   [ -n "${META_API_KEY:-}" ] || [ -s "${XDG_CONFIG_HOME:-$HOME/.config}/muse/auth.json" ] ;;
+    muse)   grep -q '"mechanism": *"oauth"' "${XDG_CONFIG_HOME:-$HOME/.config}/muse/auth.json" 2>/dev/null ;;
   esac
 }
 cli_install() {  # official installers
@@ -248,7 +248,19 @@ for line in Path(".env.example").read_text().splitlines():
         value = answers.get(key, existing.get(key, m.group(2)))
         line = f"{key}={value}"
     lines.append(line)
-extra = {k: v for k, v in existing.items() if k not in seen}
+# Provider API keys bill per token instead of your subscription; the harness
+# ignores them, so don't carry them over (keep in sync with harness/config.py).
+api_keys = {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "META_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"}
+dropped = sorted(k for k in existing if k in api_keys)
+if dropped:
+    print("  removed from .env (the agents use your subscription logins): " + ", ".join(dropped))
+    # The backup made just before this must not keep a copy of them either.
+    bak = Path(".env.bak")
+    if bak.exists():
+        kept = [l for l in bak.read_text().splitlines() if l.split("=", 1)[0] not in api_keys]
+        bak.write_text("\n".join(kept) + "\n")
+        os.chmod(bak, 0o600)
+extra = {k: v for k, v in existing.items() if k not in seen and k not in api_keys}
 if extra:
     lines += ["", "# --- kept from the previous .env ---"] + [f"{k}={v}" for k, v in extra.items()]
 Path(".env").write_text("\n".join(lines) + "\n")
@@ -317,6 +329,13 @@ if yesno "Install and (re)start the systemd user services (bot, watchdog, uptime
 else
   info "not installed — start it any time with: $DIR/run.sh"
 fi
+
+for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN META_API_KEY MOONSHOT_API_KEY KIMI_API_KEY; do
+  if [ -n "${!var:-}" ]; then
+    warn "$var is set in your shell environment. The harness ignores it, but remove it from"
+    warn "  your shell profile if nothing else needs it."
+  fi
+done
 
 bold "Done"
 info "In Discord: /new name:my-project prompt:hello"
