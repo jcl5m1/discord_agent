@@ -1,7 +1,8 @@
 """Network and system uptime log, plus the statistics behind /uptime.
 
-Runs as its own systemd user unit (discord-agent-uptime.service), independent
-of the bot, so it keeps logging while the harness is down or restarting:
+Runs as its own process (a systemd user unit on Linux or scheduled task on
+Windows), independent of the bot, so it keeps logging while the harness is down
+or restarting:
 
     python -m harness.uptime
 
@@ -19,12 +20,13 @@ with a "last alive" timestamp. Only *state changes* are appended to the log
 
 A reboot is detected on startup by a changed kernel boot id: the system was
 down from the previous run's last-alive time (or its clean-stop time) to this
-boot. On the very first run, earlier reboots are backfilled from the journal.
+boot. On the very first Linux run, earlier reboots are backfilled from the journal.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
 import os
@@ -86,6 +88,9 @@ def _write_state(state: dict) -> None:
 
 
 def _boot() -> tuple[str, float]:
+    if os.name == "nt":
+        boot = round(time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000)
+        return f"windows-{boot}", boot
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip().replace("-", "")
     for line in Path("/proc/stat").read_text().splitlines():
         if line.startswith("btime "):
@@ -105,7 +110,9 @@ def _system_stopping() -> bool:
 
 
 def _backfill_from_journal(before: float) -> None:
-    """First run only: record earlier reboots from the journal's boot list."""
+    """First Linux run only: record earlier reboots from the journal's boot list."""
+    if os.name == "nt":
+        return
     try:
         out = subprocess.run(
             ["journalctl", "--list-boots", "--no-pager", "-o", "json"],
@@ -166,7 +173,10 @@ async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
     while not stop.is_set():
         t = time.time()
@@ -265,7 +275,7 @@ def summary(now: float | None = None, recent: int = 5) -> str:
     now = now or time.time()
     events = read_events()
     if not events:
-        return "No uptime data yet — is `discord-agent-uptime.service` running?"
+        return "No uptime data yet — is the uptime monitor running?"
     state = read_state()
     sys_down, net_down, gaps, covered_from = _intervals(events, now)
     sys_from = min([s for s, _, _ in sys_down] + [covered_from or now])
@@ -276,7 +286,7 @@ def summary(now: float | None = None, recent: int = 5) -> str:
         lines.append(f"🖥️ System up since <t:{int(boot)}:f> ({fmt_duration(now - boot)})")
     alive = state.get("last_alive", 0)
     if now - alive > GAP_AFTER and not state.get("stopped_at"):
-        lines.append(f"⚠️ monitor silent since <t:{int(alive)}:R> — check `discord-agent-uptime.service`")
+        lines.append(f"⚠️ monitor silent since <t:{int(alive)}:R> — check the uptime monitor")
     elif state.get("stopped_at"):
         lines.append(f"⚠️ monitor stopped <t:{int(state['stopped_at'])}:R>")
     elif state.get("net") == "down":

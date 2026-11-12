@@ -221,5 +221,6 @@ __marimo__/
 
 # discord_agent runtime state
 data/
+/windows.config.local
 *.swp
 .pw-browsers/

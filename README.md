@@ -20,10 +20,16 @@ On a Linux machine (Ubuntu/Debian or anything with systemd), run:
 curl -fsSL https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.sh | bash
 ```
 
+On Windows, run this in PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iex (irm https://raw.githubusercontent.com/jcl5m1/discord_agent/main/setup.ps1)"
+```
+
 That single command does the full setup, asking questions as it goes:
 
-1. **Prerequisites:** installs `git`/`curl` if missing (via apt, needs sudo)
-   and `uv`, which also provides Python 3.12.
+1. **Prerequisites:** installs Git if missing and provides Python 3.12 through
+   an existing launcher or `uv` (Linux also installs `curl` via apt, needs sudo).
 2. **Code:** clones this repo to `~/discord_agent` (`--dir <path>` to change),
    or pulls if it's already there.
 3. **Dependencies:** builds the venv and installs headless Chromium for HTML
@@ -40,8 +46,9 @@ That single command does the full setup, asking questions as it goes:
 7. **Checks:** verifies the token, server, category and Message Content intent
    against Discord. If the bot isn't in your server yet, it prints the invite
    link with the right permissions.
-8. **Services:** installs and starts the bot, watchdog and uptime systemd user
-   services, with lingering on so they run at boot.
+8. **Services:** on Linux, installs and starts the bot, watchdog and uptime
+   systemd user services with lingering; on Windows, installs current-user
+   logon tasks instead.
 
 Rerunning it is safe: anything already installed or logged in is skipped,
 current settings are the defaults, and the old `.env` is kept as `.env.bak`.
@@ -114,6 +121,33 @@ PLAYWRIGHT_BROWSERS_PATH=.pw-browsers .venv/bin/playwright install chromium
 ```
 
 The bot syncs its slash commands on startup and logs in. Leave it running.
+
+### Windows
+
+The one-line PowerShell installer above installs any missing prerequisites,
+clones to `~\discord_agent`, builds the venv and installs Chromium, offers the
+Claude/Kimi/Muse installers and logins, securely asks for the Discord token,
+and can install current-user logon tasks for the harness/watchdog and uptime
+monitor. Existing settings are the defaults when rerunning it; `.env.bak` keeps
+the previous configuration. The token is never placed on the command line.
+
+From an existing checkout, run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`.
+Options are `-Directory <path>`, `-NoService` (skip logon tasks), `-ConfigureOnly`
+(skip code, dependencies and CLI installation), and `-SkipChecks` (skip Discord
+API validation). Use Task Scheduler to stop or disable the tasks later.
+
+For a manual setup, edit `windows.env.example`, then run `.\save-token.ps1` to
+create `.env` and securely save the token. An optional `windows.config.local`
+(Git-ignored) overrides the template's machine-specific defaults. `.\run.ps1`
+starts the bot and watchdog; `.\install-windows-tasks.ps1 -Start` installs and
+starts the logon tasks. The manual dependency commands are:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+$env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
+.venv\Scripts\python -m playwright install chromium
+```
 
 ### 4. Use it (from any Discord client, including your phone)
 
@@ -371,8 +405,10 @@ harness/
     ├── kimi.py         # Kimi CLI provider
     └── muse.py         # Muse CLI provider (`muse exec --json`)
 .env.example            # all configuration keys, documented
-setup.sh                # one-line installer: prereqs, clone, venv, agent CLIs + logins, .env, services
-run.sh                  # starts the harness and the watchdog
+setup.sh                # Linux one-line installer and setup wizard
+setup.ps1               # Windows one-line installer and setup wizard
+run.sh                  # starts the harness and the watchdog on Linux
+run.ps1                 # starts the harness and the watchdog on Windows
 ```
 
 ## License

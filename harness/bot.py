@@ -196,21 +196,28 @@ def _channel_lock(channel_id: int) -> asyncio.Lock:
 
 def _listening_ports() -> set[int]:
     """TCP ports currently listening on this machine (user-accessible ones)."""
+    windows = os.name == "nt"
+    cmd = ["netstat", "-ano", "-p", "tcp"] if windows else ["ss", "-tlnH"]
     try:
-        out = subprocess.run(
-            ["ss", "-tlnH"], capture_output=True, text=True, timeout=5
-        ).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return set()
     ports = set()
     for line in out.splitlines():
         parts = line.split()
-        if len(parts) >= 4:
-            tail = parts[3].rsplit(":", 1)[-1]
-            if tail.isdigit():
-                port = int(tail)
-                if 1024 <= port <= 65535 and port != config.PROXY_PORT:
-                    ports.add(port)
+        if windows:
+            if len(parts) < 5 or parts[3] != "LISTENING":
+                continue
+            local_address = parts[1]
+        else:
+            if len(parts) < 4:
+                continue
+            local_address = parts[3]
+        tail = local_address.rsplit(":", 1)[-1]
+        if tail.isdigit():
+            port = int(tail)
+            if 1024 <= port <= 65535 and port != config.PROXY_PORT:
+                ports.add(port)
     return ports
 
 
@@ -238,13 +245,13 @@ def _new_server_urls(inst: Instance, before: set[int], after: set[int]) -> list[
 # carries it forward, so users never have to spell out serving instructions.
 _HARNESS_BRIEF = """\
 [harness capabilities — persistent for this session]
-You are running inside a Discord agent harness on a Linux host.
+You are running inside a Discord agent harness on a {host_platform} host.
 Working directory: {workdir}
 Output formats you can choose from, in order of richness:
 1. Live web page — for interactive or visual output (demos, dashboards, forms,
    games, visualizations). Build the page, then serve it in the background on a
    port in the range {port_start}-{port_end}, detached so it outlives your turn:
-       cd <dir> && setsid nohup python3 -m http.server <port> >/dev/null 2>&1 &
+       {server_command}
    (or any small server). The harness detects the server and posts a public URL
    in the Discord channel automatically — you do not need to construct URLs.
    Use this format whenever the result benefits from being interactive.
@@ -285,6 +292,13 @@ def _with_brief(inst: Instance, prompt: str) -> str:
     token = inst.ensure_web_token()
     store.put(inst)
     return _HARNESS_BRIEF.format(
+        host_platform="Windows" if os.name == "nt" else "Linux",
+        server_command=(
+            "Start-Process python -ArgumentList '-m','http.server','<port>' "
+            "-WorkingDirectory <dir> -WindowStyle Hidden"
+            if os.name == "nt" else
+            "cd <dir> && setsid nohup python3 -m http.server <port> >/dev/null 2>&1 &"
+        ),
         workdir=inst.workdir,
         port_start=config.AGENT_PORT_START,
         port_end=config.AGENT_PORT_END,
@@ -1185,7 +1199,7 @@ def _restart_harness() -> None:
     """Replace the running harness with a fresh one (after a code update).
 
     Under systemd the unit is restarted (its watchdog unit follows through
-    BindsTo/Wants); otherwise the process re-execs itself in place, keeping its PID.
+    BindsTo/Wants); otherwise the process re-execs itself in place.
     """
     unit = service.current_unit()
     log.warning("restarting harness (%s)", unit or "exec")
