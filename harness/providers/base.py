@@ -37,6 +37,16 @@ class StreamEvent:
     session_id: str | None = None
 
 
+@dataclass
+class SessionInfo:
+    """A session in the CLI's own store, offered by /session."""
+
+    id: str
+    workdir: str  # cwd the session belongs to; resuming needs the same cwd
+    title: str = ""
+    updated: float = 0.0  # unix seconds, for newest-first ordering
+
+
 class AgentProvider(ABC):
     """Interface every agent CLI integration must implement."""
 
@@ -54,6 +64,13 @@ class AgentProvider(ABC):
     async def usage(self) -> str:
         """Plan/quota status as the CLI reports it (shown by /usage)."""
         return f"`{self.name}` has no usage command"
+
+    def sessions(self) -> list[SessionInfo]:
+        """Sessions in the CLI's store, newest first ([] = can't list them)."""
+        return []
+
+    def find_session(self, session_id: str) -> SessionInfo | None:
+        return next((s for s in self.sessions() if s.id == session_id), None)
 
     @abstractmethod
     def run_turn(

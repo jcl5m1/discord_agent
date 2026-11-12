@@ -15,10 +15,11 @@ import re
 import socket
 import time
 import tomllib
+from pathlib import Path
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register
+from .base import AgentProvider, SessionInfo, StreamEvent, register
 
 log = logging.getLogger("discord_agent.kimi")
 
@@ -39,6 +40,33 @@ def _load_models() -> dict[str, str]:
         log.warning("could not read kimi models from %s: %s", config.KIMI_CONFIG, e)
         return {}
     return {key.rsplit("/", 1)[-1]: key for key in keys}
+
+
+def list_sessions(root: Path) -> list[SessionInfo]:
+    """Sessions under kimi's store: <root>/<workspace>/<session_id>/state.json."""
+    found = []
+    for state in root.glob("*/session_*/state.json"):
+        try:
+            data = json.loads(state.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if data.get("archived") or not data.get("cwd"):
+            continue
+        found.append(SessionInfo(
+            id=data.get("id") or state.parent.name,
+            workdir=os.path.normpath(data["cwd"]),
+            title=data.get("title") or "",
+            updated=(data.get("updatedAt") or 0) / 1000,
+        ))
+    return sorted(found, key=lambda s: s.updated, reverse=True)
+
+
+# Kimi refuses to open a session another kimi process holds.
+_IN_USE = "in use by another"
+_IN_USE_HINT = (
+    "\n\nAnother Kimi process (a terminal window, or an agent that launched kimi "
+    "itself) has this session open. Close it, then send your message again."
+)
 
 
 _TOKEN_LINE = re.compile(r"Token:\s+(\S+)")
@@ -77,6 +105,9 @@ class KimiProvider(AgentProvider):
     @property
     def models(self) -> dict[str, str]:  # re-read so new kimi models show up live
         return _load_models()
+
+    def sessions(self) -> list[SessionInfo]:
+        return list_sessions(Path(config.KIMI_CONFIG).parent / "sessions")
 
     async def usage(self) -> str:
         """Quota from kimi's local web server, the only place the CLI exposes it.
@@ -196,9 +227,9 @@ class KimiProvider(AgentProvider):
         final_text = "".join(final_text_parts).strip()
         if returncode != 0:
             err = stderr_data.decode("utf-8", "replace").strip()
-            yield StreamEvent(
-                kind="error",
-                text=(err or f"kimi exited with code {returncode}")[-1500:],
-            )
+            text = (err or f"kimi exited with code {returncode}")[-1500:]
+            if _IN_USE in text:
+                text += _IN_USE_HINT
+            yield StreamEvent(kind="error", text=text)
         else:
             yield StreamEvent(kind="done", text=final_text, session_id=captured_session)

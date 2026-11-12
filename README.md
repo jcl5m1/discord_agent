@@ -206,6 +206,12 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   (e.g. `claude:sonnet`, `kimi:k3`, `muse:spark-1.3`); picking one from another
   provider switches provider too and starts a fresh session. Same-provider
   changes keep the session.
+- `/session` (inside an agent channel) shows the channel's session. Pick one
+  from the `session` autocomplete (the CLI's own sessions, newest first, with
+  their title and folder) to continue it here — e.g. a Kimi or Claude session
+  you started in a terminal. The instance's workdir becomes that session's
+  folder. Close the session anywhere else first: Kimi refuses a session another
+  `kimi` process has open. Agents are told not to resume sessions themselves.
 - `/list` shows active instances with their provider, model and session IDs;
   stopped instances are listed separately at the bottom.
 - `/stop name:my-project` stops the instance (no replies, hidden from the active

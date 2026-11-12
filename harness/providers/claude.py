@@ -14,16 +14,57 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register, run_text
+from .base import AgentProvider, SessionInfo, StreamEvent, register, run_text
 
 log = logging.getLogger("discord_agent.claude")
 
 # Emit a warning when the CLI produces no stdout for this long; the turn keeps
 # waiting — the warning exists so a hung subprocess is visible in the logs.
 _STALL_WARN_INTERVAL = 300.0  # seconds
+
+
+_SCAN_FILES = 200  # newest transcripts read per listing, so autocomplete stays fast
+_SCAN_LINES = 50  # lines read per transcript looking for cwd and first prompt
+
+
+def _first_prompt(entry: dict) -> str:
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = next((c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"), "")
+    text = str(content or "")
+    # Harness sessions open with the capability brief; the user's prompt follows it.
+    text = text.rpartition("[end of harness capabilities]")[2] or text
+    return " ".join(text.split())[:80]
+
+
+def list_sessions(root: Path) -> list[SessionInfo]:
+    """Sessions under Claude Code's store: <root>/<sanitized cwd>/<session_id>.jsonl."""
+    files = sorted(root.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    found = []
+    for path in files[:_SCAN_FILES]:
+        cwd = title = ""
+        try:
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for _, line in zip(range(_SCAN_LINES), f):
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    cwd = cwd or entry.get("cwd") or ""
+                    if not title and entry.get("type") == "user":
+                        title = _first_prompt(entry)
+                    if cwd and title:
+                        break
+            updated = path.stat().st_mtime
+        except OSError:
+            continue
+        if cwd:
+            found.append(SessionInfo(id=path.stem, workdir=os.path.normpath(cwd), title=title, updated=updated))
+    return found
 
 
 @register("claude")
@@ -36,6 +77,9 @@ class ClaudeProvider(AgentProvider):
         "fable": "claude-fable-5-1",
     }
     default_model = config.CLAUDE_MODEL
+
+    def sessions(self) -> list[SessionInfo]:
+        return list_sessions(Path.home() / ".claude" / "projects")
 
     async def usage(self) -> str:
         # Print mode answers the built-in /usage itself; no model call is made.

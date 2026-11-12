@@ -25,7 +25,7 @@ import discord
 from . import config, discord_markdown, files, guard, logins, service, triggers, uptime, workdirs
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
-from .providers.base import get_provider, provider_names
+from .providers.base import SessionInfo, get_provider, provider_names
 from .render import render_html_to_png
 
 if config.PUBLIC_BASE_URL:
@@ -282,6 +282,11 @@ unguessable public link; image links posted in your reply display inline in
 Discord, and the folder URL itself is a browsable index. The user can list them
 with /files. Prefer this over ad-hoc share folders or temporary servers for
 static files.
+Sessions are managed by the harness: never launch the agent CLI yourself to
+resume or continue another session (e.g. `kimi --session`, `claude --resume`) --
+it can't attach to this channel and fails if that session is open elsewhere.
+If the user wants to continue a different session, tell them to run /session
+in this Discord channel and pick it there.
 [end of harness capabilities]
 """
 
@@ -1258,6 +1263,92 @@ async def cmd_model(
         f"✅ **{inst.name}** now uses `{inst.provider}` / `{_model_label(inst)}` from the next "
         + ("message (**new session** — previous conversation not carried over)." if switching
            else "message (same session).")
+    )
+
+
+def _session_label(info: SessionInfo) -> str:
+    title = info.title or "(untitled)"
+    return f"{title[:50]} · {_display_path(info.workdir)}"[:100]
+
+
+def _display_path(path: str) -> str:
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):].replace("\\", "/") if path.startswith(home) else path
+
+
+async def _session_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[discord.app_commands.Choice[str]]:
+    """This channel's provider sessions, newest first, filtered by id/title/folder."""
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if inst is None:
+        return []
+    needle = current.lower()
+    choices = []
+    for info in await asyncio.to_thread(get_provider(inst.provider).sessions):
+        if needle in f"{info.id} {info.title} {info.workdir}".lower():
+            mark = "▶ " if info.id == inst.session_id else ""
+            choices.append(discord.app_commands.Choice(name=mark + _session_label(info), value=info.id))
+        if len(choices) == 25:
+            break
+    return choices
+
+
+@tree.command(
+    name="session",
+    description="Show this channel's agent session, or continue an existing one (e.g. from a terminal)",
+)
+@discord.app_commands.describe(
+    session="Session to continue here (its folder becomes the workdir); omit to show the current one",
+)
+@discord.app_commands.autocomplete(session=_session_autocomplete)
+async def cmd_session(interaction: discord.Interaction, session: str | None = None) -> None:
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if inst is None:
+        await interaction.response.send_message("❌ run this inside an agent channel")
+        return
+    if session is None:
+        await interaction.response.send_message(
+            f"**{inst.name}**: `{inst.provider}` session `{inst.session_id or 'new'}` in `{inst.workdir}`"
+        )
+        return
+    session = session.strip()
+    if inst.channel_id in _active_turns:
+        await interaction.response.send_message(
+            "❌ a turn is running in this channel — wait for it to finish first"
+        )
+        return
+    other = next(
+        (i for i in store.all() if i.session_id == session and i.channel_id != inst.channel_id), None
+    )
+    if other is not None:
+        await interaction.response.send_message(
+            f"❌ `{session}` is already used by instance **{other.name}** — "
+            "two channels driving one session would collide"
+        )
+        return
+    provider = get_provider(inst.provider)
+    info = await asyncio.to_thread(provider.find_session, session)
+    if info is None:
+        await interaction.response.send_message(
+            f"❌ no `{inst.provider}` session `{session}` found — pick one from the list "
+            "(`/model provider:` first if it belongs to another CLI)"
+        )
+        return
+    old = (inst.session_id, inst.workdir)
+    inst.session_id = info.id
+    inst.workdir = info.workdir
+    inst.__post_init__()  # normalize workdir the same way loading does
+    store.put(inst)
+    log.info(
+        "[%s] /session by %s: %s in %s -> %s in %s",
+        inst.name, interaction.user, old[0], old[1], inst.session_id, inst.workdir,
+    )
+    await interaction.response.send_message(
+        f"✅ **{inst.name}** continues `{inst.provider}` session `{info.id}`"
+        + (f" ({info.title})" if info.title else "")
+        + f" in `{inst.workdir}` from the next message. "
+        "Close that session anywhere else it's open (e.g. a terminal) first."
     )
 
 
