@@ -107,9 +107,11 @@ class AgentProvider(ABC):
     def find_session(self, session_id: str) -> SessionInfo | None:
         return next((s for s in self.sessions() if s.id == session_id), None)
 
-    # True when run_turn accepts control= (a TurnControl) for live messages and
-    # graceful interrupts; otherwise messages wait for the turn and an interrupt
-    # kills the CLI.
+    # True when run_turn accepts control= (a TurnControl) and stops gracefully on
+    # control.interrupt(), keeping the session; otherwise an interrupt kills the CLI.
+    supports_graceful_interrupt: bool = False
+    # True when control.send() delivers messages into the running turn; otherwise
+    # messages sent during a turn wait for it to finish.
     supports_live_input: bool = False
 
     @abstractmethod
@@ -211,6 +213,33 @@ async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 3.0
         await asyncio.wait_for(proc.wait(), 5)
     except asyncio.TimeoutError:
         proc.kill()
+
+
+def send_interrupt_signal(proc: asyncio.subprocess.Process) -> None:
+    """Ask a CLI to stop its turn the way Ctrl-C would.
+
+    kimi and muse cancel their running tool, save the session and exit within a
+    couple of seconds. On Windows the equivalent is Ctrl-Break to the CLI's own
+    process group (it was started in one).
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "nt":
+            os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.kill(proc.pid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+async def relay_interrupts(control: TurnControl, proc: asyncio.subprocess.Process, state: dict) -> None:
+    """For CLIs without live input: turn control.interrupt() into a Ctrl-C."""
+    while True:
+        kind, _ = await control.requests.get()
+        if kind == "interrupt" and proc.returncode is None:
+            state["interrupted"] = True
+            send_interrupt_signal(proc)
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")

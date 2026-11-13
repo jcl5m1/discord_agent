@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, SessionInfo, StreamEvent, register, SPAWN_KWARGS, kill_process_tree
+from .base import (
+    SPAWN_KWARGS, AgentProvider, kill_process_tree, register, relay_interrupts, SessionInfo, StreamEvent, TurnControl,
+)
 
 log = logging.getLogger("discord_agent.kimi")
 
@@ -154,18 +156,38 @@ class KimiProvider(AgentProvider):
         cmd += ["-p", prompt, "--output-format", "stream-json"]
         return cmd
 
+    supports_graceful_interrupt = True
+
+    def _newest_session(self, workdir: str, since: float) -> str | None:
+        """The session kimi saved most recently for workdir, if saved since `since`."""
+        here = os.path.realpath(workdir)
+        found = [s for s in self.sessions()
+                 if os.path.realpath(s.workdir) == here and s.updated >= since - 5]
+        return max(found, key=lambda s: s.updated).id if found else None
+
     async def run_turn(
-        self, workdir: str, prompt: str, session_id: str | None = None, model: str | None = None
+        self,
+        workdir: str,
+        prompt: str,
+        session_id: str | None = None,
+        model: str | None = None,
+        control: TurnControl | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(prompt, session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
         started = time.monotonic()
+        wall_start = time.time()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **SPAWN_KWARGS,
+        )
+        interrupt_state: dict = {}
+        relay_task = (
+            asyncio.get_running_loop().create_task(relay_interrupts(control, proc, interrupt_state))
+            if control is not None else None
         )
         try:
             log.info(
@@ -231,7 +253,12 @@ class KimiProvider(AgentProvider):
                 log.debug("kimi pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
 
             final_text = "".join(final_text_parts).strip()
-            if returncode != 0:
+            if interrupt_state.get("interrupted"):
+                # kimi doesn't print the session's resume hint when interrupted;
+                # for a new session, take the one it just saved for this folder.
+                sid = captured_session or session_id or self._newest_session(workdir, since=wall_start)
+                yield StreamEvent(kind="interrupted", text=final_text, session_id=sid)
+            elif returncode != 0:
                 err = stderr_data.decode("utf-8", "replace").strip()
                 text = (err or f"kimi exited with code {returncode}")[-1500:]
                 if _IN_USE in text:
@@ -240,5 +267,7 @@ class KimiProvider(AgentProvider):
             else:
                 yield StreamEvent(kind="done", text=final_text, session_id=captured_session)
         finally:
-            # Interrupted (or the harness gave up on the turn): stop the CLI.
+            if relay_task is not None:
+                relay_task.cancel()
+            # Cut short (or the harness gave up on the turn): stop the CLI.
             await kill_process_tree(proc)

@@ -92,6 +92,7 @@ class ClaudeProvider(AgentProvider):
         # Print mode answers the built-in /usage itself; no model call is made.
         return await run_text(config.CLAUDE_BIN, "-p", "/usage", cwd=os.path.expanduser("~"))
 
+    supports_graceful_interrupt = True
     supports_live_input = True
 
     def _build_cmd(self, session_id: str | None, model: str | None) -> list[str]:

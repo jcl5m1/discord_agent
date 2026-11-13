@@ -341,9 +341,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # Set by /interrupt (or a "stop" message): ends the turn, keeps the session.
         "interrupt": asyncio.Event(),
         "interrupted_by": None,
-        # For agents that take live input: messages sent into the running turn,
-        # and the Discord message each came from (to mark it once it's read).
-        "control": TurnControl() if provider.supports_live_input else None,
+        # For agents that stop gracefully: how /interrupt reaches the turn. For
+        # agents that also take live input: messages sent into the running
+        # turn, and the Discord message each came from (to mark it once read).
+        "control": TurnControl() if provider.supports_graceful_interrupt else None,
+        "live_input": provider.supports_live_input,
         "steered": {},
     }
     _active_turns[inst.channel_id] = turn
@@ -563,6 +565,13 @@ async def on_message(message: discord.Message) -> None:
     if _is_stop_word(message.content) and _interrupt(inst, message.author.display_name, drop_queue=True):
         await _react(message, "⏹️")
         return
+    if (redirect := _redirect_text(message.content)) and _interrupt(
+        inst, message.author.display_name, drop_queue=True
+    ):
+        await _react(message, "⏹️")
+        turn = pending.add(message.id, redirect, channel_id=message.channel.id)
+        await _process_user_message(inst, message, turn)
+        return
     if _steer(inst, message):
         if wa:
             _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* (Discord):\n{message.content}"))
@@ -588,6 +597,7 @@ def _steer(inst: Instance, message: discord.Message, text: str | None = None) ->
         not config.STEER_RUNNING_TURNS
         or turn is None
         or turn["control"] is None
+        or not turn["live_input"]
         or turn["interrupted_by"]
         or turn["interrupt"].is_set()
     ):
@@ -602,6 +612,17 @@ def _steer(inst: Instance, message: discord.Message, text: str | None = None) ->
 
 # A message that's only one of these, sent while a turn runs, interrupts it.
 _STOP_WORDS = {"stop", "!stop", "⏹️", "⏹"}
+
+
+def _redirect_text(text: str) -> str | None:
+    """For "! new instructions": the instructions; None for anything else.
+
+    Sent while a turn runs, such a message interrupts it and becomes the next turn.
+    """
+    text = text.strip()
+    if not text.startswith("!") or _is_stop_word(text):
+        return None
+    return text[1:].strip() or None
 
 
 def _is_stop_word(text: str) -> bool:
@@ -742,6 +763,9 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
     if _is_stop_word(text) and _interrupt(inst, sender, drop_queue=True):
         await channel.send(f"⏹️ **{sender}** interrupted the agent from WhatsApp.")
         return
+    if (redirect := _redirect_text(text)) and _interrupt(inst, sender, drop_queue=True):
+        await channel.send(f"⏹️ **{sender}** interrupted the agent from WhatsApp.")
+        text = redirect
     _last_channel_id = channel.id
     echo = f"📱 **{sender}** (WhatsApp):\n{text}"
     try:

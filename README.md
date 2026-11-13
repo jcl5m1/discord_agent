@@ -196,15 +196,18 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   works. ⏩ = sent into the turn, ✅ = the agent has read it; the reply continues
   in the same message. For kimi and muse, or with `STEER_RUNNING_TURNS=false`,
   they wait for the turn to finish.
-- `/interrupt` stops the agent mid-turn without closing the channel. For Claude
-  it's the CLI's own interrupt (like pressing Esc): the turn ends at once, cleanly,
-  and the session is kept so the agent remembers what it had done. kimi and muse
-  have no equivalent, so their CLI is killed with every command it started (also
-  the fallback if Claude hasn't stopped within `INTERRUPT_GRACE` seconds).
-  Messages queued behind the turn are dropped since they were for the old direction
-  (`keep_queue:True` keeps them); add `message:` to send new instructions once it
-  has stopped. Sending just `stop` while a turn runs does the same, in Discord or
-  WhatsApp. Background servers started detached (`setsid nohup … &`) keep running.
+- **Start a message with `!` to interrupt and redirect**, e.g. `! use postgres
+  instead`: the running turn stops gracefully, messages queued behind it are
+  dropped, and your message runs next on the same session (so the agent keeps the
+  context of what it was doing). Works for every agent, in Discord or WhatsApp; with
+  nothing running, the message is sent as typed. Sending just `stop` only stops.
+- `/interrupt` does the same as a command (`message:` for the new instructions,
+  `keep_queue:True` to keep queued messages). Stopping is graceful for every agent:
+  Claude gets its own interrupt (like pressing Esc), kimi and muse get Ctrl-C, which
+  cancels their running command and saves the session within a couple of seconds.
+  Only if an agent hasn't stopped within `INTERRUPT_GRACE` seconds is it killed,
+  with every command it started. Background servers started detached
+  (`setsid nohup … &`) keep running.
 - Editing or deleting a message works the way you'd expect. A message still
   waiting its turn (✏️ = edit received) is sent with its latest text, or dropped
   if you delete it. If the agent already has the message, an edit queues a

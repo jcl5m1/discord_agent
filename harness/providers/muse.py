@@ -15,7 +15,9 @@ import time
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register, run_text, SPAWN_KWARGS, kill_process_tree
+from .base import (
+    SPAWN_KWARGS, AgentProvider, kill_process_tree, register, relay_interrupts, run_text, StreamEvent, TurnControl,
+)
 
 log = logging.getLogger("discord_agent.muse")
 
@@ -50,8 +52,15 @@ class MuseProvider(AgentProvider):
         cmd.append(prompt)
         return cmd
 
+    supports_graceful_interrupt = True
+
     async def run_turn(
-        self, workdir: str, prompt: str, session_id: str | None = None, model: str | None = None
+        self,
+        workdir: str,
+        prompt: str,
+        session_id: str | None = None,
+        model: str | None = None,
+        control: TurnControl | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(prompt, session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
@@ -62,6 +71,11 @@ class MuseProvider(AgentProvider):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             **SPAWN_KWARGS,
+        )
+        interrupt_state: dict = {}
+        relay_task = (
+            asyncio.get_running_loop().create_task(relay_interrupts(control, proc, interrupt_state))
+            if control is not None else None
         )
         try:
             log.info(
@@ -136,7 +150,11 @@ class MuseProvider(AgentProvider):
             if stderr_data:
                 log.debug("muse pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
 
-            if returncode != 0 or failure:
+            if interrupt_state.get("interrupted"):
+                text = final_text if final_text is not None else "".join(final_text_parts)
+                yield StreamEvent(kind="interrupted", text=text.strip(),
+                                  session_id=captured_session or session_id)
+            elif returncode != 0 or failure:
                 err = stderr_data.decode("utf-8", "replace").strip()
                 yield StreamEvent(
                     kind="error",
@@ -146,5 +164,7 @@ class MuseProvider(AgentProvider):
                 text = final_text if final_text is not None else "".join(final_text_parts)
                 yield StreamEvent(kind="done", text=text.strip(), session_id=captured_session)
         finally:
-            # Interrupted (or the harness gave up on the turn): stop the CLI.
+            if relay_task is not None:
+                relay_task.cancel()
+            # Cut short (or the harness gave up on the turn): stop the CLI.
             await kill_process_tree(proc)

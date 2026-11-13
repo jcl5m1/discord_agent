@@ -89,3 +89,35 @@ class DropChannelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GRACEFUL_CLI = """
+import signal, sys, time
+def stop(*_):
+    print("interrupted cleanly", flush=True)
+    sys.exit(130)
+signal.signal(signal.SIGINT, stop)
+print("working", flush=True)
+time.sleep(60)
+"""
+
+
+@unittest.skipIf(os.name == "nt", "POSIX signals")
+class CtrlCRelayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interrupt_becomes_ctrl_c(self):
+        from harness.providers.base import TurnControl, relay_interrupts
+
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(GRACEFUL_CLI)
+        self.addCleanup(os.unlink, f.name)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, f.name, stdout=asyncio.subprocess.PIPE, **SPAWN_KWARGS
+        )
+        self.assertEqual(await proc.stdout.readline(), b"working\n")
+        control, state = TurnControl(), {}
+        relay = asyncio.create_task(relay_interrupts(control, proc, state))
+        control.interrupt()
+        self.assertEqual(await asyncio.wait_for(proc.stdout.readline(), 5), b"interrupted cleanly\n")
+        self.assertEqual(await asyncio.wait_for(proc.wait(), 5), 130)
+        self.assertTrue(state["interrupted"])
+        relay.cancel()
