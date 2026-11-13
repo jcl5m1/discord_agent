@@ -21,6 +21,7 @@ class PendingTurn:
     message_id: int
     content: str
     edit_of: str | None = None  # earlier text, when this turn is about an edit
+    channel_id: int | None = None
     started: bool = False
     deleted: bool = False
 
@@ -39,8 +40,10 @@ class PendingTurns:
         self._done: OrderedDict[int, str] = OrderedDict()
         self._remember = remember
 
-    def add(self, message_id: int, content: str, edit_of: str | None = None) -> PendingTurn:
-        turn = PendingTurn(message_id, content, edit_of)
+    def add(
+        self, message_id: int, content: str, edit_of: str | None = None, channel_id: int | None = None
+    ) -> PendingTurn:
+        turn = PendingTurn(message_id, content, edit_of, channel_id=channel_id)
         self._turns.setdefault(message_id, []).append(turn)
         return turn
 
@@ -56,7 +59,9 @@ class PendingTurns:
             while len(self._done) > self._remember:
                 self._done.popitem(last=False)
 
-    def edit(self, message_id: int, content: str) -> tuple[str, PendingTurn | None]:
+    def edit(
+        self, message_id: int, content: str, channel_id: int | None = None
+    ) -> tuple[str, PendingTurn | None]:
         """Apply an edit: ("updated", turn), ("followup", new turn) or ("ignored", None).
 
         Edits that don't change the text (Discord sends one when it adds a link
@@ -72,7 +77,17 @@ class PendingTurns:
         latest = turns[-1].content if turns else self._done.get(message_id)
         if latest is None or latest == content:
             return "ignored", None
-        return "followup", self.add(message_id, content, edit_of=latest)
+        return "followup", self.add(message_id, content, edit_of=latest, channel_id=channel_id)
+
+    def drop_channel(self, channel_id: int) -> int:
+        """Drop every turn waiting in a channel (after /interrupt); return how many."""
+        dropped = 0
+        for turns in self._turns.values():
+            for turn in turns:
+                if turn.channel_id == channel_id and not turn.started and not turn.deleted:
+                    turn.deleted = True
+                    dropped += 1
+        return dropped
 
     def delete(self, message_id: int) -> int:
         """Drop the message's turns that haven't started; return how many."""

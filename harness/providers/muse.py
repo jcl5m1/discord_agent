@@ -15,7 +15,7 @@ import time
 from typing import AsyncIterator
 
 from .. import config
-from .base import AgentProvider, StreamEvent, register, run_text
+from .base import AgentProvider, StreamEvent, register, run_text, SPAWN_KWARGS, kill_process_tree
 
 log = logging.getLogger("discord_agent.muse")
 
@@ -61,81 +61,90 @@ class MuseProvider(AgentProvider):
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **SPAWN_KWARGS,
         )
-        log.info(
-            "spawned muse pid=%d model=%s session=%s workdir=%s",
-            proc.pid, self.resolve_model(model) or "cli-default",
-            session_id or "new", workdir,
-        )
-        final_text_parts: list[str] = []
-        final_text: str | None = None
-        failure: str | None = None
-        captured_session: str | None = None
-        tool_count = 0
-
-        assert proc.stdout is not None
-        while True:
-            try:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=_STALL_WARN_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                log.warning(
-                    "muse pid=%d silent for %.0fs (elapsed %.0fs, %d tools so far) "
-                    "— subprocess has not exited; still waiting",
-                    proc.pid, _STALL_WARN_INTERVAL,
-                    time.monotonic() - started, tool_count,
-                )
-                continue
-            if not line:
-                break
-            line = line.decode("utf-8", "replace").strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            stream = event.get("stream") or {}
-            if stream.get("kind") == "session" and stream.get("id"):
-                captured_session = stream["id"]
-            ptype = event.get("payload_type") or ""
-            payload = event.get("payload") or {}
-            if ptype == "run.output.delta":
-                text = payload.get("text") or ""
-                if text:
-                    final_text_parts.append(text)
-                    yield StreamEvent(kind="text", text=text)
-            elif ptype == "task.lifecycle.side_effect_intent":
-                operation = (payload.get("event") or {}).get("operation") or ""
-                if operation.startswith("tool:"):
-                    tool_count += 1
-                    yield StreamEvent(
-                        kind="status", text=f"⚙️ tool #{tool_count}: {operation[5:]}"
-                    )
-            elif ptype.startswith("run.terminal."):
-                final_text = payload.get("text")
-                if payload.get("terminal") != "completed":
-                    failure = payload.get("reason") or payload.get("terminal") or ptype
-
-        assert proc.stderr is not None
-        stderr_data = await proc.stderr.read()
-        returncode = await proc.wait()
-        log.info(
-            "muse pid=%d exited rc=%d after %.0fs (%d tools, %d reply chars)",
-            proc.pid, returncode, time.monotonic() - started,
-            tool_count, sum(len(p) for p in final_text_parts),
-        )
-        if stderr_data:
-            log.debug("muse pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
-
-        if returncode != 0 or failure:
-            err = stderr_data.decode("utf-8", "replace").strip()
-            yield StreamEvent(
-                kind="error",
-                text=(err or str(failure) or f"muse exited with code {returncode}")[-1500:],
+        try:
+            log.info(
+                "spawned muse pid=%d model=%s session=%s workdir=%s",
+                proc.pid, self.resolve_model(model) or "cli-default",
+                session_id or "new", workdir,
             )
-        else:
-            text = final_text if final_text is not None else "".join(final_text_parts)
-            yield StreamEvent(kind="done", text=text.strip(), session_id=captured_session)
+            final_text_parts: list[str] = []
+            final_text: str | None = None
+            failure: str | None = None
+            captured_session: str | None = None
+            announced_session = False
+            tool_count = 0
+
+            assert proc.stdout is not None
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=_STALL_WARN_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "muse pid=%d silent for %.0fs (elapsed %.0fs, %d tools so far) "
+                        "— subprocess has not exited; still waiting",
+                        proc.pid, _STALL_WARN_INTERVAL,
+                        time.monotonic() - started, tool_count,
+                    )
+                    continue
+                if not line:
+                    break
+                line = line.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                stream = event.get("stream") or {}
+                if stream.get("kind") == "session" and stream.get("id"):
+                    captured_session = stream["id"]
+                    if captured_session and not announced_session:
+                        announced_session = True
+                        yield StreamEvent(kind="session", session_id=captured_session)
+                ptype = event.get("payload_type") or ""
+                payload = event.get("payload") or {}
+                if ptype == "run.output.delta":
+                    text = payload.get("text") or ""
+                    if text:
+                        final_text_parts.append(text)
+                        yield StreamEvent(kind="text", text=text)
+                elif ptype == "task.lifecycle.side_effect_intent":
+                    operation = (payload.get("event") or {}).get("operation") or ""
+                    if operation.startswith("tool:"):
+                        tool_count += 1
+                        yield StreamEvent(
+                            kind="status", text=f"⚙️ tool #{tool_count}: {operation[5:]}"
+                        )
+                elif ptype.startswith("run.terminal."):
+                    final_text = payload.get("text")
+                    if payload.get("terminal") != "completed":
+                        failure = payload.get("reason") or payload.get("terminal") or ptype
+
+            assert proc.stderr is not None
+            stderr_data = await proc.stderr.read()
+            returncode = await proc.wait()
+            log.info(
+                "muse pid=%d exited rc=%d after %.0fs (%d tools, %d reply chars)",
+                proc.pid, returncode, time.monotonic() - started,
+                tool_count, sum(len(p) for p in final_text_parts),
+            )
+            if stderr_data:
+                log.debug("muse pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
+
+            if returncode != 0 or failure:
+                err = stderr_data.decode("utf-8", "replace").strip()
+                yield StreamEvent(
+                    kind="error",
+                    text=(err or str(failure) or f"muse exited with code {returncode}")[-1500:],
+                )
+            else:
+                text = final_text if final_text is not None else "".join(final_text_parts)
+                yield StreamEvent(kind="done", text=text.strip(), session_id=captured_session)
+        finally:
+            # Interrupted (or the harness gave up on the turn): stop the CLI.
+            await kill_process_tree(proc)

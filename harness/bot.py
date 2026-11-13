@@ -338,6 +338,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         "started_at": time.time(),
         "last_event_at": time.time(),
         "tools": 0,
+        # Set by /interrupt (or a "stop" message): ends the turn, keeps the session.
+        "interrupt": asyncio.Event(),
+        "interrupted_by": None,
     }
     _active_turns[inst.channel_id] = turn
     progress = asyncio.get_running_loop().create_task(
@@ -353,14 +356,39 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # First chunk cuts at a line break and closes any open code block.
         return discord_markdown.split_message(text, DISCORD_MSG_LIMIT - 20)[0] + "\n…(truncated)"
 
+    def capture_session(session_id: str | None) -> None:
+        if (
+            session_id
+            and session_id != inst.session_id
+            and store.get(inst.channel_id) is inst  # not /delete'd mid-turn
+        ):
+            inst.session_id = session_id
+            store.put(inst)
+            log.info("[%s] session id captured: %s", inst.name, inst.session_id)
+
+    interrupted = False
+    interrupt_wait = asyncio.ensure_future(turn["interrupt"].wait())
     try:
         try:
             agen = provider.run_turn(
                 inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model
             )
             while True:
+                step = asyncio.ensure_future(agen.__anext__())
+                await asyncio.wait({step, interrupt_wait}, return_when=asyncio.FIRST_COMPLETED)
+                if not step.done():
+                    # Cancelling the provider mid-await runs its cleanup, which
+                    # kills the CLI and whatever it started.
+                    step.cancel()
+                    try:
+                        await step
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+                    await agen.aclose()
+                    interrupted = True
+                    break
                 try:
-                    event = await agen.__anext__()
+                    event = step.result()
                 except StopAsyncIteration:
                     break
                 turn["last_event_at"] = time.time()
@@ -369,18 +397,13 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 elif event.kind == "status":
                     turn["tools"] += 1
                     log.info("[%s] %s", inst.name, event.text)
+                elif event.kind == "session":
+                    capture_session(event.session_id)
                 elif event.kind == "error":
                     error = event.text
                 elif event.kind == "done":
                     buf = event.text or buf
-                    if (
-                        event.session_id
-                        and event.session_id != inst.session_id
-                        and store.get(inst.channel_id) is inst  # not /delete'd mid-turn
-                    ):
-                        inst.session_id = event.session_id
-                        store.put(inst)
-                        log.info("[%s] session id captured: %s", inst.name, inst.session_id)
+                    capture_session(event.session_id)
 
                 now = loop.time()
                 if buf and now - last_edit >= EDIT_INTERVAL:
@@ -389,6 +412,19 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         except Exception:
             log.exception("turn failed for %s", inst.name)
             error = "harness error while running the agent (see logs)"
+
+        if interrupted:
+            who = turn["interrupted_by"] or "you"
+            log.info("[%s] turn interrupted by %s after %.0fs", inst.name, who, loop.time() - started)
+            note = f"⏹️ Interrupted by {who}. The session is kept, so the agent remembers this work."
+            body = display(buf) if buf.strip() else ""
+            text = f"{body}\n\n{note}" if body else note
+            if len(text) > DISCORD_MSG_LIMIT:
+                text = discord_markdown.split_message(body, DISCORD_MSG_LIMIT - len(note) - 30)[0] + f"\n…\n\n{note}"
+            await status_msg.edit(content=text)
+            if wa:
+                _wa_task(wa.send_text(inst, note))
+            return
 
         if error:
             log.warning(
@@ -463,6 +499,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         except discord.Forbidden:
             log.warning("missing permission to set channel topic for %s", inst.name)
     finally:
+        interrupt_wait.cancel()
         _active_turns.pop(inst.channel_id, None)
         progress.cancel()
 
@@ -501,7 +538,34 @@ async def on_message(message: discord.Message) -> None:
         "[%s] message from %s in #%s: %.160s",
         inst.name, message.author, message.channel.name, message.content,
     )
+    if _is_stop_word(message.content) and _interrupt(inst, message.author.display_name, drop_queue=True):
+        await _react(message, "⏹️")
+        return
     await _process_user_message(inst, message)
+
+
+# A message that's only one of these, sent while a turn runs, interrupts it.
+_STOP_WORDS = {"stop", "!stop", "⏹️", "⏹"}
+
+
+def _is_stop_word(text: str) -> bool:
+    return text.strip().lower().rstrip(".!") in _STOP_WORDS or text.strip() in _STOP_WORDS
+
+
+def _interrupt(inst: Instance, by: str, *, drop_queue: bool) -> tuple[bool, int] | None:
+    """Stop the turn running in the instance's channel; returns (stopped, dropped).
+
+    None when no turn is running, so a plain "stop" with nothing to stop is sent
+    to the agent as an ordinary message.
+    """
+    turn = _active_turns.get(inst.channel_id)
+    if turn is None or turn["interrupt"].is_set():
+        return None
+    turn["interrupted_by"] = by
+    turn["interrupt"].set()
+    dropped = pending.drop_channel(inst.channel_id) if drop_queue else 0
+    log.info("[%s] interrupted by %s (%d queued message(s) dropped)", inst.name, by, dropped)
+    return True, dropped
 
 
 async def _mirror_reply(
@@ -534,7 +598,7 @@ async def _process_user_message(
     the message waits for the channel is applied to it.
     """
     global _last_channel_id
-    turn = turn or pending.add(message.id, message.content)
+    turn = turn or pending.add(message.id, message.content, channel_id=message.channel.id)
     _last_channel_id = message.channel.id
     if wa:
         verb = "edited" if turn.edit_of is not None else "(Discord)"
@@ -568,7 +632,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     inst = store.get(payload.channel_id)
     if inst is None or inst.stopped:
         return
-    outcome, turn = pending.edit(payload.message_id, data["content"])
+    outcome, turn = pending.edit(payload.message_id, data["content"], channel_id=payload.channel_id)
     if outcome == "updated":
         log.info("[%s] queued message %s edited before its turn", inst.name, payload.message_id)
         await _react(payload.message, "✏️")
@@ -613,6 +677,9 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
     channel = client.get_channel(inst.channel_id)
     if not isinstance(channel, discord.TextChannel):
         await wa.send_text(inst, f"⚠️ {inst.name}'s Discord channel is gone — `/resume` it there first.")
+        return
+    if _is_stop_word(text) and _interrupt(inst, sender, drop_queue=True):
+        await channel.send(f"⏹️ **{sender}** interrupted the agent from WhatsApp.")
         return
     _last_channel_id = channel.id
     echo = f"📱 **{sender}** (WhatsApp):\n{text}"
@@ -1218,6 +1285,35 @@ async def cmd_delete(interaction: discord.Interaction, name: str) -> None:
         f"🗑️ deleted '{name}'{note} — channel removed and instance forgotten. "
         "(The provider's own session files are not touched.)"
     )
+
+
+@tree.command(name="interrupt", description="Stop the agent's current turn (session kept), optionally with new instructions")
+@discord.app_commands.describe(
+    message="What to do instead: sent to the agent as soon as the turn has stopped",
+    keep_queue="Keep messages already waiting behind the turn (default: drop them)",
+)
+async def cmd_interrupt(
+    interaction: discord.Interaction, message: str | None = None, keep_queue: bool = False
+) -> None:
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    if inst is None:
+        await interaction.response.send_message("❌ run this inside an agent channel", ephemeral=True)
+        return
+    result = _interrupt(inst, interaction.user.display_name, drop_queue=not keep_queue)
+    if result is None and not message:
+        await interaction.response.send_message("Nothing is running in this channel.", ephemeral=True)
+        return
+    lines = []
+    if result is not None:
+        _, dropped = result
+        lines.append(f"⏹️ **{interaction.user.display_name}** stopped the current turn; the session is kept.")
+        if dropped:
+            lines.append(f"🗑️ Dropped {dropped} queued message{'s' if dropped != 1 else ''}.")
+    if message:
+        lines.append(f"➡️ Next: {message}")
+    await interaction.response.send_message(discord_markdown.split_message("\n".join(lines), DISCORD_MSG_LIMIT)[0])
+    if message:
+        asyncio.get_running_loop().create_task(on_message_simple(interaction.channel, message))
 
 
 @tree.command(name="model", description="Show or change the provider/model for this channel's agent")

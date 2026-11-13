@@ -9,7 +9,10 @@ own session store does.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import signal
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator
@@ -28,7 +31,9 @@ class TurnResult:
 class StreamEvent:
     """Incremental event while a turn is running.
 
-    kind is one of: "text", "status", "done", "error".
+    kind is one of: "text", "status", "session", "done", "error".
+    "session" carries the provider session id as soon as it's known, so a turn
+    that's interrupted before "done" can still be resumed.
     "done" events carry the final text and, when known, the provider session id.
     """
 
@@ -83,6 +88,94 @@ class AgentProvider(ABC):
         Yields StreamEvents as output arrives, ending with a "done" or "error"
         event whose text carries the final text / error message.
         """
+
+
+# Agent CLIs get their own process group (POSIX) / group (Windows), so stopping
+# a turn can kill the CLI and everything it started without touching the harness.
+SPAWN_KWARGS: dict = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+    else {"start_new_session": True}
+)
+
+
+def _descendants(pid: int) -> list[int]:
+    """PIDs below pid in the process tree, from /proc (Linux); [] elsewhere.
+
+    Agent CLIs run tool commands in process groups of their own (Claude Code's
+    Bash tool does), so killing the CLI's group alone would leave them running.
+    """
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
+
+
+def _signal_all(pids: list[int], sig: int) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 3.0) -> None:
+    """Stop an agent CLI that's still running, with everything it started.
+
+    A no-op once the CLI has exited, so finished turns keep anything they left
+    running in the background. Servers started detached (setsid nohup ... &)
+    have already left the tree, so they keep running too. On Windows, killing a
+    .cmd launcher alone would leave the real CLI running, so the whole tree is
+    killed.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "nt":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/T", "/F", "/PID", str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        else:
+            # Find the tree before killing: once the CLI dies its children are
+            # re-parented and the link to them is lost.
+            tree = [proc.pid, *_descendants(proc.pid)]
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)  # pgid == pid: it leads its own session
+            except ProcessLookupError:
+                pass
+            _signal_all(tree, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(proc.wait(), grace)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _signal_all(tree, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), 5)
+    except asyncio.TimeoutError:
+        proc.kill()
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")

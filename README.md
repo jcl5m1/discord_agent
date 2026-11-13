@@ -191,6 +191,13 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   the current level; a name that doesn't exist yet is created.
 - Just type in the channel — every message is a turn. Watch the 🤔 message update as
   the agent works. ✅ = turn finished, ❌ = error (check harness logs).
+- `/interrupt` stops the agent mid-turn without closing the channel. The CLI and
+  every command it started are killed, the session is kept (so the agent remembers
+  what it had done), and messages queued behind the turn are dropped since they
+  were for the old direction (`keep_queue:True` keeps them). Add `message:` to
+  send new instructions as soon as it has stopped. Sending just `stop` while a
+  turn runs does the same, in Discord or WhatsApp. Background servers started
+  detached (`setsid nohup … &`) keep running.
 - Editing or deleting a message works the way you'd expect. A message still
   waiting its turn (✏️ = edit received) is sent with its latest text, or dropped
   if you delete it. If the agent already has the message, an edit queues a
