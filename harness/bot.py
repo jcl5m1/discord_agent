@@ -25,7 +25,7 @@ import discord
 from . import config, discord_markdown, files, guard, logins, service, triggers, uptime, workdirs
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
-from .providers.base import SessionInfo, get_provider, provider_names
+from .providers.base import SessionInfo, TurnControl, get_provider, provider_names
 from .render import render_html_to_png
 
 if config.PUBLIC_BASE_URL:
@@ -341,6 +341,10 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # Set by /interrupt (or a "stop" message): ends the turn, keeps the session.
         "interrupt": asyncio.Event(),
         "interrupted_by": None,
+        # For agents that take live input: messages sent into the running turn,
+        # and the Discord message each came from (to mark it once it's read).
+        "control": TurnControl() if provider.supports_live_input else None,
+        "steered": {},
     }
     _active_turns[inst.channel_id] = turn
     progress = asyncio.get_running_loop().create_task(
@@ -370,8 +374,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     interrupt_wait = asyncio.ensure_future(turn["interrupt"].wait())
     try:
         try:
+            extra = {"control": turn["control"]} if turn["control"] else {}
             agen = provider.run_turn(
-                inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model
+                inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model, **extra
             )
             while True:
                 step = asyncio.ensure_future(agen.__anext__())
@@ -398,6 +403,13 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                     turn["tools"] += 1
                     log.info("[%s] %s", inst.name, event.text)
                 elif event.kind == "session":
+                    capture_session(event.session_id)
+                elif event.kind == "delivered":
+                    if (msg := turn["steered"].pop(event.text, None)) is not None:
+                        _wa_task(_react(msg, "✅"))
+                elif event.kind == "interrupted":
+                    interrupted = True
+                    buf = event.text or buf
                     capture_session(event.session_id)
                 elif event.kind == "error":
                     error = event.text
@@ -502,6 +514,16 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         interrupt_wait.cancel()
         _active_turns.pop(inst.channel_id, None)
         progress.cancel()
+        # Messages sent into the turn that the agent never read: after an
+        # interrupt they're dropped like the rest of the queue; otherwise they
+        # get a turn of their own.
+        for msg in turn["steered"].values():
+            if interrupted:
+                log.info("[%s] message %s sent into the turn was dropped by the interrupt",
+                         inst.name, msg.id)
+            elif store.get(inst.channel_id) is inst:
+                log.info("[%s] message %s wasn't read before the turn ended; queued", inst.name, msg.id)
+                asyncio.get_running_loop().create_task(_process_user_message(inst, msg))
 
 
 @client.event
@@ -541,7 +563,41 @@ async def on_message(message: discord.Message) -> None:
     if _is_stop_word(message.content) and _interrupt(inst, message.author.display_name, drop_queue=True):
         await _react(message, "⏹️")
         return
+    if _steer(inst, message):
+        if wa:
+            _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* (Discord):\n{message.content}"))
+        return
     await _process_user_message(inst, message)
+
+
+async def _hard_stop_after(inst: Instance, turn: dict, grace: float) -> None:
+    """Kill the CLI if a graceful interrupt hasn't ended the turn in time."""
+    await asyncio.sleep(grace)
+    if _active_turns.get(inst.channel_id) is turn and not turn["interrupt"].is_set():
+        log.warning("[%s] still running %.0fs after the interrupt; killing it", inst.name, grace)
+        turn["interrupt"].set()
+
+
+def _steer(inst: Instance, message: discord.Message, text: str | None = None) -> bool:
+    """Send a message straight into the running turn, if the agent can take it.
+
+    Returns False when it should be queued as a turn of its own instead.
+    """
+    turn = _active_turns.get(inst.channel_id)
+    if (
+        not config.STEER_RUNNING_TURNS
+        or turn is None
+        or turn["control"] is None
+        or turn["interrupted_by"]
+        or turn["interrupt"].is_set()
+    ):
+        return False
+    text = text if text is not None else message.content
+    turn["steered"][turn["control"].send(text)] = message
+    pending.remember(message.id, text)
+    log.info("[%s] message %s sent into the running turn", inst.name, message.id)
+    _wa_task(_react(message, "⏩"))
+    return True
 
 
 # A message that's only one of these, sent while a turn runs, interrupts it.
@@ -559,10 +615,15 @@ def _interrupt(inst: Instance, by: str, *, drop_queue: bool) -> tuple[bool, int]
     to the agent as an ordinary message.
     """
     turn = _active_turns.get(inst.channel_id)
-    if turn is None or turn["interrupt"].is_set():
+    if turn is None or turn["interrupt"].is_set() or turn["interrupted_by"]:
         return None
     turn["interrupted_by"] = by
-    turn["interrupt"].set()
+    if turn["control"] is not None:
+        # Like pressing Esc in the CLI: the agent stops at once and stays usable.
+        turn["control"].interrupt()
+        asyncio.get_running_loop().create_task(_hard_stop_after(inst, turn, config.INTERRUPT_GRACE))
+    else:
+        turn["interrupt"].set()  # no live input: the CLI is killed
     dropped = pending.drop_channel(inst.channel_id) if drop_queue else 0
     log.info("[%s] interrupted by %s (%d queued message(s) dropped)", inst.name, by, dropped)
     return True, dropped
@@ -688,6 +749,8 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
     except discord.HTTPException:
         log.exception("[%s] could not mirror whatsapp message to Discord", inst.name)
         mirror = None
+    if mirror is not None and _steer(inst, mirror, text):
+        return
     try:
         async with _channel_lock(channel.id):
             async with _global_semaphore:

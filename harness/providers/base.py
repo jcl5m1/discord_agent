@@ -18,6 +18,32 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 
+class TurnControl:
+    """Acts on a running turn, for providers with supports_live_input.
+
+    send() delivers a message into the turn (the agent reads it at its next
+    step, the way the interactive CLI's queue works); interrupt() stops the turn
+    gracefully (like pressing Esc) and keeps the session.
+    """
+
+    def __init__(self) -> None:
+        self.requests: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        # Sent but not yet read by the agent. Filled here, not when the provider
+        # writes it, so a turn ending in between still knows to wait for it.
+        self.unread: set[str] = set()
+
+    def send(self, text: str) -> str:
+        import uuid
+
+        message_id = str(uuid.uuid4())
+        self.unread.add(message_id)
+        self.requests.put_nowait(("message", f"{message_id}\n{text}"))
+        return message_id
+
+    def interrupt(self) -> None:
+        self.requests.put_nowait(("interrupt", ""))
+
+
 @dataclass
 class TurnResult:
     """Result of one provider turn."""
@@ -31,9 +57,13 @@ class TurnResult:
 class StreamEvent:
     """Incremental event while a turn is running.
 
-    kind is one of: "text", "status", "session", "done", "error".
+    kind is one of: "text", "status", "session", "delivered", "interrupted",
+    "done", "error".
     "session" carries the provider session id as soon as it's known, so a turn
     that's interrupted before "done" can still be resumed.
+    "delivered" (text = the id TurnControl.send returned): the agent has read a
+    message sent into the running turn. "interrupted": the turn stopped because
+    TurnControl.interrupt asked it to.
     "done" events carry the final text and, when known, the provider session id.
     """
 
@@ -76,6 +106,11 @@ class AgentProvider(ABC):
 
     def find_session(self, session_id: str) -> SessionInfo | None:
         return next((s for s in self.sessions() if s.id == session_id), None)
+
+    # True when run_turn accepts control= (a TurnControl) for live messages and
+    # graceful interrupts; otherwise messages wait for the turn and an interrupt
+    # kills the CLI.
+    supports_live_input: bool = False
 
     @abstractmethod
     def run_turn(

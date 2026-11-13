@@ -79,6 +79,14 @@ class PendingTurns:
             return "ignored", None
         return "followup", self.add(message_id, content, edit_of=latest, channel_id=channel_id)
 
+    def remember(self, message_id: int, content: str) -> None:
+        """Record a message the agent got without queueing (sent into a running
+        turn), so a later edit still becomes a follow-up."""
+        self._done[message_id] = content
+        self._done.move_to_end(message_id)
+        while len(self._done) > self._remember:
+            self._done.popitem(last=False)
+
     def drop_channel(self, channel_id: int) -> int:
         """Drop every turn waiting in a channel (after /interrupt); return how many."""
         dropped = 0

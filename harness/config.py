@@ -56,6 +56,11 @@ SHARED_CHANNELS: set[str] = {
 DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "kimi")
 DEFAULT_WORKDIR: str = os.path.expanduser(os.environ.get("DEFAULT_WORKDIR", str(Path.home())))
 MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
+# Messages sent while a turn runs go straight into it for agents that support
+# that (Claude Code reads them at its next step); false = they wait their turn.
+STEER_RUNNING_TURNS: bool = os.environ.get("STEER_RUNNING_TURNS", "true").lower() not in {"0", "false", "no"}
+# How long a graceful interrupt may take before the agent's CLI is killed.
+INTERRUPT_GRACE: float = float(os.environ.get("INTERRUPT_GRACE", "15"))
 
 # --- Liveness: in-channel progress updates + heartbeat for the watchdog ---
 # While a turn runs long, post a short "still working" status this often.
