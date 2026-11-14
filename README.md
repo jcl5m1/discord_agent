@@ -196,6 +196,13 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   works. ⏩ = sent into the turn, ✅ = the agent has read it; the reply continues
   in the same message. For kimi and muse, or with `STEER_RUNNING_TURNS=false`,
   they wait for the turn to finish.
+- Edit or delete a message before the agent has it and the change sticks: queued
+  messages are updated or dropped, and a message sent into Claude's running turn is
+  held for `STEER_HOLD` seconds (default 10) before Claude gets it, so a quick edit
+  or delete means Claude only ever sees the final text, or nothing. After that, an
+  edit or delete during the turn is passed on as a correction ("the user edited
+  their message…") or a retraction ("…disregard it"); after the turn, an edit
+  becomes a follow-up turn.
 - If the agent's CLI crashes before replying, the bot says so, restarts the session
   and resends your message; if it crashes again, your message goes to a fresh
   session (`/session` can switch back to the old one). A turn also ends as soon as

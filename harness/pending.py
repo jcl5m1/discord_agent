@@ -87,6 +87,10 @@ class PendingTurns:
         while len(self._done) > self._remember:
             self._done.popitem(last=False)
 
+    def last_text(self, message_id: int) -> str | None:
+        """The latest text the agent was given for a message, if remembered."""
+        return self._done.get(message_id)
+
     def drop_channel(self, channel_id: int) -> int:
         """Drop every turn waiting in a channel (after /interrupt); return how many."""
         dropped = 0

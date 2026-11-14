@@ -30,7 +30,7 @@ out({"type": "user", "isReplay": True, "uuid": first["uuid"], "message": first["
 out({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}, "session_id": "sess-1"})
 mode = first["message"]["content"]
 while True:
-    line = read(0.5)
+    line = read(2.5)
     if line is None:  # tool finished, nothing more to read: end the turn
         out({"type": "assistant", "message": {"content": [{"type": "text", "text": "turn done"}]}})
         out({"type": "result", "subtype": "success", "is_error": False, "result": "turn done"})
@@ -65,9 +65,10 @@ class ClaudeStreamTests(unittest.IsolatedAsyncioTestCase):
         fake = Path(self.tmp.name) / "claude"
         fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(FAKE_CLAUDE))
         fake.chmod(0o755)
-        patcher = mock.patch.object(config, "CLAUDE_BIN", str(fake))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for attr, value in (("CLAUDE_BIN", str(fake)), ("STEER_HOLD", 0)):
+            patcher = mock.patch.object(config, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def run_turn(self, control=None, during=None):
         events = []
@@ -111,6 +112,35 @@ class ClaudeStreamTests(unittest.IsolatedAsyncioTestCase):
                 control.send("one more")  # arrives as the turn ends
         self.assertIn("late: one more", events[-1].text)
         self.assertEqual(events[-1].kind, "done")
+
+
+class HoldTests(unittest.TestCase):
+    """TurnControl keeps sent messages editable until they're handed over."""
+
+    def test_edit_and_withdraw_while_held(self):
+        c = TurnControl()
+        kept, dropped = c.send("helo"), c.send("never mind")
+        self.assertTrue(c.edit(kept, "hello"))
+        self.assertTrue(c.withdraw(dropped))
+        self.assertEqual(c.take_held(), [(kept, "hello")])
+        self.assertEqual(c.unread, {kept})
+
+    def test_too_late_once_handed_over(self):
+        c = TurnControl()
+        m = c.send("x")
+        c.take_held()
+        self.assertFalse(c.edit(m, "y"))
+        self.assertFalse(c.withdraw(m))
+
+    def test_only_messages_past_their_window_are_due(self):
+        import time
+
+        c = TurnControl()
+        old = c.send("old")
+        c.held[old][1] -= 30
+        new = c.send("new")
+        self.assertEqual(c.take_held(time.monotonic() - 10), [(old, "old")])
+        self.assertEqual([m for m, _ in c.take_held()], [new])
 
 
 if __name__ == "__main__":

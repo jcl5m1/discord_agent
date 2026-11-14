@@ -31,14 +31,43 @@ class TurnControl:
         # Sent but not yet read by the agent. Filled here, not when the provider
         # writes it, so a turn ending in between still knows to wait for it.
         self.unread: set[str] = set()
+        # Sent but not yet handed to the agent ([text, sent at]): the provider
+        # holds each for a short edit window, so a quick edit or delete in
+        # Discord changes or removes it before the agent ever sees it.
+        self.held: dict[str, list] = {}
 
     def send(self, text: str) -> str:
+        import time
         import uuid
 
         message_id = str(uuid.uuid4())
         self.unread.add(message_id)
-        self.requests.put_nowait(("message", f"{message_id}\n{text}"))
+        self.held[message_id] = [text, time.monotonic()]
         return message_id
+
+    def edit(self, message_id: str, text: str) -> bool:
+        """Replace a message the agent hasn't been handed yet; False if too late."""
+        import time
+
+        if message_id not in self.held:
+            return False
+        self.held[message_id] = [text, time.monotonic()]  # a fresh window for the new text
+        return True
+
+    def withdraw(self, message_id: str) -> bool:
+        """Take back a message the agent hasn't been handed yet; False if too late."""
+        if self.held.pop(message_id, None) is None:
+            return False
+        self.unread.discard(message_id)
+        return True
+
+    def take_held(self, sent_before: float | None = None) -> list[tuple[str, str]]:
+        """Messages to hand over now, in order: all, or those sent before a time."""
+        due = [(mid, text) for mid, (text, sent) in self.held.items()
+               if sent_before is None or sent <= sent_before]
+        for mid, _ in due:
+            del self.held[mid]
+        return due
 
     def interrupt(self) -> None:
         self.requests.put_nowait(("interrupt", ""))

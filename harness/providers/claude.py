@@ -136,6 +136,7 @@ class ClaudeProvider(AgentProvider):
             **SPAWN_KWARGS,
         )
         relay_task: asyncio.Task | None = None
+        hold_task: asyncio.Task | None = None
         try:
             log.info(
                 "spawned claude pid=%d model=%s session=%s workdir=%s",
@@ -168,22 +169,40 @@ class ClaudeProvider(AgentProvider):
                     if proc.stdin.is_closing():
                         continue
                     try:
-                        if kind == "message":
-                            message_id, _, text = payload.partition("\n")
-                            proc.stdin.write(self._user_line(message_id, text))
-                        else:
-                            interrupt_requested = True
-                            proc.stdin.write((json.dumps({
-                                "type": "control_request",
-                                "request_id": f"interrupt-{uuid.uuid4()}",
-                                "request": {"subtype": "interrupt"},
-                            }) + "\n").encode())
+                        interrupt_requested = True
+                        proc.stdin.write((json.dumps({
+                            "type": "control_request",
+                            "request_id": f"interrupt-{uuid.uuid4()}",
+                            "request": {"subtype": "interrupt"},
+                        }) + "\n").encode())
                         await proc.stdin.drain()
                     except (BrokenPipeError, ConnectionResetError, RuntimeError):
                         return
 
+            async def hand_over(sent_before: float | None = None) -> None:
+                """Pass held messages to Claude, which reads them at its next step."""
+                if control is None or proc.stdin.is_closing():
+                    return
+                due = control.take_held(sent_before)
+                for message_id, text in due:
+                    proc.stdin.write(self._user_line(message_id, text))
+                if due:
+                    try:
+                        await proc.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError, RuntimeError):
+                        pass
+
+            async def hand_over_when_due() -> None:
+                # Each message waits out its edit window, then goes to Claude at
+                # once, so it's still read at the next step (handing it over only
+                # when a step ends would be too late for that step).
+                while True:
+                    await asyncio.sleep(1)
+                    await hand_over(time.monotonic() - config.STEER_HOLD)
+
             if control is not None:
                 relay_task = asyncio.get_running_loop().create_task(relay())
+                hold_task = asyncio.get_running_loop().create_task(hand_over_when_due())
 
             while True:
                 line = await read_line(proc, _UNREAD_GRACE if waiting_since else _STALL_WARN_INTERVAL)
@@ -233,6 +252,8 @@ class ClaudeProvider(AgentProvider):
                             name = block.get("name") or "tool"
                             yield StreamEvent(kind="status", text=f"⚙️ tool #{tool_count}: {name}")
                 elif etype == "result":
+                    if not interrupt_requested:
+                        await hand_over()  # anything still held gets a further turn
                     if interrupt_requested:
                         interrupted = True
                         close_stdin()
@@ -270,7 +291,8 @@ class ClaudeProvider(AgentProvider):
             else:
                 yield StreamEvent(kind="done", text=final_text, session_id=captured_session)
         finally:
-            if relay_task is not None:
-                relay_task.cancel()
+            for task in (relay_task, hold_task):
+                if task is not None:
+                    task.cancel()
             # Cut short (or the harness gave up on the turn): stop the CLI.
             await kill_process_tree(proc)

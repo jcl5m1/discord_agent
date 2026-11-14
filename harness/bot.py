@@ -742,6 +742,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
     inst = store.get(payload.channel_id)
     if inst is None or inst.stopped:
         return
+    if await _edit_steered(inst, payload.message_id, data["content"], payload.message):
+        return
     outcome, turn = pending.edit(payload.message_id, data["content"], channel_id=payload.channel_id)
     if outcome == "updated":
         log.info("[%s] queued message %s edited before its turn", inst.name, payload.message_id)
@@ -754,11 +756,59 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
         )
 
 
+def _steered_entry(inst: Instance, message_id: int) -> tuple[dict, str] | None:
+    """(running turn, id in it) for a Discord message that was sent into that turn."""
+    turn = _active_turns.get(inst.channel_id)
+    if turn is None or turn["control"] is None:
+        return None
+    for sent_id, msg in turn["steered"].items():
+        if msg.id == message_id:
+            return turn, sent_id
+    return None
+
+
+async def _edit_steered(inst: Instance, message_id: int, text: str, message) -> bool:
+    """Apply an edit to a message sent into the running turn; False if it wasn't."""
+    found = _steered_entry(inst, message_id)
+    if found is None:
+        return False
+    turn, sent_id = found
+    old = pending.last_text(message_id)
+    if text == old:
+        return True  # nothing changed (Discord sends an edit when adding a link preview)
+    pending.remember(message_id, text)
+    control = turn["control"]
+    if control.edit(sent_id, text):
+        log.info("[%s] message %s edited while held; the agent gets the new text", inst.name, message_id)
+    else:
+        # Already handed over: tell the agent within the same turn.
+        turn["steered"][control.send(
+            f"[The user edited their message above. It now reads:]\n{text}"
+        )] = message
+        log.info("[%s] message %s edited after the agent got it; correction sent", inst.name, message_id)
+    await _react(message, "✏️")
+    return True
+
+
 def _drop_deleted(channel_id: int, message_ids) -> None:
     inst = store.get(channel_id)
     if inst is None:
         return
     for message_id in message_ids:
+        if (found := _steered_entry(inst, message_id)) is not None:
+            turn, sent_id = found
+            turn["steered"].pop(sent_id)
+            if turn["control"].withdraw(sent_id):
+                log.info("[%s] message %s deleted while held; the agent never sees it", inst.name, message_id)
+            else:
+                old = pending.last_text(message_id) or ""
+                turn["control"].send(
+                    "[The user deleted one of their messages, so disregard it:]\n" + old
+                )
+                log.info("[%s] message %s deleted after the agent got it; retraction sent",
+                         inst.name, message_id)
+            pending.delete(message_id)
+            continue
         if pending.delete(message_id):
             log.info("[%s] message %s deleted while queued; dropped", inst.name, message_id)
             if wa:

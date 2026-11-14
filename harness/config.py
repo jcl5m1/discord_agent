@@ -59,6 +59,9 @@ MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 # Messages sent while a turn runs go straight into it for agents that support
 # that (Claude Code reads them at its next step); false = they wait their turn.
 STEER_RUNNING_TURNS: bool = os.environ.get("STEER_RUNNING_TURNS", "true").lower() not in {"0", "false", "no"}
+# Seconds a message sent into a running turn is held before the agent gets it,
+# so a quick edit or delete in Discord changes or removes it first.
+STEER_HOLD: float = float(os.environ.get("STEER_HOLD", "10"))
 # How long a graceful interrupt may take before the agent's CLI is killed.
 INTERRUPT_GRACE: float = float(os.environ.get("INTERRUPT_GRACE", "15"))
 
