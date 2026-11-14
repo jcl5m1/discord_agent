@@ -28,7 +28,7 @@ from . import config, discord_markdown, files, guard, logfile, logins, service, 
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
 from .providers.base import SessionInfo, TurnControl, get_provider, provider_names
-from .render import render_html_to_png
+from .render import render_html_to_png, render_table_png, table_html
 
 if config.PUBLIC_BASE_URL:
     from . import proxy
@@ -261,9 +261,10 @@ Output formats you can choose from, in order of richness:
    Use this format whenever the result benefits from being interactive.
 2. Static HTML in a fenced ```html code block — the harness renders it to an
    image. Good for one-shot rich documents (tables, reports, layouts).
-3. Plain Markdown text — for everything else. Discord can't display Markdown
-   tables, so the harness turns them into lists; prefer lists or short
-   paragraphs. Headings below ### show as bold text.
+3. Plain Markdown text — for everything else. Discord can't display tables:
+   write them as normal Markdown tables (not drawn in a code block) and the
+   harness shows them as images; tables of long sentences become lists. Headings
+   below ### show as bold text.
 Keep servers on ports {port_start}-{port_end} only; other ports are ignored.
 Annotation feedback (already wired up — nothing for you to enable): every HTML
 page you serve is automatically injected with the reviewjs annotate toolbar.
@@ -512,20 +513,37 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 png = None
                 final_text += "\n\n(html rendering failed — see raw source above)"
 
-        # Tables and deep headings don't render in Discord (or WhatsApp).
-        final_text = discord_markdown.adapt(final_text)
+        # Discord has no tables: those too wide for a phone become images, the
+        # rest code blocks or lists (as do deep headings, in Discord and WhatsApp).
+        tables: list[discord_markdown.Table] = []
+        adapted = discord_markdown.adapt(final_text, tables)
+        table_pngs: list[bytes] = []
+        if tables:
+            try:
+                for t in tables:
+                    table_pngs.append(await render_table_png(table_html(t.header, t.align, t.rows)))
+            except Exception:
+                log.exception("[%s] table rendering failed; sending tables as text", inst.name)
+                adapted, tables, table_pngs = discord_markdown.adapt(final_text), [], []
+        final_text = adapted
 
         if wa:
-            _wa_task(_mirror_reply(inst, final_text, png, html_block))
+            _wa_task(_mirror_reply(inst, final_text, png, html_block, table_pngs))
 
         # Split over the limit at line breaks, keeping code blocks intact.
         chunks = discord_markdown.split_message(final_text, DISCORD_MSG_LIMIT)
-        if image:
-            await status_msg.edit(content=chunks[0], attachments=[image], view=None)
+        # Each table image goes with the part of the reply that mentions it.
+        files: list[list[discord.File]] = [[] for _ in chunks]
+        for n, (t, table_png) in enumerate(zip(tables, table_pngs), 1):
+            k = next((i for i, c in enumerate(chunks) if t.marker in c), len(chunks) - 1)
+            files[k].append(discord.File(io.BytesIO(table_png), filename=f"table-{n}.png"))
+        first = ([image] if image else []) + files[0]
+        if first:
+            await status_msg.edit(content=chunks[0], attachments=first[:10], view=None)
         else:
             await status_msg.edit(content=chunks[0], view=None)
-        for chunk in chunks[1:]:
-            await status_msg.channel.send(chunk)
+        for chunk, chunk_files in zip(chunks[1:], files[1:]):
+            await status_msg.channel.send(chunk, files=chunk_files[:10])
         if source:
             await status_msg.channel.send(file=source)
 
@@ -677,12 +695,15 @@ def _interrupt(inst: Instance, by: str, *, drop_queue: bool) -> tuple[bool, int]
 
 
 async def _mirror_reply(
-    inst: Instance, text: str, png: bytes | None, html_block: str | None
+    inst: Instance, text: str, png: bytes | None, html_block: str | None,
+    table_pngs: list[bytes] = (),
 ) -> None:
     """Echo a finished agent reply into the instance's WhatsApp group, in order."""
     assert wa is not None
     await wa.typing(inst, False)
     await wa.send_text(inst, text)
+    for n, table_png in enumerate(table_pngs, 1):
+        await wa.send_image(inst, table_png, caption=f"table {n}")
     if png:
         await wa.send_image(inst, png, caption=f"{inst.name} output")
         await wa.send_document(

@@ -76,6 +76,56 @@ class AdaptTests(unittest.TestCase):
         self.assertEqual(adapt(text), text)
 
 
+DRAWN = """```
+File             Who uses it               Purpose
+---------------  ------------------------  -------------------------------------
+peer_channel.py  You and the Beacon agent  Submit, list, record status, answer
+CLAUDE.md        Your discussion agent     Discussion, submission, notifications
+```"""
+
+
+class TableImageTests(unittest.TestCase):
+    def test_wide_short_value_table_becomes_an_image(self):
+        images = []
+        out = adapt(WIDE_THREE_COL, images)
+        self.assertEqual(out, "📊 *table 1, shown below*")
+        self.assertEqual(images[0].header, ["Setup", "Even spacing", "Greedy"])
+        self.assertEqual(len(images[0].rows), 2)
+
+    def test_prose_table_stays_a_list(self):
+        images = []
+        out = adapt(WIDE_TWO_COL.replace("palm 48–56° from gaze, limit 45°",
+                                         "palm 48–56° from gaze, limit 45°, " + "long " * 10), images)
+        self.assertEqual(images, [])
+        self.assertIn("_Problem → Pinches affected_", out)
+
+    def test_narrow_table_stays_a_code_block(self):
+        images = []
+        self.assertTrue(adapt(NARROW, images).startswith("```"))
+        self.assertEqual(images, [])
+
+    def test_hand_drawn_table_in_a_code_block_becomes_an_image(self):
+        images = []
+        self.assertEqual(adapt(DRAWN, images), "📊 *table 1, shown below*")
+        t = images[0]
+        self.assertEqual(t.header, ["File", "Who uses it", "Purpose"])
+        self.assertEqual(t.rows[1], ["CLAUDE.md", "Your discussion agent", "Discussion, submission, notifications"])
+
+    def test_without_images_code_blocks_and_lists_are_unchanged(self):
+        self.assertEqual(adapt(DRAWN), DRAWN)
+        self.assertIn("- **`You_re_Beautiful` setup 1 (25 min)**", adapt(WIDE_THREE_COL))
+
+    def test_ordinary_code_is_not_mistaken_for_a_table(self):
+        code = "```python\nx = 1\n# ----  ----\ny = 2\n```"
+        images = []
+        self.assertEqual(adapt(code, images), code)
+        self.assertEqual(images, [])
+
+    def test_indented_code_block_keeps_its_opening_line(self):
+        text = "1. Run:\n   ```\n   make\n   ```"
+        self.assertEqual(adapt(text, []), text)
+
+
 class SplitTests(unittest.TestCase):
     def check(self, chunks, limit):
         for c in chunks:

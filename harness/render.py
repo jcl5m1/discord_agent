@@ -52,3 +52,65 @@ async def render_html_to_png(html: str) -> bytes:
                 return await page.screenshot(clip={"x": 0, "y": 0, "width": w, "height": h})
         finally:
             await browser.close()
+
+
+_TABLE_STYLE = """
+body { background: #2b2d31; padding: 12px; }
+table { border-collapse: collapse; font: 15px/1.35 -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: #dbdee1; }
+th { background: #1e1f22; color: #f2f3f5; font-weight: 600; text-align: left; }
+th, td { border: 1px solid #3f4147; padding: 6px 10px; max-width: 420px; vertical-align: top; }
+td.right, th.right { text-align: right; }
+tr:nth-child(even) td { background: #313338; }
+code { font: 13px ui-monospace, Menlo, Consolas, monospace; background: #1e1f22; padding: 1px 4px;
+       border-radius: 3px; }
+"""
+
+
+def _cell_html(cell: str) -> str:
+    """A table cell's inline Markdown (bold, code, links) as HTML."""
+    import html
+    import re
+
+    text = html.escape(cell.strip())
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    return re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+
+
+def table_html(header: list[str], align: list[str], rows: list[list[str]]) -> str:
+    """An HTML table styled like Discord's dark theme, for render_html_to_png."""
+    def row(cells: list[str], tag: str) -> str:
+        return "<tr>" + "".join(
+            f'<{tag} class="{a}">{_cell_html(c)}</{tag}>'
+            for c, a in zip(cells, align + ["left"] * len(cells))
+        ) + "</tr>"
+
+    return (f"<style>{_TABLE_STYLE}</style><table>{row(header, 'th')}"
+            + "".join(row(r, "td") for r in rows) + "</table>")
+
+
+async def render_table_png(html: str) -> bytes:
+    """Screenshot just the table in `html` (from table_html), at double resolution.
+
+    Laid out on a wide page so columns take their natural width (cells wrap at
+    420px), then cropped to the table, so there's no empty margin; 2x keeps the
+    text sharp when a phone scales the image down.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        try:
+            page = await browser.new_page(
+                viewport={"width": _MAX_WIDTH, "height": 400}, device_scale_factor=2
+            )
+            await page.set_content(_TEMPLATE.format(body=html), wait_until="load")
+            box = await page.locator("table").bounding_box()
+            pad = 10
+            clip = {"x": max(box["x"] - pad, 0), "y": max(box["y"] - pad, 0),
+                    "width": min(box["width"] + 2 * pad, _MAX_WIDTH),
+                    "height": min(box["height"] + 2 * pad, _MAX_HEIGHT)}
+            return await page.screenshot(clip=clip, full_page=True)
+        finally:
+            await browser.close()

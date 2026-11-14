@@ -298,8 +298,9 @@ def summary(now: float | None = None, recent: int = 5) -> str:
         lines.append(f"🟢 Internet up since <t:{int(since)}:f> ({fmt_duration(now - since)})"
                      + ("" if net_down else " — no outages recorded yet"))
 
-    lines += ["", "```", f"{'window':<8}{'internet':>26}{'system':>26}",
-              f"{'':<8}{'avail · outages · down':>26}{'avail · outages · down':>26}"]
+    # One line per window rather than a code-block table: Discord wraps long code
+    # lines on phones, which breaks a table's alignment.
+    lines += ["", "**Availability** (outages · downtime)"]
     for label, span in (("24h", 86400), ("7d", 7 * 86400), ("30d", 30 * 86400), ("all", None)):
         lo_net = max(now - span, covered_from or now) if span else (covered_from or now)
         lo_sys = max(now - span, sys_from) if span else sys_from
@@ -316,9 +317,8 @@ def summary(now: float | None = None, recent: int = 5) -> str:
                 cells.append("—")
                 continue
             pct = 100 * (1 - down / window)
-            cells.append(f"{pct:.2f}% {n}× {fmt_duration(down)}" if n else f"{pct:.2f}%")
-        lines.append(f"{label:<8}{cells[0]:>26}{cells[1]:>26}")
-    lines.append("```")
+            cells.append(f"{pct:.2f}% ({n}× · {fmt_duration(down)})" if n else f"{pct:.2f}%")
+        lines.append(f"`{label:>3}` 🌐 {cells[0]} · 🖥️ {cells[1]}")
     lines.append(f"_internet tracked since <t:{int(covered_from or now)}:d>, "
                  f"system since <t:{int(sys_from)}:d>; checks every {int(INTERVAL)}s_")
 

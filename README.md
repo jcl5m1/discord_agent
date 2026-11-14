@@ -300,11 +300,22 @@ The image renders inline on mobile; tap the attachment for the source.
 ### Markdown in Discord
 
 Discord shows only part of Markdown, so replies are adapted before posting
-(`harness/discord_markdown.py`). Tables become an aligned code block when narrow
-enough for a phone, otherwise a list with one entry per row. Headings below `###`
-become bold lines, and `---` dividers are dropped. Replies over Discord's
-2000-character limit are split at line breaks, and a code block cut by a split is
-closed and reopened so both halves render. Code blocks are never changed.
+(`harness/discord_markdown.py`). It has no tables, and its code blocks wrap long
+lines instead of scrolling, which breaks a text table's alignment on a phone. So:
+
+- tables that fit a phone (up to 32 characters wide) become an aligned code block;
+- wider tables of short values become an **image** of the table (headless Chromium,
+  in Discord's dark colours), attached under the part of the reply that mentions
+  it, with a "📊 table 1, shown below" line where the table was; WhatsApp gets the
+  images too. If rendering fails, the reply falls back to text;
+- tables of long sentences become a list, one entry per row, which reads better on
+  a phone than a shrunken image;
+- tables an agent draws itself inside a code block (a dashed rule under the
+  header) are detected and treated the same way when they're too wide for a phone.
+
+Headings below `###` become bold lines, and `---` dividers are dropped. Replies over
+Discord's 2000-character limit are split at line breaks, and a code block cut by a
+split is closed and reopened so both halves render.
 
 ### WhatsApp mirror (optional)
 
