@@ -35,7 +35,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config
+from . import config, logfile
 
 log = logging.getLogger("uptime")
 
@@ -337,10 +337,7 @@ def summary(now: float | None = None, recent: int = 5) -> str:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logfile.setup("uptime")
     asyncio.run(run())
 
 

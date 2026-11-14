@@ -10,11 +10,13 @@ stored provider session.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import io
 import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -22,7 +24,7 @@ from pathlib import Path
 
 import discord
 
-from . import config, discord_markdown, files, guard, logins, service, triggers, uptime, workdirs
+from . import config, discord_markdown, files, guard, logfile, logins, service, triggers, uptime, workdirs
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
 from .providers.base import SessionInfo, TurnControl, get_provider, provider_names
@@ -33,10 +35,7 @@ if config.PUBLIC_BASE_URL:
 if config.WHATSAPP_ENABLED:
     from .whatsapp import WhatsAppBridge
 
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logfile.setup("bot")
 log = logging.getLogger("discord_agent")
 
 DISCORD_MSG_LIMIT = 2000
@@ -1816,6 +1815,28 @@ async def cmd_whatsapp(interaction: discord.Interaction, phone: str | None = Non
         "Scan with the **bot** phone (WhatsApp → Linked devices → Link a device). "
         "QR codes rotate quickly — rerun `/whatsapp` if it expires, or pass `phone:` for a code.",
         file=discord.File(io.BytesIO(png), filename="whatsapp-qr.png"),
+    )
+
+
+@tree.command(name="logs", description="Post this machine's recent harness logs as a file (secrets removed)")
+@discord.app_commands.describe(lines="How many recent lines from each log (default 3000)")
+@discord.app_commands.default_permissions(administrator=True)
+async def cmd_logs(interaction: discord.Interaction, lines: int = 3000) -> None:
+    await interaction.response.defer()
+    header = [f"bot {client.user} · {len(_active_turns)} turn(s) running"] + [
+        f"instance {i.name}: {i.provider}/{_model_label(i)} session={i.session_id} "
+        f"workdir={i.workdir}{' (stopped)' if i.stopped else ''}"
+        for i in store.all()
+    ]
+    text = await asyncio.to_thread(logfile.export, max(100, min(lines, 20000)), header)
+    data, name = text.encode(), f"logs-{_slug(socket.gethostname())}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+    if len(data) > 7_000_000:  # under Discord's upload limit
+        data, name = gzip.compress(data), name + ".gz"
+    log.info("/logs by %s: %d bytes", interaction.user, len(data))
+    await interaction.followup.send(
+        f"📄 Logs from **{socket.gethostname()}** ({client.user.name}), secrets removed. "
+        "Hand this to whoever is debugging, or tell the agent on another machine where it is.",
+        file=discord.File(io.BytesIO(data), filename=name),
     )
 
 

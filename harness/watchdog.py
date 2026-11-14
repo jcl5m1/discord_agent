@@ -23,12 +23,9 @@ import logging
 import time
 import urllib.request
 
-from . import config
+from . import config, logfile
 
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+logfile.setup("watchdog")
 log = logging.getLogger("discord_agent.watchdog")
 
 

@@ -341,6 +341,17 @@ Discord still lists every bot's commands in the picker. Its channel settings und
 Server Settings → Integrations don't hide them from a server owner, so the picker
 can't be cleaned up for an admin account. Each bot needs this code to be guarded.
 
+### Logs and `/logs`
+
+Each process writes `data/logs/<bot|watchdog|uptime>.log` (rotated at 5 MB, 3 old
+files kept), so logs survive restarts on every OS, including Windows, where the
+logon tasks have no console to read afterwards. `/logs` (admins) posts this
+machine's recent lines, plus systemd's journal on Linux, as a file in the channel,
+with a summary of the bot's instances and sessions at the top. Anything that looks
+like a token or key is replaced with `[redacted]`. To get another machine's logs to
+the agent on this one, run that bot's `/logs` and tell the agent which channel it's
+in: the agent can download the file with its own bot's access.
+
 ### Uptime log (`/uptime`)
 
 A third user unit, `discord-agent-uptime.service`, tracks how often the
@@ -470,6 +481,7 @@ harness/
 ├── config.py           # .env loading and typed settings
 ├── instances.py        # channel ↔ instance mapping (data/instances.json)
 ├── discord_markdown.py # adapts replies to Discord's Markdown, splits long ones
+├── logfile.py          # log files for each process, and the /logs export
 ├── guard.py            # keeps slash commands to this bot's own channels
 ├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
