@@ -352,6 +352,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     progress = asyncio.get_running_loop().create_task(
         _progress_updates(inst, status_msg.channel, turn)
     )
+    stop_view = StopTurnView(inst, turn)
+    try:
+        await status_msg.edit(view=stop_view)
+    except discord.HTTPException:
+        log.warning("[%s] couldn't add the stop button", inst.name)
     if wa:
         _wa_task(wa.typing(inst))
 
@@ -435,7 +440,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
             text = f"{body}\n\n{note}" if body else note
             if len(text) > DISCORD_MSG_LIMIT:
                 text = discord_markdown.split_message(body, DISCORD_MSG_LIMIT - len(note) - 30)[0] + f"\n…\n\n{note}"
-            await status_msg.edit(content=text)
+            await status_msg.edit(content=text, view=None)
             if wa:
                 _wa_task(wa.send_text(inst, note))
             return
@@ -455,7 +460,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                     view=SessionInUseView(inst, prompt),
                 )
             else:
-                await status_msg.edit(content=f"❌ {display(error)}")
+                await status_msg.edit(content=f"❌ {display(error)}", view=None)
             if wa:
                 _wa_task(wa.send_text(inst, f"❌ {error}"))
             return
@@ -499,9 +504,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # Split over the limit at line breaks, keeping code blocks intact.
         chunks = discord_markdown.split_message(final_text, DISCORD_MSG_LIMIT)
         if image:
-            await status_msg.edit(content=chunks[0], attachments=[image])
+            await status_msg.edit(content=chunks[0], attachments=[image], view=None)
         else:
-            await status_msg.edit(content=chunks[0])
+            await status_msg.edit(content=chunks[0], view=None)
         for chunk in chunks[1:]:
             await status_msg.channel.send(chunk)
         if source:
@@ -513,6 +518,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         except discord.Forbidden:
             log.warning("missing permission to set channel topic for %s", inst.name)
     finally:
+        stop_view.stop()
         interrupt_wait.cancel()
         _active_turns.pop(inst.channel_id, None)
         progress.cancel()
@@ -1072,6 +1078,28 @@ class ReopenView(discord.ui.View):
 # Agent CLIs refuse a session another process still has open (kimi says "in use
 # by another Kimi Code CLI instance").
 _SESSION_IN_USE_RE = re.compile(r"in use by another|session (is )?(already )?in use", re.IGNORECASE)
+
+
+class StopTurnView(discord.ui.View):
+    """⏹️ Stop on the "working…" message: the same graceful stop as `stop`."""
+
+    def __init__(self, inst: Instance, turn: dict):
+        super().__init__(timeout=None)  # removed by the turn's final edit
+        self.inst = inst
+        self.turn = turn
+
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger)
+    async def stop_turn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Only this message's turn: an old button mustn't stop a newer turn.
+        if _active_turns.get(self.inst.channel_id) is not self.turn:
+            await interaction.response.send_message("That turn has already finished.", ephemeral=True)
+            return
+        if _interrupt(self.inst, interaction.user.display_name, drop_queue=True) is None:
+            await interaction.response.send_message("It's already stopping.", ephemeral=True)
+            return
+        button.disabled = True
+        button.label = "Stopping…"
+        await interaction.response.edit_message(view=self)
 
 
 class SessionInUseView(discord.ui.View):

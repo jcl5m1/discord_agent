@@ -196,6 +196,8 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   works. ⏩ = sent into the turn, ✅ = the agent has read it; the reply continues
   in the same message. For kimi and muse, or with `STEER_RUNNING_TURNS=false`,
   they wait for the turn to finish.
+- While the agent works, its "working…" message has a **⏹️ Stop** button: the same
+  graceful stop as sending `stop`. It goes away when the turn ends.
 - **Start a message with `!` to interrupt and redirect**, e.g. `! use postgres
   instead`: the running turn stops gracefully, messages queued behind it are
   dropped, and your message runs next on the same session (so the agent keeps the
