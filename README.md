@@ -196,6 +196,15 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   works. ⏩ = sent into the turn, ✅ = the agent has read it; the reply continues
   in the same message. For kimi and muse, or with `STEER_RUNNING_TURNS=false`,
   they wait for the turn to finish.
+- If the agent's CLI crashes before replying, the bot says so, restarts the session
+  and resends your message; if it crashes again, your message goes to a fresh
+  session (`/session` can switch back to the old one). A turn also ends as soon as
+  the CLI exits, even if a program it started in the background still holds its
+  output open (that used to leave a session silently "running" forever).
+- A message that has to wait behind a running turn gets one status note per turn:
+  how long the agent has been at it, when it last produced output, and how to stop
+  it. The same note appears if a message you send into a running turn finds it
+  silent for 10 minutes or more.
 - While the agent works, its "working…" message has a **⏹️ Stop** button: the same
   graceful stop as sending `stop`. It goes away when the turn ends.
 - **Start a message with `!` to interrupt and redirect**, e.g. `! use postgres

@@ -215,6 +215,50 @@ async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 3.0
         proc.kill()
 
 
+# How often a silent CLI is checked for having exited.
+EXIT_CHECK = 5.0
+
+
+async def read_line(proc: asyncio.subprocess.Process, timeout: float) -> bytes | None:
+    """The CLI's next output line: b"" once it's done, None after `timeout` of silence.
+
+    Done means the pipe closed, or the CLI exited and nothing more is coming. A
+    program it started in the background (a dev server) can hold the pipe open
+    long after the CLI exits, and the turn must not wait on that: it would look
+    like a session that silently stopped responding.
+    """
+    assert proc.stdout is not None
+    waited = 0.0
+    while True:
+        step = min(EXIT_CHECK, timeout - waited)
+        try:
+            return await asyncio.wait_for(proc.stdout.readline(), step)
+        except asyncio.TimeoutError:
+            if proc.returncode is not None:
+                return b""
+            waited += step
+            if waited >= timeout:
+                return None
+
+
+async def finish_process(proc: asyncio.subprocess.Process) -> tuple[bytes, int]:
+    """(stderr, exit code) of a CLI whose output has ended, without waiting on
+    pipes a background program may still hold open."""
+    assert proc.stderr is not None
+    try:
+        # Once the CLI has exited, its own error output is already buffered.
+        wait = 1.0 if proc.returncode is not None else EXIT_CHECK
+        stderr = await asyncio.wait_for(proc.stderr.read(), wait)
+    except asyncio.TimeoutError:
+        stderr = b""
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), EXIT_CHECK)
+        except asyncio.TimeoutError:
+            pass
+    return stderr, proc.returncode if proc.returncode is not None else -1
+
+
 def send_interrupt_signal(proc: asyncio.subprocess.Process) -> None:
     """Ask a CLI to stop its turn the way Ctrl-C would.
 

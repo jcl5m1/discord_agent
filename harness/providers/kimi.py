@@ -20,7 +20,8 @@ from typing import AsyncIterator
 
 from .. import config
 from .base import (
-    SPAWN_KWARGS, AgentProvider, kill_process_tree, register, relay_interrupts, SessionInfo, StreamEvent, TurnControl,
+    SPAWN_KWARGS, AgentProvider, finish_process, kill_process_tree, read_line, register,
+    relay_interrupts, SessionInfo, StreamEvent, TurnControl,
 )
 
 log = logging.getLogger("discord_agent.kimi")
@@ -202,11 +203,8 @@ class KimiProvider(AgentProvider):
 
             assert proc.stdout is not None
             while True:
-                try:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=_STALL_WARN_INTERVAL
-                    )
-                except asyncio.TimeoutError:
+                line = await read_line(proc, _STALL_WARN_INTERVAL)
+                if line is None:
                     log.warning(
                         "kimi pid=%d silent for %.0fs (elapsed %.0fs, %d tools so far) "
                         "— subprocess has not exited; still waiting",
@@ -242,8 +240,7 @@ class KimiProvider(AgentProvider):
                             yield StreamEvent(kind="session", session_id=captured_session)
 
             assert proc.stderr is not None
-            stderr_data = await proc.stderr.read()
-            returncode = await proc.wait()
+            stderr_data, returncode = await finish_process(proc)
             log.info(
                 "kimi pid=%d exited rc=%d after %.0fs (%d tools, %d reply chars)",
                 proc.pid, returncode, time.monotonic() - started,

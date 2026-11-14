@@ -42,6 +42,8 @@ log = logging.getLogger("discord_agent")
 DISCORD_MSG_LIMIT = 2000
 TOPIC_LIMIT = 1024
 EDIT_INTERVAL = 1.0  # seconds between in-place message edits
+# A running turn silent this long is called out as possibly stuck when you message it.
+STUCK_AFTER = 600
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -316,8 +318,12 @@ def _with_brief(inst: Instance, prompt: str) -> str:
     ) + "\n" + prompt
 
 
-async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
-    """Run one provider turn for an instance, streaming into status_msg."""
+async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> str:
+    """Run one provider turn for an instance, streaming into status_msg.
+
+    Returns how it ended: "done", "error", "interrupted", or "crashed" (the CLI
+    failed before writing anything or using a tool; see _run_turn_recovering).
+    """
     provider = get_provider(inst.provider)
     loop = asyncio.get_running_loop()
     started = loop.time()
@@ -443,13 +449,25 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
             await status_msg.edit(content=text, view=None)
             if wa:
                 _wa_task(wa.send_text(inst, note))
-            return
+            return "interrupted"
 
         if error:
             log.warning(
                 "[%s] turn failed after %.0fs: %.300s",
                 inst.name, loop.time() - started, error,
             )
+            crashed = (
+                not buf.strip()
+                and turn["tools"] == 0
+                and not error.startswith("harness error")
+                and not _SESSION_IN_USE_RE.search(error)
+            )
+            if crashed:
+                await status_msg.edit(
+                    content=display(f"⚠️ The agent's session crashed before replying: {error}"),
+                    view=None,
+                )
+                return "crashed"
             if inst.session_id and _SESSION_IN_USE_RE.search(error):
                 await status_msg.edit(
                     content=display(
@@ -463,7 +481,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 await status_msg.edit(content=f"❌ {display(error)}", view=None)
             if wa:
                 _wa_task(wa.send_text(inst, f"❌ {error}"))
-            return
+            return "error"
 
         log.info(
             "[%s] turn done in %.0fs, %d chars of reply",
@@ -517,6 +535,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
             await status_msg.channel.edit(topic=topic)
         except discord.Forbidden:
             log.warning("missing permission to set channel topic for %s", inst.name)
+        return "done"
     finally:
         stop_view.stop()
         interrupt_wait.cancel()
@@ -579,6 +598,8 @@ async def on_message(message: discord.Message) -> None:
         await _process_user_message(inst, message, turn)
         return
     if _steer(inst, message):
+        if notice := _busy_notice(inst, steered=True):
+            await message.channel.send(notice)
         if wa:
             _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* (Discord):\n{message.content}"))
         return
@@ -688,6 +709,8 @@ async def _process_user_message(
     global _last_channel_id
     turn = turn or pending.add(message.id, message.content, channel_id=message.channel.id)
     _last_channel_id = message.channel.id
+    if notice := _busy_notice(inst, steered=False):
+        await message.channel.send(notice)
     if wa:
         verb = "edited" if turn.edit_of is not None else "(Discord)"
         _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* {verb}:\n{turn.content}"))
@@ -700,7 +723,7 @@ async def _process_user_message(
                 turn.started = True
                 async with message.channel.typing():
                     status_msg = await message.channel.send("🤔 …")
-                    await _run_turn(inst, turn.prompt(), status_msg)
+                    await _run_turn_recovering(inst, turn.prompt(), status_msg)
         if store.get(message.channel.id) is inst:  # not /delete'd mid-turn
             inst.last_message_id = str(message.id)
             store.put(inst)
@@ -781,12 +804,14 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
         mirror = None
     if mirror is not None and _steer(inst, mirror, text):
         return
+    if notice := _busy_notice(inst, steered=False):
+        await channel.send(notice)
     try:
         async with _channel_lock(channel.id):
             async with _global_semaphore:
                 async with channel.typing():
                     status_msg = await channel.send("🤔 …")
-                    await _run_turn(inst, text, status_msg)
+                    await _run_turn_recovering(inst, text, status_msg)
         if mirror:
             await mirror.add_reaction("✅")
     except Exception:
@@ -1136,6 +1161,53 @@ class SessionInUseView(discord.ui.View):
         await self._retry(interaction, fresh=False)
 
 
+async def _run_turn_recovering(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
+    """Run a turn; if the agent's CLI crashed before replying, restart and resend.
+
+    First the same session again (a transient failure), then, if it crashes once
+    more, a fresh session: the message isn't lost either way.
+    """
+    if await _run_turn(inst, prompt, status_msg) != "crashed":
+        return
+    channel = status_msg.channel
+    log.warning("[%s] agent crashed before replying; retrying the same session", inst.name)
+    retry = await channel.send("🔄 Restarting the session and resending your message…")
+    if await _run_turn(inst, prompt, retry) != "crashed":
+        return
+    if not inst.session_id or store.get(inst.channel_id) is not inst:
+        return
+    old = inst.session_id
+    inst.session_id = None
+    store.put(inst)
+    log.warning("[%s] session %s crashed twice; starting a fresh session", inst.name, old)
+    await channel.send(
+        f"⚠️ Session `{old}` crashed again, so your message goes to a **fresh session**. "
+        "The old one isn't deleted: `/session` can switch back to it."
+    )
+    await _run_turn(inst, prompt, await channel.send("🤔 …"))
+
+
+def _busy_notice(inst: Instance, *, steered: bool) -> str | None:
+    """A one-per-turn note when a message has to wait for (or went into) a busy turn."""
+    turn = _active_turns.get(inst.channel_id)
+    if turn is None or turn.get("notified"):
+        return None
+    silent = time.time() - turn["last_event_at"]
+    if steered and silent < STUCK_AFTER:
+        return None  # ⏩ says enough while the agent is visibly working
+    turn["notified"] = True
+    elapsed = _fmt_duration(time.time() - turn["started_at"])
+    how = "press ⏹️ Stop on its message, or send `! <your message>` to stop it and run yours"
+    if steered:
+        return (f"⏳ **{inst.name}** hasn't produced output for {_fmt_duration(silent)} "
+                f"({elapsed} into this turn), so it may be stuck. Your message was passed to "
+                f"it (⏩). To restart with your message, {how}.")
+    stuck = " It may be stuck." if silent >= STUCK_AFTER else ""
+    return (f"⏳ **{inst.name}** is still on the previous message ({elapsed} so far, last "
+            f"output {_fmt_duration(silent)} ago).{stuck} Yours will run when it finishes; "
+            f"to go now, {how}.")
+
+
 async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     global _last_channel_id
     inst = store.get(channel.id)
@@ -1148,7 +1220,7 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
         async with _global_semaphore:
             async with channel.typing():
                 status_msg = await channel.send("🤔 …")
-                await _run_turn(inst, prompt, status_msg)
+                await _run_turn_recovering(inst, prompt, status_msg)
 
 
 async def fire_trigger(trig: triggers.Trigger, event: dict) -> dict:

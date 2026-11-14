@@ -20,8 +20,8 @@ from typing import AsyncIterator
 
 from .. import config
 from .base import (
-    SPAWN_KWARGS, AgentProvider, SessionInfo, StreamEvent, TurnControl, kill_process_tree, register,
-    run_text,
+    SPAWN_KWARGS, AgentProvider, SessionInfo, StreamEvent, TurnControl, finish_process,
+    kill_process_tree, read_line, register, run_text,
 )
 
 log = logging.getLogger("discord_agent.claude")
@@ -186,12 +186,8 @@ class ClaudeProvider(AgentProvider):
                 relay_task = asyncio.get_running_loop().create_task(relay())
 
             while True:
-                try:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(),
-                        timeout=_UNREAD_GRACE if waiting_since else _STALL_WARN_INTERVAL,
-                    )
-                except asyncio.TimeoutError:
+                line = await read_line(proc, _UNREAD_GRACE if waiting_since else _STALL_WARN_INTERVAL)
+                if line is None:
                     if waiting_since:
                         log.warning("claude pid=%d didn't pick up %d message(s) after its turn; "
                                     "ending it", proc.pid, len(unread))
@@ -251,8 +247,7 @@ class ClaudeProvider(AgentProvider):
                         waiting_since = time.monotonic()
 
             assert proc.stderr is not None
-            stderr_data = await proc.stderr.read()
-            returncode = await proc.wait()
+            stderr_data, returncode = await finish_process(proc)
             log.info(
                 "claude pid=%d exited rc=%d after %.0fs (%d tools, %d reply chars)%s",
                 proc.pid, returncode, time.monotonic() - started,
