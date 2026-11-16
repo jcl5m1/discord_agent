@@ -62,6 +62,9 @@ STEER_RUNNING_TURNS: bool = os.environ.get("STEER_RUNNING_TURNS", "true").lower(
 # Seconds a message sent into a running turn is held before the agent gets it,
 # so a quick edit or delete in Discord changes or removes it first.
 STEER_HOLD: float = float(os.environ.get("STEER_HOLD", "10"))
+# Seconds a message to an idle agent waits before its turn starts, so deleting it
+# (e.g. sent to the wrong channel) or editing it right away takes effect first.
+SEND_DELAY: float = float(os.environ.get("SEND_DELAY", "5"))
 # How long a graceful interrupt may take before the agent's CLI is killed.
 INTERRUPT_GRACE: float = float(os.environ.get("INTERRUPT_GRACE", "15"))
 

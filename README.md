@@ -196,6 +196,12 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   works. ⏩ = sent into the turn, ✅ = the agent has read it; the reply continues
   in the same message. For kimi and muse, or with `STEER_RUNNING_TURNS=false`,
   they wait for the turn to finish.
+- A message to an idle agent waits `SEND_DELAY` seconds (default 5, typing
+  indicator showing) before its turn starts, so deleting it (say, sent to the wrong
+  channel) or fixing a typo right away means the agent never sees it, or sees only
+  the fixed text. Deleting a message whose turn has already started stops that turn,
+  and the agent's next turn begins with a note to disregard it and anything it did
+  for it.
 - Edit or delete a message before the agent has it and the change sticks: queued
   messages are updated or dropped, and a message sent into Claude's running turn is
   held for `STEER_HOLD` seconds (default 10) before Claude gets it, so a quick edit

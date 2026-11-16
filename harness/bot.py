@@ -81,6 +81,11 @@ wa: "WhatsAppBridge | None" = None
 
 # User messages waiting for (or in) a turn, so edits and deletes reach the agent.
 pending = PendingTurns()
+# The Discord message each channel's running turn is answering: (id, text). A
+# delete of it stops the turn, and the agent's next turn starts with the note
+# kept in _disregard_notes.
+_running_message: dict[int, tuple[int, str]] = {}
+_disregard_notes: dict[int, str] = {}
 
 # Serialize turns within a channel; cap total concurrent turns globally.
 # Take the channel lock BEFORE the global slot, so messages queued behind a
@@ -387,6 +392,8 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     interrupt_wait = asyncio.ensure_future(turn["interrupt"].wait())
     try:
         try:
+            if note := _disregard_notes.pop(inst.channel_id, None):
+                prompt = f"{note}\n\n{prompt}"
             extra = {"control": turn["control"]} if turn["control"] else {}
             agen = provider.run_turn(
                 inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model, **extra
@@ -727,6 +734,7 @@ async def _process_user_message(
     the message waits for the channel is applied to it.
     """
     global _last_channel_id
+    fresh = turn is None
     turn = turn or pending.add(message.id, message.content, channel_id=message.channel.id)
     _last_channel_id = message.channel.id
     if notice := _busy_notice(inst, steered=False):
@@ -735,15 +743,25 @@ async def _process_user_message(
         verb = "edited" if turn.edit_of is not None else "(Discord)"
         _wa_task(wa.send_text(inst, f"💬 *{message.author.display_name}* {verb}:\n{turn.content}"))
     try:
+        if fresh and config.SEND_DELAY > 0 and inst.channel_id not in _active_turns:
+            # Give a just-sent message a moment, so deleting it (wrong channel) or
+            # fixing a typo happens before the agent ever sees it.
+            async with message.channel.typing():
+                await asyncio.sleep(config.SEND_DELAY)
         async with _channel_lock(message.channel.id):
             async with _global_semaphore:
                 if turn.deleted:
                     log.info("[%s] message %s deleted before its turn; skipped", inst.name, message.id)
                     return
                 turn.started = True
-                async with message.channel.typing():
-                    status_msg = await message.channel.send("🤔 …")
-                    await _run_turn_recovering(inst, turn.prompt(), status_msg)
+                _running_message[message.channel.id] = (message.id, turn.content)
+                try:
+                    async with message.channel.typing():
+                        status_msg = await message.channel.send("🤔 …")
+                        await _run_turn_recovering(inst, turn.prompt(), status_msg)
+                finally:
+                    if _running_message.get(message.channel.id, (None,))[0] == message.id:
+                        _running_message.pop(message.channel.id, None)
         if store.get(message.channel.id) is inst:  # not /delete'd mid-turn
             inst.last_message_id = str(message.id)
             store.put(inst)
@@ -828,6 +846,17 @@ def _drop_deleted(channel_id: int, message_ids) -> None:
                 )
                 log.info("[%s] message %s deleted after the agent got it; retraction sent",
                          inst.name, message_id)
+            pending.delete(message_id)
+            continue
+        running = _running_message.get(channel_id)
+        if running and running[0] == message_id and _interrupt(
+            inst, "the message being deleted", drop_queue=False
+        ):
+            _disregard_notes[channel_id] = (
+                "[The user deleted the message you were just working on, so disregard it and "
+                "anything you did for it, unless they ask again. It said:]\n" + running[1][:500]
+            )
+            log.info("[%s] message %s deleted while its turn ran; stopped the turn", inst.name, message_id)
             pending.delete(message_id)
             continue
         if pending.delete(message_id):
