@@ -695,6 +695,13 @@ def _channel_allowed(channel) -> bool:
 
 
 @client.event
+async def on_guild_role_create(role: discord.Role) -> None:
+    # A bot joined the server: let its role into the (hidden) #worklog.
+    if worklog and worklog.ready.is_set() and role.is_bot_managed():
+        await worklog.lock(role.guild)
+
+
+@client.event
 async def on_message(message: discord.Message) -> None:
     if worklog and worklog.channel and message.channel.id == worklog.channel.id:
         await worklog.ingest(message)

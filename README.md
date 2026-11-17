@@ -388,6 +388,10 @@ provides it, so sessions don't each build their own.
   makes the same on every machine; an event arriving late triggers a replay. A
   change is confirmed about 2.5 s after posting, so a competing claim from another
   machine wins if it reached Discord first; the loser's line is marked "❌ refused".
+  The channel is hidden from people and open to every bot's role (each bot sets
+  this at startup and when another bot joins). Discord still shows every channel
+  to the server owner and admins, so mute it: right-click `#worklog` → Mute Channel,
+  and turn on Hide Muted Channels. Use `/worklog` to read it instead.
 - **Agents** run `wl …`: the harness puts `bin/wl` on their PATH and sets
   `WORKLOG_WORKER` (`<instance>@<machine>`), so they never see the bot token. The
   session brief explains the rules; existing sessions are told once, on their next

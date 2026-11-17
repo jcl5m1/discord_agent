@@ -99,6 +99,7 @@ class WorklogService:
     # ------------------------------------------------------------- startup
     async def start(self, guild: discord.Guild) -> None:
         self.channel = await self._find_channel(guild)
+        await self.lock(guild)
         self._rebuild()
         after = self.state.last_id
         async for msg in self.channel.history(
@@ -129,6 +130,32 @@ class WorklogService:
         await asyncio.sleep(2)
         return sorted((c for c in guild.text_channels if c.name == config.WORKLOG_CHANNEL),
                       key=lambda c: c.id)[0]
+
+    async def lock(self, guild: discord.Guild) -> None:
+        """Hide #worklog from people (it's for the bots) and keep it open to every bot.
+
+        Every harness bot does this at startup, and again when a bot joins (its
+        role is created), so each bot's own role is always allowed in. The
+        server owner and administrators still see it: Discord shows them every
+        channel, so they mute it instead.
+        """
+        channel = self.channel
+        if not hasattr(channel, "overwrites"):  # a test stand-in
+            return
+        hidden = discord.PermissionOverwrite(view_channel=False)
+        bots = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                           read_message_history=True)
+        wanted = {guild.default_role: hidden}
+        for role in guild.roles:
+            if role.is_bot_managed():
+                wanted[role] = bots
+        current = channel.overwrites
+        try:
+            for target, ow in wanted.items():
+                if current.get(target) != ow:
+                    await channel.set_permissions(target, overwrite=ow)
+        except discord.HTTPException as e:
+            log.warning("couldn't lock #%s (needs Manage Roles): %s", channel.name, e)
 
     async def resync(self) -> None:
         """Pick up events posted while this bot was disconnected."""

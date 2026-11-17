@@ -161,5 +161,39 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((r.returncode, r.stdout.strip()), (1, "bad worklog token"))
 
 
+class LockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hidden_from_people_open_to_every_bot(self):
+        import discord
+
+        class Role(NS):
+            def __hash__(self):
+                return hash(self.name)
+
+        everyone = Role(name="@everyone", is_bot_managed=lambda: False)
+        human = Role(name="mods", is_bot_managed=lambda: False)
+        bot1, bot2 = (Role(name=n, is_bot_managed=lambda: True) for n in ("b1", "b2"))
+        calls = []
+
+        class Chan:
+            name = "worklog"
+
+            def __init__(self):
+                self.overwrites = {}
+
+            async def set_permissions(self, target, overwrite):
+                calls.append(target.name)
+                self.overwrites[target] = overwrite
+
+        s = svc.WorklogService.__new__(svc.WorklogService)
+        s.channel = Chan()
+        guild = NS(default_role=everyone, roles=[everyone, human, bot1, bot2])
+        await s.lock(guild)
+        self.assertFalse(s.channel.overwrites[everyone].view_channel)
+        self.assertTrue(s.channel.overwrites[bot2].send_messages)
+        self.assertNotIn(human, s.channel.overwrites)
+        await s.lock(guild)  # already locked: nothing to change
+        self.assertEqual(calls, ["@everyone", "b1", "b2"])
+
+
 if __name__ == "__main__":
     unittest.main()
