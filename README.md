@@ -435,6 +435,14 @@ On first run, earlier reboots are backfilled from the journal.
 downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
 downtime only counts while the machine was up and monitored.
 
+## Agent onboarding
+
+Each new session starts with the harness onboarding (`_HARNESS_BRIEF` and
+`_WORKLOG_BRIEF` in `harness/bot.py`): output formats, files, sessions, the
+shared worklog, and the writing style (ASD-STE100 Simplified Technical English).
+When you change it, raise `BRIEF_VERSION`: every existing session then gets the
+new version once, on its next turn, marked as updated.
+
 ## Shared files (`/files`)
 
 Every instance has a persistent folder for the files its discussion produces:

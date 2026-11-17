@@ -298,6 +298,12 @@ resume or continue another session (e.g. `kimi --session`, `claude --resume`) --
 it can't attach to this channel and fails if that session is open elsewhere.
 If the user wants to continue a different session, tell them to run /session
 in this Discord channel and pick it there.
+Writing style: follow ASD-STE100 Simplified Technical English as far as you
+can, in replies, worklog entries, commit messages and docs. Use short
+sentences (at most 20 words for instructions, 25 for descriptions), one
+instruction per sentence, active voice, simple verb tenses, common words with
+one meaning each, and the same term every time for the same thing. Keep
+technical names (commands, files, APIs) exactly as they are.
 [end of harness capabilities]
 """
 
@@ -333,21 +339,40 @@ def _instance_for_worker(worker: str) -> Instance | None:
     return next((i for i in store.all() if _worker(i) == worker), None)
 
 
-def _with_brief(inst: Instance, prompt: str) -> str:
-    """Prepend the capability brief when this turn starts a new session.
+# Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
+# existing sessions then get the new version once, on their next turn.
+BRIEF_VERSION = 2
 
-    An existing session that hasn't been told about the worklog gets just that
-    part, once.
-    """
+_BRIEF_UPDATED = """\
+[the harness onboarding below was updated; read all of it again and follow it
+from now on. It replaces the earlier version.]
+"""
+
+
+def _with_brief(inst: Instance, prompt: str) -> str:
+    """Prepend the onboarding when this turn starts a new session, or when the
+    session got an older version of it (then once, marked as updated)."""
     worklog_brief = _WORKLOG_BRIEF.format(worker=_worker(inst)) if worklog else ""
+    current = inst.brief_version >= BRIEF_VERSION
     if inst.session_id is not None:
+        if not current:
+            inst.brief_version = BRIEF_VERSION
+            inst.worklog_briefed = bool(worklog_brief)
+            store.put(inst)
+            return _BRIEF_UPDATED + _harness_brief(inst) + worklog_brief + "\n" + prompt
         if worklog_brief and not inst.worklog_briefed:
             inst.worklog_briefed = True
             store.put(inst)
             return worklog_brief + "\n" + prompt
         return prompt
+    inst.brief_version = BRIEF_VERSION
     if worklog_brief:
         inst.worklog_briefed = True
+    store.put(inst)
+    return _harness_brief(inst) + worklog_brief + "\n" + prompt
+
+
+def _harness_brief(inst: Instance) -> str:
     folder = files.files_dir(_slug(inst.name))
     folder.mkdir(parents=True, exist_ok=True)
     token = inst.ensure_web_token()
@@ -366,7 +391,7 @@ def _with_brief(inst: Instance, prompt: str) -> str:
         annotations_path=config.DATA_DIR / "annotations" / f"{_slug(inst.name)}.json",
         files_dir=folder,
         files_url=files.files_url(_slug(inst.name), token) or "(not served: PUBLIC_BASE_URL unset) ",
-    ) + worklog_brief + "\n" + prompt
+    )
 
 
 async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> str:

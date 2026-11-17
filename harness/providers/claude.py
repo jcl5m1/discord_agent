@@ -44,7 +44,8 @@ def _first_prompt(entry: dict) -> str:
         content = next((c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"), "")
     text = str(content or "")
     # Harness sessions open with the capability brief; the user's prompt follows it.
-    text = text.rpartition("[end of harness capabilities]")[2] or text
+    for end in ("[end of harness capabilities]", "[end of shared worklog]"):
+        text = text.rpartition(end)[2] or text
     return " ".join(text.split())[:80]
 
 
