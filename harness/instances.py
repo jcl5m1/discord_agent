@@ -34,7 +34,12 @@ log = logging.getLogger(__name__)
 
 def _claude_project_dir(cwd: str) -> Path:
     """Where Claude Code keeps session transcripts for a given cwd."""
-    return Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    # Claude Code replaces each non-alphanumeric UTF-16 code unit, so a character
+    # outside the BMP (an emoji) becomes two dashes.
+    name = "".join(
+        c if c.isascii() and c.isalnum() else ("--" if ord(c) > 0xFFFF else "-") for c in cwd
+    )
+    return Path.home() / ".claude" / "projects" / name
 
 
 def _migrate_claude_session(old_cwd: str, new_cwd: str, session_id: str) -> None:
@@ -47,10 +52,31 @@ def _migrate_claude_session(old_cwd: str, new_cwd: str, session_id: str) -> None
         log.info("migrated claude session %s: %s -> %s", session_id, src.parent, dst.parent)
 
 
+# A path segment that is "~", possibly behind a label's decoration ("📁~"): what
+# a "~/..." path becomes when it wasn't expanded and got resolved as relative.
+_TILDE_SEGMENT = re.compile(r"^[^\w~/.\\-]*\s*~$")
+
+
 def normalize_workdir(path: str) -> str:
-    """Subprocesses get workdir as cwd verbatim, so "~" must be expanded here
-    or it becomes a literal directory under the harness's own cwd."""
-    return os.path.abspath(os.path.expanduser(path))
+    """An absolute workdir; subprocesses get it as their cwd verbatim.
+
+    "~" is expanded, and a path is never resolved inside the harness's own
+    folder: relative paths count from the home folder, and a path containing a
+    stray "~" segment (e.g. ".../discord_agent/📁~/github/x", from an unexpanded
+    or decorated "~/github/x") is re-rooted at home.
+    """
+    from pathlib import Path
+
+    home = Path.home()
+    path = path.strip()
+    parts = Path(path).parts
+    for i, part in enumerate(parts):
+        if _TILDE_SEGMENT.match(part):
+            return str(home.joinpath(*parts[i + 1:]))
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(home, path)
+    return os.path.normpath(path)
 
 
 @dataclass

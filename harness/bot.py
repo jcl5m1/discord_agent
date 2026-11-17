@@ -1059,7 +1059,7 @@ async def cmd_new(
         channel_id=channel.id,
         name=name,
         provider=provider or config.DEFAULT_PROVIDER,
-        workdir=workdir or config.DEFAULT_WORKDIR,
+        workdir=workdirs.clean(workdir) if workdir else config.DEFAULT_WORKDIR,
         model=model,
     )
     inst.ensure_web_token()
@@ -1105,7 +1105,7 @@ async def _reopen_instance(
     if fresh:
         inst.session_id = None
         if workdir:
-            inst.workdir = normalize_workdir(workdir)
+            inst.workdir = normalize_workdir(workdirs.clean(workdir))
     elif workdir:
         note = " The folder is unchanged: a resumed session keeps its own."
     store.put(inst)

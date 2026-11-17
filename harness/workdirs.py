@@ -9,6 +9,7 @@ filters the current level.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 MAX_CHOICES = 25  # Discord's limit per autocomplete response
@@ -48,14 +49,30 @@ def _subfolders(folder: Path, prefix: str) -> list[Path]:
     return sorted(found, key=lambda p: p.name.lower())
 
 
+# Labels older versions put on choices, which mobile Discord can send back
+# as typed text: leading emoji/symbols, and a trailing "(…)" note.
+_LEAD = re.compile(r"^[^\w~/.\\-]+")
+_TRAIL = re.compile(r"\s*\((?:use this folder|used before|new folder)\)\s*$")
+
+
+def clean(text: str) -> str:
+    """A typed or picked workdir with any label decoration removed."""
+    text = _TRAIL.sub("", text.strip())
+    return _LEAD.sub("", text).strip().replace("\\", "/")
+
+
 def suggest(current: str, home: Path, recent: list[str] | None = None) -> list[tuple[str, str]]:
     """(name, value) choices for what's typed so far.
 
     Folders are offered with a trailing "/" so picking one lists its contents
-    next; the folder being browsed is offered first as "use this folder".
+    next; the folder being browsed is offered first ("use this folder").
     recent workdirs (e.g. existing instances') lead the list before anything is typed.
+
+    A choice's name is exactly its path: on mobile, picking a choice puts its
+    name in the field, and typing on sends that text instead of the value, so
+    any label (emoji, "(use this folder)") would end up in the path.
     """
-    current = current.strip().replace("\\", "/")
+    current = clean(current)
     choices: list[tuple[str, str]] = []
 
     def add(name: str, value: str) -> None:
@@ -65,7 +82,7 @@ def suggest(current: str, home: Path, recent: list[str] | None = None) -> list[t
     if not current:
         for path in recent or []:
             shown = _display(Path(path), home)
-            add(f"🕘 {shown} (used before)", shown)
+            add(shown, shown)
         current = "~/"
     elif current == "~":
         current = "~/"
@@ -81,13 +98,13 @@ def suggest(current: str, home: Path, recent: list[str] | None = None) -> list[t
 
     if not prefix:
         shown = _display(folder, home)
-        add(f"📂 {shown} (use this folder)", shown)
+        add(shown, shown)
     for sub in _subfolders(folder, prefix):
         shown = _display(sub, home) + "/"
-        add(f"📁 {shown}", shown)
+        add(shown, shown)
         if len(choices) >= MAX_CHOICES:
             break
     if prefix and not choices:  # nothing matches: let them create a new folder there
         shown = _display(folder / prefix, home)
-        add(f"✨ {shown} (new folder)", shown)
+        add(shown, shown)
     return choices[:MAX_CHOICES]

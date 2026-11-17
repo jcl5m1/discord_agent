@@ -25,8 +25,9 @@ class SuggestTests(unittest.TestCase):
 
     def test_empty_lists_home_with_recent_first(self):
         out = suggest("", self.home, recent=[str(self.home / "slr-client")])
-        self.assertEqual(out[0], ("🕘 ~/slr-client (used before)", "~/slr-client"))
-        self.assertEqual(out[1], ("📂 ~ (use this folder)", "~"))
+        # Names are the plain paths: mobile Discord can send a picked name back.
+        self.assertEqual(out[0], ("~/slr-client", "~/slr-client"))
+        self.assertEqual(out[1], ("~", "~"))
         self.assertEqual([v for _, v in out[2:]],
                          ["~/Documents/", "~/github/", "~/Github2/", "~/slr-client/"])
 
@@ -45,7 +46,15 @@ class SuggestTests(unittest.TestCase):
 
     def test_no_match_offers_a_new_folder(self):
         self.assertEqual(suggest("~/github/newproj", self.home),
-                         [("✨ ~/github/newproj (new folder)", "~/github/newproj")])
+                         [("~/github/newproj", "~/github/newproj")])
+
+    def test_names_are_exactly_the_values(self):
+        for typed in ("", "~/github/", "~/git", "~/github/newproj"):
+            for name, value in suggest(typed, self.home, recent=[str(self.home / "slr-client")]):
+                self.assertEqual(name, value)
+
+    def test_label_typed_back_from_mobile_still_browses(self):
+        self.assertEqual(self.values("📁 ~/github/"), ["~/github", "~/github/jcl5m1/"])
 
     def test_files_are_not_suggested(self):
         self.assertNotIn("~/notes.txt/", self.values("~/"))
