@@ -145,17 +145,19 @@ class WorklogService:
         hidden = discord.PermissionOverwrite(view_channel=False)
         bots = discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                            read_message_history=True)
-        wanted = {guild.default_role: hidden}
-        for role in guild.roles:
-            if role.is_bot_managed():
-                wanted[role] = bots
         current = channel.overwrites
+        # Let every bot in first, and hide it from @everyone only if that all
+        # worked: hiding first would shut out a bot (this one included) whose
+        # role isn't allowed yet.
         try:
-            for target, ow in wanted.items():
-                if current.get(target) != ow:
-                    await channel.set_permissions(target, overwrite=ow)
+            for role in guild.roles:
+                if role.is_bot_managed() and current.get(role) != bots:
+                    await channel.set_permissions(role, overwrite=bots)
+            if current.get(guild.default_role) != hidden:
+                await channel.set_permissions(guild.default_role, overwrite=hidden)
         except discord.HTTPException as e:
-            log.warning("couldn't lock #%s (needs Manage Roles): %s", channel.name, e)
+            log.warning("left #%s visible: couldn't set its permissions (the bot needs "
+                        "Manage Roles): %s", channel.name, e)
 
     async def resync(self) -> None:
         """Pick up events posted while this bot was disconnected."""

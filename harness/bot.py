@@ -650,11 +650,19 @@ async def on_ready() -> None:
 
 
 async def _start_worklog(guild: discord.Guild) -> None:
-    try:
-        await worklog.start(guild)
-    except Exception:
-        log.exception("worklog failed to start; agents run without it")
-        return
+    delay = 60
+    while True:
+        try:
+            await worklog.start(guild)
+            break
+        except Exception:
+            if worklog.ready.is_set():  # failed after starting (the local API): no retry
+                log.exception("worklog failed to start; agents run without it")
+                return
+            log.exception("worklog failed to start; retrying in %ds (agents run without it "
+                          "until then)", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 900)
     for inst in store.all():  # register agents that exist already
         if not inst.stopped:
             await worklog.register(_worker(inst), inst.channel_id, inst.session_id or "",

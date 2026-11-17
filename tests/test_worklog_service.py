@@ -207,7 +207,28 @@ class LockTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(s.channel.overwrites[bot2].send_messages)
         self.assertNotIn(human, s.channel.overwrites)
         await s.lock(guild)  # already locked: nothing to change
-        self.assertEqual(calls, ["@everyone", "b1", "b2"])
+        self.assertEqual(calls, ["b1", "b2", "@everyone"])  # bots let in before hiding
+
+    async def test_never_hidden_if_a_bot_cant_be_let_in(self):
+        import discord
+
+        class Role(NS):
+            def __hash__(self):
+                return hash(self.name)
+
+        everyone = Role(name="@everyone", is_bot_managed=lambda: False)
+        bot = Role(name="b1", is_bot_managed=lambda: True)
+
+        class Chan:
+            name, overwrites = "worklog", {}
+
+            async def set_permissions(self, target, overwrite):
+                raise discord.Forbidden(NS(status=403, reason="Forbidden"), "Missing Access")
+
+        s = svc.WorklogService.__new__(svc.WorklogService)
+        s.channel = Chan()
+        await s.lock(NS(default_role=everyone, roles=[everyone, bot]))  # logs, doesn't raise
+        self.assertNotIn(everyone, s.channel.overwrites)
 
 
 if __name__ == "__main__":
