@@ -88,6 +88,20 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual((self.log.state.tasks[1].status, self.log.state.tasks[1].owner), ("open", ""))
 
 
+class StaleTests(unittest.TestCase):
+    def test_stale_after_checkin_period_or_with_a_lapsed_claim(self):
+        log = Log()
+        log.wl(0, "a", 'add "x"')
+        log.wl(1, "a", "claim 1")
+        log.wl(CHECKIN_EVERY - 60, "b", "register")
+        st = log.state
+        self.assertFalse(st.is_stale("a", T0 + 60))
+        self.assertTrue(st.is_stale("a", T0 + CHECKIN_EVERY + 5))  # lapsed claim
+        self.assertFalse(st.is_stale("b", T0 + CHECKIN_EVERY + 5))
+        self.assertTrue(st.is_stale("b", T0 + 2 * CHECKIN_EVERY))  # not seen for 30 min
+        self.assertTrue(st.is_stale("nobody", T0))
+
+
 class LeaseAndMessageTests(unittest.TestCase):
     def test_lease_exclusive_until_expiry(self):
         log = Log()

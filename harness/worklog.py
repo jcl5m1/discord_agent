@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 CHECKIN_EVERY = 30 * 60  # seconds a claim stays valid without a check-in
 CHECKIN_WORDS = 10
-STALE_AFTER = 2 * 3600  # a worker not seen for this long is shown as stale
+STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
        "reopen", "drop", "lease", "unlease", "send"}
@@ -69,6 +69,7 @@ class Task:
     updated: float = 0.0
     checkin_at: float = 0.0  # last claim or check-in by the owner
     progress: str = ""  # the owner's latest check-in line
+    via: int = 0  # the bot that posted the latest claim or check-in (it releases a lapsed one)
     result: str = ""
     notes: list[tuple[float, str, str]] = field(default_factory=list)
 
@@ -172,6 +173,7 @@ class Worklog:
                                          f"I took over #{task.num} '{task.title}': your claim had lapsed."))
         task.owner, task.status, task.checkin_at, task.updated = by, "claimed", t, t
         task.progress = str(ev.get("text", "")).strip()
+        task.via = int(ev.get("via") or 0)
         return True, f"claimed #{task.num} {task.title}"
 
     def _op_checkin(self, by, t, ev):
@@ -184,6 +186,7 @@ class Worklog:
         if not text or words(text) > CHECKIN_WORDS:
             return False, f"a check-in needs 1-{CHECKIN_WORDS} words of progress"
         task.checkin_at, task.updated, task.progress = t, t, text
+        task.via = int(ev.get("via") or task.via)
         task.notes.append((t, by, f"[check-in] {text}"))
         return True, f"#{task.num} check-in: {text}"
 
@@ -267,6 +270,13 @@ class Worklog:
     def inbox(self, worker: str, read: set[int]) -> list[Message]:
         return [m for m in self.messages
                 if (m.to == worker or (m.to == "all" and m.sender != worker)) and m.id not in read]
+
+    def is_stale(self, worker: str, now: float) -> bool:
+        """Not seen for CHECKIN_EVERY, or holding a claim it hasn't checked in on."""
+        w = self.workers.get(worker)
+        if w is None or now - w.seen >= STALE_AFTER:
+            return True
+        return any(t.lapsed(now) for t in self.owned_by(worker))
 
     def owned_by(self, worker: str) -> list[Task]:
         return [t for t in self.tasks.values() if t.owner == worker and t.status == "claimed"]
@@ -434,7 +444,7 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
     if cmd in ("status", "workers"):
         out = ["Workers:"]
         for w in sorted(state.workers.values(), key=lambda w: -w.seen):
-            st = "active" if now - w.seen < STALE_AFTER else "stale"
+            st = "stale" if state.is_stale(w.name, now) else "active"
             where = f" on {w.machine}" if w.machine else ""
             out.append(f"  {w.name:<34} {st:<6} seen {fmt_time(w.seen)}{where}  {w.desc}")
         if cmd == "workers":

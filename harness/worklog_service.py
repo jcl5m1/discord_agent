@@ -172,6 +172,7 @@ class WorklogService:
         ev = decode(msg.content)
         if ev is None:
             return None
+        ev.setdefault("via", msg.author.id)  # which bot posted it
         self._db.execute("insert or ignore into events values(?, ?)", (msg.id, json.dumps(ev)))
         self._db.commit()
         return ev
@@ -259,17 +260,48 @@ class WorklogService:
             except Exception:
                 log.exception("worklog duty check failed")
 
+    def _orphans(self, now: float) -> list:
+        """Lapsed claims of workers no harness bot runs (e.g. terminal sessions)
+        that this bot should release: the bot that posted the claim or latest
+        check-in does it; if it doesn't within another CHECKIN_EVERY (it's down,
+        or the claim predates this rule), any bot does, and a duplicate release
+        is simply refused."""
+        me = self.client.user.id if self.client.user else 0
+        out = []
+        for task in self.state.tasks.values():
+            if not task.lapsed(now):
+                continue
+            w = self.state.workers.get(task.owner)
+            if w and w.bot:
+                continue  # its own bot releases it (below)
+            if task.via == me or now - task.checkin_at > 2 * CHECKIN_EVERY:
+                out.append(task)
+        return out
+
+    async def _release(self, task, worker: str, now: float) -> bool:
+        age = now - task.checkin_at
+        log.info("worklog: releasing #%d from %s (no check-in for %dm)", task.num, worker, age // 60)
+        ok, _ = await self.post({"op": "release", "by": f"harness@{self.machine}", "task": task.num,
+                                 "harness": True, "text": f"no check-in from {worker} for "
+                                                          f"{CHECKIN_EVERY // 60} min"})
+        return ok
+
     async def _check_claims(self) -> None:
         now = time.time()
+        for task in self._orphans(now):
+            worker = task.owner
+            if not await self._release(task, worker, now) or self.state.tasks[task.num].owner:
+                continue
+            await self.post({"op": "send", "by": f"harness@{self.machine}", "to": worker,
+                             "task": task.num, "text": (
+                                 f"#{task.num} was released: no check-in for {CHECKIN_EVERY // 60} min. "
+                                 f"Claim it again (wl claim {task.num}) if you're still on it, and "
+                                 f'check in every 30 min: wl checkin {task.num} "<up to 10 words>"')})
         for worker in self.my_workers():
             for task in self.state.owned_by(worker):
                 age = now - task.checkin_at
                 if age > CHECKIN_EVERY:
-                    log.info("worklog: releasing #%d from %s (no check-in for %dm)",
-                             task.num, worker, age // 60)
-                    await self.post({"op": "release", "by": f"harness@{self.machine}", "task": task.num,
-                                     "harness": True, "text": f"no check-in from {worker} for "
-                                                              f"{CHECKIN_EVERY // 60} min"})
+                    await self._release(task, worker, now)
                     await self.notify(worker, f"⌛ #{task.num} released: no check-in for "
                                               f"{CHECKIN_EVERY // 60} min")
                 elif age > REMIND_AT and (task.num, task.checkin_at) not in self._reminded:

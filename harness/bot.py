@@ -311,7 +311,8 @@ shared worklog with the `wl` command (on your PATH; you are worker {worker}).
   a.py,b.py` first. A claim held by someone else is refused: message them.
 - While you hold a claim, check in at least every 30 minutes:
   `wl checkin <id> "<up to 10 words of progress>"`. It's posted to your Discord
-  channel. A claim with no check-in for 30 minutes is released.
+  channel. A claim with no check-in for 30 minutes is released, however long
+  the task, and you show as stale; claim it again if you're still on it.
 - Finish with `wl done <id> "<result, commits>"`, `wl block <id> "<what you need>"`
   or `wl release <id>`. Use `wl note <id> "..."` for longer progress notes.
 - Shared resources (the GPU, a repo during a rebase, a service restart):

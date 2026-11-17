@@ -128,14 +128,29 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.notified, [(2, "bob@m2", "📋 #1 · rebased onto main, tests running")])
         self.assertEqual(self.delivered, [(2, "bob@m2", "alice@m1", "(re #1) ping me when done")])
 
+    async def test_terminal_sessions_lapsed_claim_released_once(self):
+        await self.a.run(["add", "Migrate hdd"], "alice@m1")
+        await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl
+        await asyncio.sleep(0.3)
+        later = time.time() + svc.CHECKIN_EVERY + 60
+        with mock.patch.object(svc.time, "time", return_value=later):
+            self.assertEqual(self.a._orphans(later), [])  # b posted the claim: b's job
+            await asyncio.gather(self.a._check_claims(), self.b._check_claims())
+        await asyncio.sleep(0.3)
+        task = self.a.state.tasks[1]
+        self.assertEqual((task.status, task.owner), ("open", ""))
+        mail = [m for m in self.a.state.messages if m.to == "term@m2"]
+        self.assertEqual(len(mail), 1)
+        self.assertIn("released", mail[0].text)
+
     async def test_late_event_triggers_replay(self):
         now = time.time()
         sid = lambda t, s: (int(t * 1000) - EPOCH_MS) << 22 | s  # noqa: E731
-        add = NS(id=sid(now, 900), author=NS(bot=True), content=encode(
+        add = NS(id=sid(now, 900), author=NS(bot=True, id=9), content=encode(
             {"op": "add", "by": "x", "title": "t"}, "x"))
-        late = NS(id=sid(now + 1, 901), author=NS(bot=True), content=encode(
+        late = NS(id=sid(now + 1, 901), author=NS(bot=True, id=9), content=encode(
             {"op": "claim", "by": "bob@m2", "task": 1}, summary({"op": "claim", "by": "bob@m2", "task": 1})))
-        early = NS(id=sid(now + 1, 902), author=NS(bot=True), content=encode(
+        early = NS(id=sid(now + 1, 902), author=NS(bot=True, id=9), content=encode(
             {"op": "claim", "by": "alice@m1", "task": 1}, "x"))
         for m in (add, early, late):  # `late` has the earlier id but arrives last
             await self.a.ingest(m)

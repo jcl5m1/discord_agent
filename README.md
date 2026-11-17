@@ -399,7 +399,11 @@ provides it, so sessions don't each build their own.
 - **Check-ins:** while holding a claim, an agent must run
   `wl checkin <id> "<up to 10 words of progress>"` at least every 30 minutes. Each
   check-in is posted to the agent's own Discord channel; after 25 minutes the
-  harness reminds it, and at 30 minutes it releases the claim.
+  harness reminds it, and at 30 minutes it releases the claim. A terminal session's
+  lapsed claim is released too, by the bot that posted its claim or last check-in
+  (or by any bot an hour later, if that one is down), and the session gets a message
+  saying so. `wl status` shows a worker as stale after 30 minutes without activity,
+  or while it holds a lapsed claim.
 - **Mail:** `wl send <worker|all> "…"`. The harness delivers a direct message to its
   agent, into the running turn or as a new turn (at most 12 per agent per hour, so
   two agents can't ping-pong forever); messages to `all` wait in inboxes.
