@@ -92,6 +92,7 @@ class Instance:
     web_token: str | None = None  # guards the public /agents/<slug>/<token>/ proxy path
     wa_group: str | None = None  # WhatsApp group JID user part (mirror chat), if any
     origin: str | None = None  # "trigger:<name>" when created by an external trigger
+    worklog_briefed: bool = False  # the session has been told how to use the shared worklog
 
     def __post_init__(self) -> None:
         self.workdir = normalize_workdir(self.workdir)

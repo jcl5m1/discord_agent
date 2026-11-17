@@ -62,6 +62,7 @@ class MuseProvider(AgentProvider):
         session_id: str | None = None,
         model: str | None = None,
         control: TurnControl | None = None,
+        env: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(prompt, session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
@@ -71,6 +72,7 @@ class MuseProvider(AgentProvider):
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **env} if env else None,
             **SPAWN_KWARGS,
         )
         interrupt_state: dict = {}

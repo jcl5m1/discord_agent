@@ -376,6 +376,37 @@ like a token or key is replaced with `[redacted]`. To get another machine's logs
 the agent on this one, run that bot's `/logs` and tell the agent which channel it's
 in: the agent can download the file with its own bot's access.
 
+### Shared worklog (`wl`, `/worklog`)
+
+Agents on every machine coordinate through one shared worklog: a task list with
+claims, progress check-ins, notes, resource leases and messages. The harness
+provides it, so sessions don't each build their own.
+
+- **Transport:** a `#worklog` channel (created on first start). Every change is one
+  message there: a readable line, plus the event as small JSON. Each bot keeps the
+  events in `data/worklog.db` and applies them in message-id order, which Discord
+  makes the same on every machine; an event arriving late triggers a replay. A
+  change is confirmed about 2.5 s after posting, so a competing claim from another
+  machine wins if it reached Discord first; the loser's line is marked "❌ refused".
+- **Agents** run `wl …`: the harness puts `bin/wl` on their PATH and sets
+  `WORKLOG_WORKER` (`<instance>@<machine>`), so they never see the bot token. The
+  session brief explains the rules; existing sessions are told once, on their next
+  message. Terminal sessions on the same machine can use `bin/wl --as <name>` too.
+- **Check-ins:** while holding a claim, an agent must run
+  `wl checkin <id> "<up to 10 words of progress>"` at least every 30 minutes. Each
+  check-in is posted to the agent's own Discord channel; after 25 minutes the
+  harness reminds it, and at 30 minutes it releases the claim.
+- **Mail:** `wl send <worker|all> "…"`. The harness delivers a direct message to its
+  agent, into the running turn or as a new turn (at most 12 per agent per hour, so
+  two agents can't ping-pong forever); messages to `all` wait in inboxes.
+- **Humans:** `/worklog` shows the status, or runs any `wl` command
+  (`/worklog command:"show 8"`).
+- `wl import-legacy PATH [--map old=new …]` copies a per-project worklog database
+  (from the earlier `ops/worklog.py`) into an empty shared worklog.
+
+Settings: `WORKLOG_ENABLED` (default true), `WORKLOG_CHANNEL` (default `worklog`),
+`WORKLOG_PORT` (default 8091, the local port `wl` talks to).
+
 ### Uptime log (`/uptime`)
 
 A third user unit, `discord-agent-uptime.service`, tracks how often the
@@ -509,6 +540,8 @@ harness/
 ├── guard.py            # keeps slash commands to this bot's own channels
 ├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
+├── worklog.py          # shared worklog: event rules and the `wl` commands
+├── worklog_service.py  # its #worklog transport, local API for `wl`, check-ins, mail delivery
 ├── workdirs.py         # folder-by-folder workdir suggestions for /new
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls
 ├── uptime.py           # separate unit: internet/system up-down event log + /uptime stats
@@ -520,6 +553,7 @@ harness/
 .env.example            # all configuration keys, documented
 setup.sh                # Linux one-line installer and setup wizard
 setup.ps1               # Windows one-line installer and setup wizard
+bin/wl, bin/wl.cmd      # the `wl` command agents use (stdlib Python)
 run.sh                  # starts the harness and the watchdog on Linux
 run.ps1                 # starts the harness and the watchdog on Windows
 ```

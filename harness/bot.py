@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from pathlib import Path
 import discord
 
 from . import config, discord_markdown, files, guard, logfile, logins, service, triggers, uptime, workdirs
+from .worklog_service import WorklogService
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
 from .providers.base import SessionInfo, TurnControl, get_provider, provider_names
@@ -81,6 +83,8 @@ wa: "WhatsAppBridge | None" = None
 
 # User messages waiting for (or in) a turn, so edits and deletes reach the agent.
 pending = PendingTurns()
+# The shared worklog (#worklog channel + `wl`); created in on_ready.
+worklog: WorklogService | None = None
 # The Discord message each channel's running turn is answering: (id, text). A
 # delete of it stops the turn, and the agent's next turn starts with the note
 # kept in _disregard_notes.
@@ -298,10 +302,51 @@ in this Discord channel and pick it there.
 """
 
 
+_WORKLOG_BRIEF = """\
+[shared worklog — persistent for this session]
+Every agent on this Discord server, on every machine, coordinates through one
+shared worklog with the `wl` command (on your PATH; you are worker {worker}).
+- Before starting a piece of work: `wl list`, then `wl claim <id> "<what you're
+  starting, up to 10 words>"`. If it isn't listed, `wl add "<title>" --files
+  a.py,b.py` first. A claim held by someone else is refused: message them.
+- While you hold a claim, check in at least every 30 minutes:
+  `wl checkin <id> "<up to 10 words of progress>"`. It's posted to your Discord
+  channel. A claim with no check-in for 30 minutes is released.
+- Finish with `wl done <id> "<result, commits>"`, `wl block <id> "<what you need>"`
+  or `wl release <id>`. Use `wl note <id> "..."` for longer progress notes.
+- Shared resources (the GPU, a repo during a rebase, a service restart):
+  `wl lease <name> --ttl 3600 --why "..."`, then `wl unlease <name>`.
+- Messages: `wl send <worker|all> "text" [--task <id>]`. The harness delivers
+  messages sent to you as they arrive; never block waiting for one.
+- Subagents: have each use `--as {worker}/sub-1` (sub-2, ...) on its `wl` commands.
+`wl status` shows workers, tasks and leases; `wl help` lists every command.
+[end of shared worklog]
+"""
+
+
+def _worker(inst: Instance) -> str | None:
+    return worklog.worker_name(inst.name) if worklog else None
+
+
+def _instance_for_worker(worker: str) -> Instance | None:
+    return next((i for i in store.all() if _worker(i) == worker), None)
+
+
 def _with_brief(inst: Instance, prompt: str) -> str:
-    """Prepend the capability brief when this turn starts a new session."""
+    """Prepend the capability brief when this turn starts a new session.
+
+    An existing session that hasn't been told about the worklog gets just that
+    part, once.
+    """
+    worklog_brief = _WORKLOG_BRIEF.format(worker=_worker(inst)) if worklog else ""
     if inst.session_id is not None:
+        if worklog_brief and not inst.worklog_briefed:
+            inst.worklog_briefed = True
+            store.put(inst)
+            return worklog_brief + "\n" + prompt
         return prompt
+    if worklog_brief:
+        inst.worklog_briefed = True
     folder = files.files_dir(_slug(inst.name))
     folder.mkdir(parents=True, exist_ok=True)
     token = inst.ensure_web_token()
@@ -320,7 +365,7 @@ def _with_brief(inst: Instance, prompt: str) -> str:
         annotations_path=config.DATA_DIR / "annotations" / f"{_slug(inst.name)}.json",
         files_dir=folder,
         files_url=files.files_url(_slug(inst.name), token) or "(not served: PUBLIC_BASE_URL unset) ",
-    ) + "\n" + prompt
+    ) + worklog_brief + "\n" + prompt
 
 
 async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> str:
@@ -395,6 +440,12 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
             if note := _disregard_notes.pop(inst.channel_id, None):
                 prompt = f"{note}\n\n{prompt}"
             extra = {"control": turn["control"]} if turn["control"] else {}
+            if worklog and worklog.ready.is_set():
+                worker = _worker(inst)
+                extra["env"] = worklog.env_for(worker)
+                asyncio.get_running_loop().create_task(worklog.register(
+                    worker, inst.channel_id, inst.session_id or "", f"{inst.provider} in {inst.workdir}"
+                ))
             agen = provider.run_turn(
                 inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model, **extra
             )
@@ -589,6 +640,49 @@ async def on_ready() -> None:
     asyncio.get_running_loop().create_task(_announce_update())
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
+    global worklog
+    if config.WORKLOG_ENABLED and worklog is None and (g := client.get_guild(config.GUILD_ID)):
+        worklog = WorklogService(client, _worklog_deliver, _worklog_notify)
+        asyncio.get_running_loop().create_task(_start_worklog(g))
+    elif worklog is not None and worklog.ready.is_set():
+        asyncio.get_running_loop().create_task(worklog.resync())  # after a reconnect
+
+
+async def _start_worklog(guild: discord.Guild) -> None:
+    try:
+        await worklog.start(guild)
+    except Exception:
+        log.exception("worklog failed to start; agents run without it")
+        return
+    for inst in store.all():  # register agents that exist already
+        if not inst.stopped:
+            await worklog.register(_worker(inst), inst.channel_id, inst.session_id or "",
+                                   f"{inst.provider} in {inst.workdir}")
+
+
+async def _worklog_notify(worker: str, text: str) -> None:
+    inst = _instance_for_worker(worker)
+    channel = client.get_channel(inst.channel_id) if inst else None
+    if isinstance(channel, discord.TextChannel):
+        await channel.send(text[:DISCORD_MSG_LIMIT])
+
+
+async def _worklog_deliver(worker: str, sender: str, text: str) -> None:
+    """Hand a worklog message to the agent: into its running turn, or as a new turn."""
+    inst = _instance_for_worker(worker)
+    channel = client.get_channel(inst.channel_id) if inst else None
+    if inst is None or inst.stopped or not isinstance(channel, discord.TextChannel):
+        return
+    if sender == "harness":
+        prompt, shown = f"[Worklog reminder] {text}", f"⏰ {text}"
+    else:
+        prompt = (f"[Worklog message from {sender}]\n{text}\n"
+                  f'(Reply with `wl send {sender} "..."` if it needs an answer; don\'t reply to acks.)')
+        shown = f"✉️ **worklog** from `{sender}`: {text}"
+    anchor = await channel.send(shown[:DISCORD_MSG_LIMIT])
+    log.info("[%s] worklog message from %s delivered", inst.name, sender)
+    if not _steer(inst, anchor, prompt):
+        asyncio.get_running_loop().create_task(on_message_simple(channel, prompt))
 
 
 def _channel_allowed(channel) -> bool:
@@ -602,6 +696,9 @@ def _channel_allowed(channel) -> bool:
 
 @client.event
 async def on_message(message: discord.Message) -> None:
+    if worklog and worklog.channel and message.channel.id == worklog.channel.id:
+        await worklog.ingest(message)
+        return
     if message.author.bot or not message.guild:
         return
     inst = store.get(message.channel.id)
@@ -1938,6 +2035,27 @@ async def cmd_logs(interaction: discord.Interaction, lines: int = 3000) -> None:
         "Hand this to whoever is debugging, or tell the agent on another machine where it is.",
         file=discord.File(io.BytesIO(data), filename=name),
     )
+
+
+@tree.command(name="worklog", description="The agents' shared worklog: status, tasks, or any wl command")
+@discord.app_commands.describe(
+    command='A wl command, e.g. "list --all", "show 8", "log", \'send harness-2@host "hi"\' (default: status)'
+)
+async def cmd_worklog(interaction: discord.Interaction, command: str = "status") -> None:
+    if worklog is None or not worklog.ready.is_set():
+        await interaction.response.send_message("The worklog isn't running on this machine.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        argv = shlex.split(command)
+    except ValueError as e:
+        await interaction.followup.send(f"❌ {e}")
+        return
+    ok, text = await worklog.run(argv, f"human:{interaction.user.name}")
+    chunks = discord_markdown.split_message(("" if ok else "❌ ") + (text or "(nothing)"), DISCORD_MSG_LIMIT)
+    await interaction.followup.send(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.channel.send(chunk)
 
 
 @tree.command(name="uptime", description="Internet and system uptime: outages, availability, history")

@@ -122,6 +122,7 @@ class ClaudeProvider(AgentProvider):
         session_id: str | None = None,
         model: str | None = None,
         control: TurnControl | None = None,
+        env: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cmd = self._build_cmd(session_id, model)
         os.makedirs(workdir, exist_ok=True)  # agent workdirs are created on demand
@@ -133,6 +134,7 @@ class ClaudeProvider(AgentProvider):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,  # stream-json lines (tool results) can be large
+            env={**os.environ, **env} if env else None,
             **SPAWN_KWARGS,
         )
         relay_task: asyncio.Task | None = None

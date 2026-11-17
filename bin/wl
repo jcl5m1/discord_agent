@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""wl — the shared worklog for every agent on this Discord server (all machines).
+
+Talks to the harness bot on this machine, which keeps the worklog in sync over
+Discord. Run `wl help` for the commands. Stdlib only, so any python3 works.
+"""
+import json
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+url = os.environ.get("WORKLOG_URL", "http://127.0.0.1:8091")
+token = os.environ.get("WORKLOG_TOKEN")
+if not token:  # a terminal session on this machine: read the harness's token file
+    path = Path(__file__).resolve().parent.parent / "data" / "worklog_token"
+    try:
+        token = path.read_text().strip()
+    except OSError:
+        sys.exit(f"wl: no WORKLOG_TOKEN and can't read {path}; is the harness running here?")
+req = urllib.request.Request(
+    url.rstrip("/") + "/wl",
+    data=json.dumps({"argv": sys.argv[1:], "worker": os.environ.get("WORKLOG_WORKER", "")}).encode(),
+    headers={"Content-Type": "application/json", "X-Worklog-Token": token},
+)
+try:
+    with urllib.request.urlopen(req, timeout=3700 if sys.argv[1:2] in (["wait"], ["import-legacy"]) else 60) as resp:
+        out = json.load(resp)
+except urllib.error.HTTPError as e:
+    out = json.load(e)
+except OSError as e:
+    sys.exit(f"wl: can't reach the harness at {url} ({e})")
+print(out.get("text", ""))
+sys.exit(0 if out.get("ok") else 1)

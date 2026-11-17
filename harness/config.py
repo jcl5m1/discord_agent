@@ -113,6 +113,13 @@ if not ALLOW_AGENT_API_KEYS:
         if os.environ.pop(_var, None) is not None:
             IGNORED_API_KEYS.append(_var)
 
+# --- Shared worklog (all agents on the server, every machine; see worklog.py) ---
+WORKLOG_ENABLED: bool = os.environ.get("WORKLOG_ENABLED", "true").lower() not in {"0", "false", "no"}
+# The channel every bot reads and writes the worklog through.
+WORKLOG_CHANNEL: str = os.environ.get("WORKLOG_CHANNEL", "worklog")
+# Local port for agents' `wl` command (outside the 8100-8999 agent server range).
+WORKLOG_PORT: int = int(os.environ.get("WORKLOG_PORT", "8091"))
+
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
 # Seconds between internet checks; only state changes are logged.
 UPTIME_INTERVAL: float = float(os.environ.get("UPTIME_INTERVAL", "10"))
