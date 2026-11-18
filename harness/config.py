@@ -123,6 +123,8 @@ WORKLOG_PORT: int = int(os.environ.get("WORKLOG_PORT", "8091"))
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
 # Seconds between internet checks; only state changes are logged.
 UPTIME_INTERVAL: float = float(os.environ.get("UPTIME_INTERVAL", "10"))
+# GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
+GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.
 UPTIME_TARGETS: list[tuple[str, int]] = [
     (hp.rsplit(":", 1)[0], int(hp.rsplit(":", 1)[1]))

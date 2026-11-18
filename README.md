@@ -435,6 +435,26 @@ On first run, earlier reboots are backfilled from the journal.
 downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
 downtime only counts while the machine was up and monitored.
 
+### GPU recorder
+
+On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
+(`harness/gpumon.py`; set `GPU_MONITOR=0` to turn it off). Everything goes in
+`data/gpu/`:
+
+- `samples/<hour>.csv`: one line per second with power, temperature, clocks,
+  utilization, memory, P-state, PCIe link and clock-limit reasons. The monitor
+  writes these lines to disk every 5 s, so they survive a crash. It keeps 48 hours.
+- `minutes-<month>.csv`: one summary line per minute, kept for good. It includes
+  the PCIe error counters, the CPU temperature and the load.
+- `processes.log`: the GPU processes and their command lines, when they change.
+- `incidents/<time>/`: made when the kernel reports an NVIDIA Xid or a PCIe
+  error. It holds the kernel lines, the 15 minutes of samples before the error,
+  the GPU processes, the PCIe error counters and `nvidia-smi -q`.
+
+Each error is also a `gpu_error` event in `data/uptime.jsonl`, and `/uptime`
+lists them. At startup, the monitor adds Xid errors from the last 30 days of
+the journal that it has not logged yet.
+
 ## Agent onboarding
 
 Each new session starts with the harness onboarding (`_HARNESS_BRIEF` and

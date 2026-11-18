@@ -16,6 +16,7 @@ with a "last alive" timestamp. Only *state changes* are appended to the log
     system_down     machine was off/rebooting   {start, end, clean, source}
     monitor_gap     same boot, monitor not running (suspend, stopped unit) {start, end}
     net_down        internet unreachable since ts   {targets}
+    gpu_error       NVIDIA Xid or PCIe error (gpumon) {xid, pci, what, live}
     net_up          internet back               {down_since}
 
 A reboot is detected on startup by a changed kernel boot id: the system was
@@ -35,7 +36,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config, logfile
+from . import config, gpumon, logfile
 
 log = logging.getLogger("uptime")
 
@@ -178,6 +179,9 @@ async def run() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
+    logged = {int(e["ts"]) for e in read_events() if e.get("event") == "gpu_error"}
+    gpu = asyncio.ensure_future(gpumon.run(stop, _append, logged))
+
     while not stop.is_set():
         t = time.time()
         if t - last_alive > GAP_AFTER:  # suspended, or the process was frozen
@@ -205,6 +209,10 @@ async def run() -> None:
         except asyncio.TimeoutError:
             pass
 
+    try:
+        await asyncio.wait_for(gpu, 10)
+    except (asyncio.TimeoutError, Exception):
+        log.exception("gpumon didn't stop cleanly")
     now = time.time()
     reason = "shutdown" if _system_stopping() else "stop"
     _append("monitor_stop", ts=now, reason=reason)
@@ -333,6 +341,7 @@ def summary(now: float | None = None, recent: int = 5) -> str:
         for kind, a, b in outages:
             ongoing = " (ongoing)" if b >= now - 1 else ""
             lines.append(f"• {kind} <t:{int(a)}:f> — {fmt_duration(b - a)}{ongoing}")
+    lines += gpumon.summary_lines(events, now)
     return "\n".join(lines)
 
 
