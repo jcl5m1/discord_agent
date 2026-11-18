@@ -25,7 +25,7 @@ from pathlib import Path
 
 import discord
 
-from . import config, discord_markdown, files, guard, logfile, logins, service, triggers, uptime, workdirs
+from . import config, discord_markdown, files, guard, logfile, logins, resume, service, triggers, uptime, workdirs
 from .worklog_service import WorklogService
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
@@ -100,6 +100,8 @@ _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
 # Turns currently running, keyed by channel id. Feeds the in-channel progress
 # updates and the heartbeat file the watchdog process monitors.
 _active_turns: dict[int, dict] = {}
+# Channels whose current turn is a resume after a restart: how many resumes in a row (harness/resume.py).
+_resume_counts: dict[int, int] = {}
 # Most recent channel with user activity; the watchdog's fallback alert target.
 _last_channel_id: int | None = None
 # Written by /update just before restarting; the next startup reports back.
@@ -443,6 +445,11 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         "steered": {},
     }
     _active_turns[inst.channel_id] = turn
+    # Kept until the turn ends, so a restart that cuts it off leaves the record (see harness/resume.py).
+    running = _running_message.get(inst.channel_id)
+    resume.mark(inst.channel_id, inst.name, prompt, int(running[0]) if running else None,
+                resumes=_resume_counts.get(inst.channel_id, 0))
+    cut_off = False
     progress = asyncio.get_running_loop().create_task(
         _progress_updates(inst, status_msg.channel, turn)
     )
@@ -649,7 +656,12 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         except discord.Forbidden:
             log.warning("missing permission to set channel topic for %s", inst.name)
         return "done"
+    except asyncio.CancelledError:
+        cut_off = True  # the harness is shutting down: keep the record for the resume
+        raise
     finally:
+        if not cut_off:
+            resume.clear(inst.channel_id)
         stop_view.stop()
         interrupt_wait.cancel()
         _active_turns.pop(inst.channel_id, None)
@@ -676,6 +688,10 @@ async def on_ready() -> None:
         log.warning("ignoring agent API keys (subscription logins are used instead): %s",
                     ", ".join(config.IGNORED_API_KEYS))
     asyncio.get_running_loop().create_task(_announce_update())
+    global _resumed
+    if not _resumed:  # once per process: on_ready also runs after a reconnect
+        _resumed = True
+        _resume_cut_off_turns()
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
     global worklog
@@ -691,6 +707,44 @@ async def on_ready() -> None:
 
 
 _gdoc_checked = False
+_resumed = False
+
+
+def _resume_cut_off_turns() -> None:
+    """Give each channel whose turn the last restart cut off a resume turn."""
+    records = resume.take()
+    for channel_id, record in records.items():
+        inst = store.get(channel_id)
+        channel = client.get_channel(channel_id)
+        if inst is None or inst.stopped or not isinstance(channel, discord.TextChannel):
+            continue
+        # The catch-up would run the cut-off message again as if it were new; the resume turn replaces it.
+        message_id = record.get("message_id")
+        if message_id and (not inst.last_message_id or int(inst.last_message_id) < int(message_id)):
+            inst.last_message_id = str(message_id)
+            store.put(inst)
+        if not config.AUTO_RESUME:
+            continue
+        count = int(record.get("resumes") or 0) + 1
+        if count > resume.MAX_RESUMES:
+            log.warning("[%s] cut off by %d restarts in a row; not resumed again", inst.name, count)
+            asyncio.get_running_loop().create_task(channel.send(
+                f"⚠️ The harness restarted during this agent's turn {count} times in a row, so it is not "
+                "resumed again. Send a message to continue."))
+            continue
+        log.info("[%s] resuming a turn cut off by the restart (resume %d)", inst.name, count)
+        asyncio.get_running_loop().create_task(_run_resume(inst, channel, record, count))
+
+
+async def _run_resume(inst: Instance, channel: discord.TextChannel, record: dict, count: int) -> None:
+    await channel.send("♻️ The harness restarted while this agent was working. It continues now.")
+    _resume_counts[channel.id] = count
+    try:
+        await on_message_simple(channel, resume.prompt(record))
+    except Exception:
+        log.exception("resume turn failed for %s", inst.name)
+    finally:
+        _resume_counts.pop(channel.id, None)
 
 
 async def _check_gdoc() -> None:

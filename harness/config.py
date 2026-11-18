@@ -114,6 +114,8 @@ if not ALLOW_AGENT_API_KEYS:
             IGNORED_API_KEYS.append(_var)
 
 # --- Shared worklog (all agents on the server, every machine; see worklog.py) ---
+# After a restart, give each agent whose turn (or background work) the restart cut off a resume turn.
+AUTO_RESUME: bool = os.environ.get("AUTO_RESUME", "true").lower() not in {"0", "false", "no"}
 WORKLOG_ENABLED: bool = os.environ.get("WORKLOG_ENABLED", "true").lower() not in {"0", "false", "no"}
 # The channel every bot reads and writes the worklog through.
 WORKLOG_CHANNEL: str = os.environ.get("WORKLOG_CHANNEL", "worklog")
