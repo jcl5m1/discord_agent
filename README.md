@@ -11,6 +11,14 @@ Discord — designed for driving agents from your phone.
 - **Sessions survive restarts.** The harness stores each instance's provider session
   ID on disk. If the harness (or the whole machine) goes down, the next message in
   the channel transparently resumes the agent exactly where it left off.
+- **Work cut off by a restart resumes by itself.** A turn lasts as long as the agent's
+  process, including background subagents after its reply. Each running turn is recorded
+  in `data/interrupted_turns.json` until it ends. After a restart, each channel whose turn
+  was cut off gets a resume turn: it says what was stopped and asks the agent to check
+  its work and continue. The cut-off message is not run again as new. A turn cut off by
+  more than 2 restarts in a row is not resumed again. Turn this off with `AUTO_RESUME=false`.
+  To restart from a terminal: `.venv/bin/python -m harness.resume restart` (it also records
+  the turns of a harness that is older than this feature).
 
 ## Install in one line
 
