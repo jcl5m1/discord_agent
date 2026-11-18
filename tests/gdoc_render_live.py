@@ -41,7 +41,7 @@ A list right after a paragraph line:
 
 ```
 code line 1
-code line 2
+code line 2 x=$A y=$B
 ```
 
 > a quoted line
@@ -54,6 +54,8 @@ code line 2
 - **Bold start:** text after a bold label, with a continuation
   line indented by two spaces.
 - last item
+
+Prices: $0.20 and $0.40/h, as `x=$A y=$B` and x=$A y=$B.
 """
 
 # The two lines of the first paragraph are one paragraph (Markdown joins a paragraph's lines).
@@ -63,7 +65,8 @@ EXPECT_A = [("h1", "Render test"), ("p", "A paragraph with"),
             # One preset per Doc list: a bullet nested in a numbered list is numbered too (a., b.); splitting the list
             # would restart its numbering.
             ("ol1", "a bullet inside"), ("ol0", "step three"), ("h3", "Code, quote and table"), ("code", "code line 1"),
-            ("quote", "a quoted line"), ("table", "Name"), ("ul0", "Bold start:"), ("ul0", "last item")]
+            ("quote", "a quoted line"), ("table", "Name"), ("ul0", "Bold start:"), ("ul0", "last item"),
+            ("p", "Prices: $0.20 and $0.40/h, as x=$A y=$B and x=$A y=$B.")]
 
 # Version B: items added, removed and re-nested, as a report changes between publishes.
 SAMPLE_B = SAMPLE_A.replace("- second bullet\n  - nested bullet (2 spaces)\n",
@@ -75,7 +78,11 @@ EXPECT_B = [("h1", "Render test"), ("p", "A paragraph with"),
             ("ul1", "a new nested bullet"), ("ul2", "nested twice"), ("ul0", "third bullet"),
             ("ul0", "a new fourth bullet"), ("h2", "Numbered"), ("ol0", "step one"), ("ol0", "step two"),
             ("ol0", "step three"), ("h3", "Code, quote and table"), ("code", "code line 1"), ("quote", "a quoted line"),
-            ("table", "Name"), ("ul0", "Bold start:"), ("ul0", "last item")]
+            ("table", "Name"), ("ul0", "Bold start:"), ("ul0", "last item"),
+            ("p", "Prices: $0.20 and $0.40/h, as x=$A y=$B and x=$A y=$B.")]
+
+
+EQ = "<equation>"  # the import makes "$x ... y=$" an equation unless prevented
 
 
 def blocks(doc: dict) -> list[tuple[str, str]]:
@@ -90,7 +97,7 @@ def blocks(doc: dict) -> list[tuple[str, str]]:
         p = el.get("paragraph")
         if not p:
             continue
-        text = "".join(r.get("textRun", {}).get("content", "") for r in p["elements"]).strip()
+        text = "".join(EQ if "equation" in r else r.get("textRun", {}).get("content", "") for r in p["elements"]).strip()
         if not text:
             continue
         style = p.get("paragraphStyle", {})
@@ -132,6 +139,10 @@ def compare(got: list[tuple[str, str]], want: list[tuple[str, str]], label: str)
             problems += 1
         i = j + 1
     joined = "\n".join(t for _, t in got)
+    for line in joined.splitlines():
+        if EQ in line:
+            print(f"  [{label}] EQUATION made by the import: {line!r}")
+            problems += 1
     for marker in ("- second", "- first", "1. step", "  - nested"):
         if marker in joined:
             print(f"  [{label}] RAW MARKDOWN left in the text: {marker!r}")

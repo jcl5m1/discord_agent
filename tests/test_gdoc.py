@@ -162,3 +162,13 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn('<blockquote style="margin-left', html)
         self.assertIn("<td><b>H</b></td>", html)  # header cells as bold cells, no <th>/<thead>
         self.assertNotIn("<th", html)
+
+    def test_section_links_keep_their_text(self):
+        html = gdoc._to_html("See [the plans](#4-plans) and [site](https://x.org).")
+        self.assertIn("See the plans and", html)
+        self.assertIn('<a href="https://x.org">site</a>', html)
+
+    def test_sync_does_not_copy_links_within_a_doc(self):
+        from harness import gdoc_sync as gs
+        self.assertEqual(gs._style({"bold": True, "link": {"bookmarkId": "id.x"}}, gs.TEXT_KEYS), '{"bold": true}')
+        self.assertIn("url", gs._style({"link": {"url": "https://x.org"}}, gs.TEXT_KEYS))

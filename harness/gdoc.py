@@ -178,6 +178,7 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
 # before, needs a blank line before a list and 4-space nesting, so most report lists came out as text or flat.
 # The Drive import keeps a font set on a block or a span, not on <code>, and shows a bare <blockquote> as plain text.
 CODE_FONT = "font-family:'Courier New',monospace"
+DOLLAR = '<span style="vertical-align:baseline">$</span>'
 MARKDOWN = MarkdownIt("commonmark").enable(["table", "strikethrough"])
 MARKDOWN.add_render_rule(  # inline code as a monospace span (the Drive import drops the font of <code>)
     "code_inline", lambda self, tokens, idx, options, env:
@@ -188,6 +189,10 @@ def _to_html(text: str) -> str:
     """The report's Markdown as HTML for the Drive import (which turns it into Doc paragraphs, lists and tables)."""
     html = MARKDOWN.render(text)
     html = html.replace("<pre><code", f'<pre style="{CODE_FONT}"><code')
+    # The import makes "$x ... y=$" an equation, in code too: a styled span around each $ prevents it.
+    html = re.sub(r">([^<]*)<", lambda m: ">" + m.group(1).replace("$", DOLLAR) + "<", html)
+    # A link to a section (#anchor) imports as a link to a bookmark that does not exist: keep only its text.
+    html = re.sub(r'<a href="#[^"]*">(.*?)</a>', r"\1", html, flags=re.S)
     # A <th> row imports as a repeated header row, not bold, with an extra blank line in exports: use bold cells.
     html = re.sub(r"<th( style=\"[^\"]*\")?>(.*?)</th>", r"<td\1><b>\2</b></td>", html, flags=re.S)
     html = re.sub(r"</?thead>\n?", "", html)

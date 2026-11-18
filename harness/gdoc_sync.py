@@ -27,6 +27,7 @@ TEXT_KEYS = ("bold", "italic", "underline", "strikethrough", "smallCaps", "basel
              "weightedFontFamily", "fontSize", "foregroundColor", "backgroundColor")
 PARA_KEYS = ("namedStyleType", "alignment", "lineSpacing", "direction", "spacingMode", "spaceAbove", "spaceBelow",
              "indentFirstLine", "indentStart", "indentEnd", "keepLinesTogether", "keepWithNext", "avoidWidowAndOrphan")
+INDENTS = ("indentFirstLine", "indentStart", "indentEnd")
 MAX_PASSES = 8
 
 Api = Callable[[str, str, dict | None], dict]
@@ -208,8 +209,10 @@ def _image(index: int, props: dict) -> dict:
 def _style_para(start: int, n: Para) -> list[dict]:
     end = start + _u16(n.text)
     reqs: list[dict] = []
+    # An indent left out of the request is not cleared: set no indent as 0.
+    style = {k: {"magnitude": 0, "unit": "PT"} for k in INDENTS} | json.loads(n.style)
     reqs.append({"updateParagraphStyle": {"range": {"startIndex": start, "endIndex": end},
-                                          "paragraphStyle": json.loads(n.style), "fields": ",".join(PARA_KEYS)}})
+                                          "paragraphStyle": style, "fields": ",".join(PARA_KEYS)}})
     for a, b, style in n.runs:
         if b > a:
             reqs.append({"updateTextStyle": {"range": {"startIndex": start + a, "endIndex": start + b},
@@ -382,7 +385,15 @@ def _merge(runs: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
 
 
 def _style(style: dict, keys: tuple[str, ...]) -> str:
-    return json.dumps({k: style[k] for k in keys if k in style}, sort_keys=True)
+    out = {k: style[k] for k in keys if k in style}
+    for k in INDENTS:  # a zero indent reads as {"unit": "PT"} or not at all, depending on how it was set
+        if k in out and not out[k].get("magnitude"):
+            del out[k]
+    if out.get("baselineOffset") == "NONE":
+        del out["baselineOffset"]
+    if "url" not in out.get("link", {"url": ""}):  # a link within the Doc: its bookmark or heading id is the source
+        del out["link"]                              # Doc's own and invalid in the target, so it is not copied
+    return json.dumps(out, sort_keys=True)
 
 
 def _image_hash(props: dict, cache: dict[str, str]) -> str:
