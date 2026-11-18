@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""gdoc — publish a Markdown report as a Google Doc; read and answer its comments.
+
+Runs harness/gdoc.py with the harness's Python (it needs markdown and Pillow).
+`gdoc --help` lists the commands; `gdoc check` says what setup is missing.
+"""
+import os
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+venv = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+python = str(venv) if venv.exists() else sys.executable
+args = [python, "-m", "harness.gdoc", *sys.argv[1:]]
+os.environ["PYTHONPATH"] = str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")
+if os.name == "nt":
+    import subprocess
+    sys.exit(subprocess.call(args, cwd=os.getcwd()))
+os.execv(python, args)

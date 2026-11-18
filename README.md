@@ -463,6 +463,42 @@ shared worklog, and the writing style (ASD-STE100 Simplified Technical English).
 When you change it, raise `BRIEF_VERSION`: every existing session then gets the
 new version once, on its next turn, marked as updated.
 
+## Reports as Google Docs (`gdoc`)
+
+Agents write every report for the user as Markdown in its repo, and publish it
+as a Google Doc with `gdoc publish <file.md>` (`bin/gdoc`, on every agent's
+PATH). The onboarding tells them the rules:
+
+- **One Doc per report, for good.** The first publish creates the Doc. Every
+  later publish updates the same Doc in place with the Google Docs API: only
+  changed text is edited, so the link, the sharing and comments on unchanged
+  text persist. Publish never makes a second Doc; it stops with an error if the
+  Doc can't be read. `--doc <id or link>` binds an existing Doc to a report.
+  `--replace` rewrites the whole body, only when the user asks.
+- **Header:** authors (from git), agents (`$WORKLOG_WORKER`, or `--agent` for
+  subagents), created and last-updated times.
+- **Content:** images are embedded and scaled to the page width; a `<video>`
+  becomes a link to a copy on Drive; a relative link to another report's `.md`
+  file, or its file name in the text, becomes a link to that report's Doc.
+- **Comments:** `gdoc comments <file.md>` lists the open threads with the text
+  they are on; `gdoc reply <file.md> <id> "text" --resolve` answers one.
+- **Sharing:** each publish shares the Doc with the people in
+  `~/.config/discord-agent/gdoc_share` (one `email [role]` per line, role
+  `writer`, `commenter` or `reader`; no email is sent).
+
+**Setup** (once per machine; `gdoc check` says what is missing, and the harness
+logs it at startup):
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), in a
+   project of your own, enable the **Google Drive API** and the **Google Docs
+   API**, and make an OAuth client ID (type *Desktop app*).
+2. Install [rclone](https://rclone.org/install/) and run `rclone config`: a new
+   remote named `gdrive`, type `drive`, with your client ID and secret, scope
+   `drive.file` (the tool sees only the files it made).
+3. Optional settings in `.env`: `GDOC_REMOTE` (default `gdrive`), `GDOC_FOLDER`
+   (Drive folder, default `agent-reports`), `GDOC_REGISTRY` (report → Doc map,
+   default `data/gdocs.json`), `GDOC_SHARE_FILE`, `GDOC_WEB_REGISTRY`.
+
 ## Shared files (`/files`)
 
 Every instance has a persistent folder for the files its discussion produces:
@@ -577,6 +613,7 @@ harness/
 ├── pending.py          # queued messages: edits and deletes reach the agent
 ├── whatsapp.py         # optional WhatsApp mirror: one group per instance (neonize)
 ├── worklog.py          # shared worklog: event rules and the `wl` commands
+├── gdoc.py            # `gdoc`: Markdown reports as Google Docs; gdoc_sync.py edits Docs in place
 ├── worklog_service.py  # its #worklog transport, local API for `wl`, check-ins, mail delivery
 ├── workdirs.py         # folder-by-folder workdir suggestions for /new
 ├── watchdog.py         # separate process: alerts when the harness dies or a turn stalls

@@ -304,6 +304,20 @@ fi
 [[ " ${READY[*]} " =~ " $PROVIDER " ]] \
   || warn "default provider $PROVIDER isn't installed and logged in — rerun setup to fix"
 
+# --- reports as Google Docs (optional) ---
+if gcheck=$(.venv/bin/python -m harness.gdoc check 2>&1); then
+  info "reports as Google Docs: $gcheck"
+else
+  warn "reports as Google Docs (gdoc) not ready: $gcheck"
+  info "  1. In a Google Cloud project of your own, enable the Google Drive API and the Google Docs API,"
+  info "     and make an OAuth client ID (Desktop app)."
+  info "  2. rclone config: a remote named gdrive, type drive, your client ID and secret, scope drive.file."
+  if command -v rclone >/dev/null && yesno "Run rclone config now?" n; then
+    rclone config <"$TTY"
+    .venv/bin/python -m harness.gdoc check || warn "still not ready; agents can't publish reports until it is"
+  fi
+fi
+
 # --- 7. services ---
 bold "8/8 Services"
 if [ "$WITH_SERVICE" = 0 ] || ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then

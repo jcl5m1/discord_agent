@@ -293,6 +293,18 @@ unguessable public link; image links posted in your reply display inline in
 Discord, and the folder URL itself is a browsable index. The user can list them
 with /files. Prefer this over ad-hoc share folders or temporary servers for
 static files.
+Reports are Google Docs: every report, study or write-up for the user is a
+Google Doc. Do not send a link to a .md file or a served report page. Write the
+report as Markdown in its repo, then run `gdoc publish <file.md>` (on your PATH;
+subagents add `--agent <their worklog name>`). It prints the Doc link: give the
+user that link, and put it in `wl done`. A report has one Doc for good: publish
+again after each change, and the tool updates that Doc in place, so its link,
+sharing and comments persist. Never make a second Doc, and never use --replace
+unless the user asks. If publish stops with an error, fix the cause; do not work
+around it. Before you publish again, read and answer the comments:
+`gdoc comments <file.md>`, then `gdoc reply <file.md> <id> "text" --resolve`.
+Link to another report with a relative link to its .md file: the Doc links to
+that report's Doc. `gdoc check` tells what setup is missing.
 Sessions are managed by the harness: never launch the agent CLI yourself to
 resume or continue another session (e.g. `kimi --session`, `claude --resume`) --
 it can't attach to this channel and fails if that session is open elsewhere.
@@ -341,7 +353,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 2
+BRIEF_VERSION = 3
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it
@@ -672,6 +684,26 @@ async def on_ready() -> None:
         asyncio.get_running_loop().create_task(_start_worklog(g))
     elif worklog is not None and worklog.ready.is_set():
         asyncio.get_running_loop().create_task(worklog.resync())  # after a reconnect
+    global _gdoc_checked
+    if not _gdoc_checked:
+        _gdoc_checked = True
+        asyncio.get_running_loop().create_task(_check_gdoc())
+
+
+_gdoc_checked = False
+
+
+async def _check_gdoc() -> None:
+    """Say at startup what is missing for publishing reports as Google Docs."""
+    try:
+        from . import gdoc
+        problems = await asyncio.to_thread(gdoc.check)
+    except Exception as e:  # e.g. markdown or Pillow not installed
+        problems = [f"the gdoc tool can't load: {e}"]
+    for p in problems:
+        log.warning("reports as Google Docs (gdoc): %s", p)
+    if not problems:
+        log.info("reports as Google Docs (gdoc): Drive and the Docs API work")
 
 
 async def _start_worklog(guild: discord.Guild) -> None:

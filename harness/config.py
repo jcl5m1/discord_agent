@@ -123,6 +123,16 @@ WORKLOG_PORT: int = int(os.environ.get("WORKLOG_PORT", "8091"))
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
 # Seconds between internet checks; only state changes are logged.
 UPTIME_INTERVAL: float = float(os.environ.get("UPTIME_INTERVAL", "10"))
+# Reports as Google Docs (harness/gdoc.py, the `gdoc` command): an rclone Google
+# Drive remote, the Drive folder for the Docs, the registry of report -> Doc, and
+# the people each Doc is shared with (one "email [role]" per line).
+GDOC_REMOTE: str = os.environ.get("GDOC_REMOTE", "gdrive")
+GDOC_FOLDER: str = os.environ.get("GDOC_FOLDER", "agent-reports")
+GDOC_REGISTRY: Path = Path(os.path.expanduser(os.environ.get("GDOC_REGISTRY", "") or str(DATA_DIR / "gdocs.json")))
+GDOC_SHARE_FILE: Path = Path(os.path.expanduser(
+    os.environ.get("GDOC_SHARE_FILE", "") or "~/.config/discord-agent/gdoc_share"))
+GDOC_WEB_REGISTRY: Path | None = (Path(os.path.expanduser(os.environ["GDOC_WEB_REGISTRY"]))
+                                  if os.environ.get("GDOC_WEB_REGISTRY") else None)
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.
