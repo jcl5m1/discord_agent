@@ -107,3 +107,33 @@ class CheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncImageTests(unittest.TestCase):
+    """gdoc_sync: a changed image in a paragraph just before a table (task #57)."""
+
+    @staticmethod
+    def doc(uri: str) -> dict:
+        cell = {"content": [{"startIndex": 5, "endIndex": 7, "paragraph": {"elements": [
+            {"startIndex": 5, "endIndex": 7, "textRun": {"content": "x\n"}}]}}]}
+        return {"body": {"content": [
+            {"startIndex": 1, "endIndex": 3, "paragraph": {"elements": [
+                {"startIndex": 1, "endIndex": 2, "inlineObjectElement": {"inlineObjectId": "img"}},
+                {"startIndex": 2, "endIndex": 3, "textRun": {"content": "\n"}}]}},
+            {"startIndex": 3, "endIndex": 9, "table": {"tableRows": [{"tableCells": [cell]}]}},
+            {"startIndex": 9, "endIndex": 10, "paragraph": {"elements": [
+                {"startIndex": 9, "endIndex": 10, "textRun": {"content": "\n"}}]}}]},
+            "inlineObjects": {"img": {"inlineObjectProperties": {"embeddedObject": {
+                "imageProperties": {"contentUri": uri}, "size": {"width": {"magnitude": 100, "unit": "PT"}}}}}}}
+
+    def test_newline_before_the_table_is_kept(self):
+        from harness import gdoc_sync as gs
+        with mock.patch.object(gs, "_image_hash", side_effect=lambda props, cache:
+                               props["embeddedObject"]["imageProperties"]["contentUri"]):
+            old, new = gs._blocks(self.doc("old"), {}), gs._blocks(self.doc("new"), {})
+            src = self.doc("new")
+            reqs = gs.plan(old, new, src, 10)
+        deletes = [r["deleteContentRange"]["range"] for r in reqs if "deleteContentRange" in r]
+        self.assertEqual(deletes, [{"startIndex": 1, "endIndex": 2}])  # the image only, not its newline (2-3)
+        (img,) = [r["insertInlineImage"] for r in reqs if "insertInlineImage" in r]
+        self.assertEqual((img["location"]["index"], img["uri"]), (1, "new"))

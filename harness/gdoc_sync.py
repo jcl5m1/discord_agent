@@ -113,8 +113,14 @@ def _pair(old: list, new: list) -> tuple[list, list, list]:
 
 def _edit_para(o: Para, n: Para, src_doc: dict) -> list[dict]:
     if [x[1] for x in o.images] != [x[1] for x in n.images]:
-        shift = _u16(n.text)
-        return [*_insert_paras(o.start, [n], src_doc, before=True), *_delete_range(o.start + shift, o.end + shift)]
+        # An image changed: replace the paragraph's content and keep its newline. Deleting the whole paragraph
+        # fails when a table follows it (the newline before a table cannot be deleted).
+        reqs = _delete_range(o.start, o.end - 1)
+        text = n.text[:-1].replace(OBJ, "")
+        if text:
+            reqs.append({"insertText": {"location": {"index": o.start}, "text": text}})
+        reqs += [_image(o.start + off, props) for off, _, props in n.images]
+        return reqs + _style_para(o.start, n, o.bullet)
     reqs = []
     a, b = o.text[:-1], n.text[:-1]
     for tag, i1, i2, j1, j2 in reversed(difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()):
