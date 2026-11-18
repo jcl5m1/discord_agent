@@ -42,6 +42,7 @@ class Para:
     style: str
     bullet: tuple | None
     images: list[tuple[int, str, dict]] = field(default_factory=list)  # (offset, content hash, object properties)
+    atomic: bool = False  # holds an element that cannot be partly deleted (an equation)
 
     @property
     def sig(self) -> tuple:
@@ -115,8 +116,8 @@ def _pair(old: list, new: list) -> tuple[list, list, list]:
 
 
 def _edit_para(o: Para, n: Para, src_doc: dict) -> list[dict]:
-    if [x[1] for x in o.images] != [x[1] for x in n.images]:
-        # An image changed: replace the paragraph's content and keep its newline. Deleting the whole paragraph
+    if [x[1] for x in o.images] != [x[1] for x in n.images] or (o.atomic and o.text != n.text):
+        # An image changed (or the paragraph holds an equation, from older imports of "$"): replace the paragraph's content and keep its newline. Deleting the whole paragraph
         # fails when a table follows it (the newline before a table cannot be deleted).
         reqs = _delete_range(o.start, o.end - 1)
         text = n.text[:-1].replace(OBJ, "")
@@ -213,6 +214,9 @@ def _style_para(start: int, n: Para) -> list[dict]:
     style = {k: {"magnitude": 0, "unit": "PT"} for k in INDENTS} | json.loads(n.style)
     reqs.append({"updateParagraphStyle": {"range": {"startIndex": start, "endIndex": end},
                                           "paragraphStyle": style, "fields": ",".join(PARA_KEYS)}})
+    # A link is not removed by an update that clears it along with the other fields: clear links on their own first.
+    reqs.append({"updateTextStyle": {"range": {"startIndex": start, "endIndex": end}, "textStyle": {},
+                                     "fields": "link"}})
     for a, b, style in n.runs:
         if b > a:
             reqs.append({"updateTextStyle": {"range": {"startIndex": start + a, "endIndex": start + b},
@@ -352,7 +356,7 @@ def _block(el: dict, doc: dict, images: dict[str, str]):
 
 def _para(el: dict, doc: dict, images: dict[str, str]) -> Para:
     p = el["paragraph"]
-    text, runs, imgs = "", [], []
+    text, runs, imgs, atomic = "", [], [], False
     for e in p.get("elements", []):
         if "textRun" in e:
             t = e["textRun"]["content"]
@@ -362,8 +366,9 @@ def _para(el: dict, doc: dict, images: dict[str, str]) -> Para:
             props = doc.get("inlineObjects", {})[e["inlineObjectElement"]["inlineObjectId"]]["inlineObjectProperties"]
             imgs.append((_u16(text), _image_hash(props, images), props))
             text += OBJ
-        else:  # page breaks, footnote refs, auto text: one index each
-            text += OBJ
+        else:  # page breaks, footnote refs, auto text: one index each; an equation spans its content
+            text += OBJ * max(1, e.get("endIndex", 0) - e.get("startIndex", 0))
+            atomic = atomic or "equation" in e
     bullet = None
     if "bullet" in p:
         level = p["bullet"].get("nestingLevel", 0)
@@ -371,7 +376,7 @@ def _para(el: dict, doc: dict, images: dict[str, str]) -> Para:
         glyph = lst.get("listProperties", {}).get("nestingLevels", [{}] * (level + 1))[level]
         bullet = (level, bool(glyph.get("glyphType")) and glyph.get("glyphType") != "GLYPH_TYPE_UNSPECIFIED")
     return Para(el["startIndex"], el["endIndex"], text, _merge(runs), _style(p.get("paragraphStyle", {}), PARA_KEYS),
-                bullet, imgs)
+                bullet, imgs, atomic)
 
 
 def _merge(runs: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
@@ -391,6 +396,11 @@ def _style(style: dict, keys: tuple[str, ...]) -> str:
             del out[k]
     if out.get("baselineOffset") == "NONE":
         del out["baselineOffset"]
+    font = out.get("weightedFontFamily", {}).get("fontFamily", "")
+    if font.islower():  # older imports wrote "courier new"; the API keeps it when asked for "Courier New"
+        out["weightedFontFamily"] = out["weightedFontFamily"] | {"fontFamily": font.title()}
+    if out.get("weightedFontFamily") == {"fontFamily": "Arial", "weight": 400}:  # the default font, set or not
+        del out["weightedFontFamily"]
     if "url" not in out.get("link", {"url": ""}):  # a link within the Doc: its bookmark or heading id is the source
         del out["link"]                              # Doc's own and invalid in the target, so it is not copied
     return json.dumps(out, sort_keys=True)

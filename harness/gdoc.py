@@ -177,7 +177,8 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
 # and nested list items need only be indented to their parent's text (2 spaces after "- "). Python-Markdown, used
 # before, needs a blank line before a list and 4-space nesting, so most report lists came out as text or flat.
 # The Drive import keeps a font set on a block or a span, not on <code>, and shows a bare <blockquote> as plain text.
-CODE_FONT = "font-family:'Courier New',monospace"
+# Unquoted and without a fallback: with "'Courier New',monospace" some imports set every code span to Arial.
+CODE_FONT = "font-family:Courier New"
 DOLLAR = '<span style="vertical-align:baseline">$</span>'
 MARKDOWN = MarkdownIt("commonmark").enable(["table", "strikethrough"])
 MARKDOWN.add_render_rule(  # inline code as a monospace span (the Drive import drops the font of <code>)
