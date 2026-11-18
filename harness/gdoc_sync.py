@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import io
 import json
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from PIL import Image
 
 DOCS = "https://docs.googleapis.com/v1/documents"
 OBJ = "\ufffc"  # one index in the Doc: an inline image
@@ -285,7 +288,15 @@ def _image_hash(props: dict, cache: dict[str, str]) -> str:
     uri = emb.get("imageProperties", {}).get("contentUri", "")
     if uri and uri not in cache:
         with urllib.request.urlopen(uri, timeout=60) as r:
-            cache[uri] = hashlib.sha1(r.read()).hexdigest()[:16]
+            data = r.read()
+        # Hash the decoded pixels, not the file: Google re-encodes an image that insertInlineImage adds, so its
+        # bytes differ from the temporary Doc's copy even when the picture is the same.
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                data = im.convert("RGBA").tobytes()
+        except OSError:
+            pass
+        cache[uri] = hashlib.sha1(data).hexdigest()[:16]
     size = emb.get("size", {})
     dims = tuple(round(size.get(k, {}).get("magnitude", 0)) for k in ("width", "height"))
     return f"{cache.get(uri, '')}:{dims}"
