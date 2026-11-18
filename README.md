@@ -488,6 +488,15 @@ PATH). The onboarding tells them the rules:
 - **Content:** images are embedded and scaled to the page width; a `<video>`
   becomes a link to a copy on Drive; a relative link to another report's `.md`
   file, or its file name in the text, becomes a link to that report's Doc.
+- **Markdown:** CommonMark as on GitHub (markdown-it-py), with tables. A list
+  may follow a paragraph line directly; nest items by indenting them to the
+  parent's text (2 spaces after `- `, 3 after `1. `). Bullet and numbered lists
+  keep their nesting levels and numbering (a bullet nested in a numbered list is
+  numbered `a.`, `b.`); code is set in Courier, quotes are indented, header
+  rows of tables are bold. `tests/gdoc_render_live.py` publishes a sample of
+  every feature to a scratch Doc, checks each block through the Docs API, both
+  for a new Doc and for an in-place update, and deletes the Doc (needs the
+  setup below and network; not part of the unit tests).
 - **Comments:** `gdoc comments <file.md>` lists the open threads with the text
   they are on; `gdoc reply <file.md> <id> "text" --resolve` answers one.
 - **Sharing:** each publish shares the Doc with the people in

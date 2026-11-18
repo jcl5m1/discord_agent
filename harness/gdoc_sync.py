@@ -44,7 +44,7 @@ class Para:
 
     @property
     def sig(self) -> tuple:
-        return ("p", self.text, tuple(self.runs), self.style, self.bullet, tuple((o, h) for o, h, _ in self.images))
+        return ("p", self.text, tuple(self.runs), self.style, tuple((o, h) for o, h, _ in self.images))
 
 
 @dataclass
@@ -72,6 +72,8 @@ def sync(api: Api, target: str, source: str) -> int:
     for _ in range(MAX_PASSES):
         tgt, src = api("GET", f"{DOCS}/{target}", None), api("GET", f"{DOCS}/{source}", None)
         reqs = plan(_blocks(tgt, images), _blocks(src, images), src, _body_end(tgt))
+        if not reqs:  # text and styles match: now the lists (which paragraphs are list items, at which level)
+            reqs = list_plan(tgt, src)
         if not reqs:
             return total
         api("POST", f"{DOCS}/{target}:batchUpdate", {"requests": reqs})
@@ -120,7 +122,7 @@ def _edit_para(o: Para, n: Para, src_doc: dict) -> list[dict]:
         if text:
             reqs.append({"insertText": {"location": {"index": o.start}, "text": text}})
         reqs += [_image(o.start + off, props) for off, _, props in n.images]
-        return reqs + _style_para(o.start, n, o.bullet)
+        return reqs + _style_para(o.start, n)
     reqs = []
     a, b = o.text[:-1], n.text[:-1]
     for tag, i1, i2, j1, j2 in reversed(difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()):
@@ -129,8 +131,8 @@ def _edit_para(o: Para, n: Para, src_doc: dict) -> list[dict]:
             reqs.append({"insertText": {"location": {"index": x2}, "text": b[j1:j2]}})
         if tag in ("replace", "delete") and x2 > x1:
             reqs.append({"deleteContentRange": {"range": {"startIndex": x1, "endIndex": x2}}})
-    if reqs or o.runs != n.runs or o.style != n.style or o.bullet != n.bullet:
-        reqs += _style_para(o.start, n, o.bullet)
+    if reqs or o.runs != n.runs or o.style != n.style:
+        reqs += _style_para(o.start, n)
     return reqs
 
 
@@ -190,7 +192,7 @@ def _insert_paras(index: int, paras: list[Para], src_doc: dict, before: bool) ->
     for p in paras:
         for off, _, props in p.images:
             reqs.append(_image(pos + off, props))
-        reqs += _style_para(pos, p, None, fresh=True)
+        reqs += _style_para(pos, p)
         pos += _u16(p.text)
     return reqs
 
@@ -203,21 +205,115 @@ def _image(index: int, props: dict) -> dict:
     return {"insertInlineImage": req}
 
 
-def _style_para(start: int, n: Para, old_bullet: tuple | None, fresh: bool = False) -> list[dict]:
+def _style_para(start: int, n: Para) -> list[dict]:
     end = start + _u16(n.text)
     reqs: list[dict] = []
-    if fresh or old_bullet != n.bullet:
-        reqs.append({"deleteParagraphBullets": {"range": {"startIndex": start, "endIndex": end}}})
-        if n.bullet:
-            preset = "NUMBERED_DECIMAL_ALPHA_ROMAN" if n.bullet[1] else "BULLET_DISC_CIRCLE_SQUARE"
-            reqs.append({"createParagraphBullets": {"range": {"startIndex": start, "endIndex": end},
-                                                    "bulletPreset": preset}})
     reqs.append({"updateParagraphStyle": {"range": {"startIndex": start, "endIndex": end},
                                           "paragraphStyle": json.loads(n.style), "fields": ",".join(PARA_KEYS)}})
     for a, b, style in n.runs:
         if b > a:
             reqs.append({"updateTextStyle": {"range": {"startIndex": start + a, "endIndex": start + b},
                                              "textStyle": json.loads(style), "fields": ",".join(TEXT_KEYS)}})
+    return reqs
+
+
+# ------------------------------------------------------------------------------------------------ lists
+# A list is rebuilt as a whole: its bullets are removed, each item gets one tab per nesting level at its start, and
+# createParagraphBullets makes one list over all its items (the tabs set the nesting levels and are removed). Making
+# bullets paragraph by paragraph made a separate list for each item: numbering restarted and nesting was lost.
+# Docs imported from HTML carry no list types (every level reads GLYPH_TYPE_UNSPECIFIED), so a new Doc and the
+# temporary Doc of an update are rebuilt the same way first (normalize_lists, with the types from the Markdown);
+# then both sides carry explicit types and the list pass compares them.
+PRESET = {True: "NUMBERED_DECIMAL_ALPHA_ROMAN", False: "BULLET_DISC_CIRCLE_SQUARE"}
+
+
+def list_plan(tgt: dict, src: dict) -> list[dict]:
+    """Requests that make the target's lists match the source's; the paragraphs match already (same order)."""
+    tp, sp = _body_paras(tgt), _body_paras(src)
+    if len(tp) != len(sp):
+        return []
+    want = _list_items(src, sp)
+    have = _list_items(tgt, tp)
+    if want == have:
+        return []
+    return _rebuild(tp, want, _body_end(tgt))
+
+
+def normalize_lists(api: Api, doc: str, kinds: list[tuple[int, int, bool]]) -> int:
+    """Rebuild every list of a Doc imported from HTML with explicit types. kinds: one (list number, nesting level,
+    numbered) per list item, in order, from the Markdown. Nothing is changed when the Doc's list items do not match
+    the Markdown's one for one."""
+    d = api("GET", f"{DOCS}/{doc}", None)
+    paras = _body_paras(d)
+    items = [i for i, (_, p) in enumerate(paras) if "bullet" in p]
+    if len(items) != len(kinds):
+        return 0
+    want = {i: k for i, k in zip(items, kinds)}
+    reqs = _rebuild(paras, want, _body_end(d))
+    if reqs:
+        api("POST", f"{DOCS}/{doc}:batchUpdate", {"requests": reqs})
+    return len(reqs)
+
+
+def _body_paras(doc: dict) -> list[tuple[dict, dict]]:
+    return [(el, el["paragraph"]) for el in doc["body"]["content"] if "paragraph" in el]
+
+
+def _list_items(doc: dict, paras: list[tuple[dict, dict]]) -> dict[int, tuple[int, int, bool]]:
+    """Paragraph number -> (list group, nesting level, numbered) for the list items. A list group is a run of items of
+    one list; the type is that of the list's top level, as createParagraphBullets gives one preset to a whole list."""
+    out: dict[int, tuple[int, int, bool]] = {}
+    group, prev = -1, None
+    for i, (_, p) in enumerate(paras):
+        b = p.get("bullet")
+        if not b:
+            prev = None
+            continue
+        if b["listId"] != prev:
+            group += 1
+            prev = b["listId"]
+        levels = doc.get("lists", {}).get(b["listId"], {}).get("listProperties", {}).get("nestingLevels", [{}])
+        top = levels[0] if levels else {}
+        numbered = top.get("glyphType", "GLYPH_TYPE_UNSPECIFIED") not in ("GLYPH_TYPE_UNSPECIFIED", "NONE")
+        out[i] = (group, b.get("nestingLevel", 0), numbered)
+    return out
+
+
+def _rebuild(paras: list[tuple[dict, dict]], want: dict[int, tuple[int, int, bool]], body_end: int) -> list[dict]:
+    """Requests that make exactly the paragraphs in want list items, list by list, back to front."""
+    blocks: list[list[int]] = []
+    for i in sorted(want):
+        if blocks and blocks[-1][-1] == i - 1 and want[blocks[-1][-1]][0] == want[i][0]:
+            blocks[-1].append(i)
+        else:
+            blocks.append([i])
+    ops: list[tuple[int, list[dict]]] = []  # (start index, requests): applied from the end of the Doc backwards
+    for blk in blocks:
+        s = paras[blk[0]][0]["startIndex"]
+        e = min(paras[blk[-1]][0]["endIndex"], body_end - 1)
+        # Without its bullets an item keeps the list's indent, which createParagraphBullets would count as more
+        # nesting levels on top of the tabs: clear the indent first.
+        reqs = [{"deleteParagraphBullets": {"range": {"startIndex": s, "endIndex": e}}},
+                {"updateParagraphStyle": {"range": {"startIndex": s, "endIndex": e},
+                                          "paragraphStyle": {"indentStart": {"magnitude": 0, "unit": "PT"},
+                                                             "indentFirstLine": {"magnitude": 0, "unit": "PT"}},
+                                          "fields": "indentStart,indentFirstLine"}}]
+        tabs = 0
+        for i in reversed(blk):
+            level = want[i][1]
+            if level:
+                reqs.append({"insertText": {"location": {"index": paras[i][0]["startIndex"]}, "text": "\t" * level}})
+                tabs += level
+        reqs.append({"createParagraphBullets": {"range": {"startIndex": s, "endIndex": e + tabs},
+                                                "bulletPreset": PRESET[want[blk[0]][2]]}})
+        ops.append((s, reqs))
+    for i, (el, p) in enumerate(paras):  # paragraphs that are list items now but should not be
+        if "bullet" in p and i not in want:
+            ops.append((el["startIndex"], [{"deleteParagraphBullets": {"range": {
+                "startIndex": el["startIndex"], "endIndex": min(el["endIndex"], body_end - 1)}}}]))
+    reqs: list[dict] = []
+    for _, r in sorted(ops, key=lambda x: -x[0]):
+        reqs += r
     return reqs
 
 

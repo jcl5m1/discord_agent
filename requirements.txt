@@ -1,5 +1,5 @@
 discord.py>=2.4
 playwright
 neonize>=0.5
-markdown>=3.5
+markdown-it-py>=3
 Pillow>=10

@@ -43,7 +43,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-import markdown
+from markdown_it import MarkdownIt
+from markdown_it.common.utils import escapeHtml
 from PIL import Image
 
 from . import config, gdoc_sync
@@ -127,7 +128,7 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
     prev = reg.get(str(src)) or {}
     title = title or prev.get("title") or _first_heading(text) or src.stem
     videos = dict(prev.get("videos", {}))
-    html = markdown.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
+    html = _to_html(text)
     html = VIDEO.sub(lambda m: _video_link(m, src, videos), html)
     html = IMAGE.sub(lambda m: _fit_image(src, m.group(0)), html)
     html = _link_reports(src, html, reg)
@@ -147,7 +148,7 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
             _upload("PATCH", f"{UPLOAD}/files/{doc}?uploadType=multipart&fields=id", {"name": title}, page)
             print(f"replaced the whole body of Doc {doc} (--replace)", file=sys.stderr)
         else:
-            edits = _update_in_place(doc, title, page)
+            edits = _update_in_place(doc, title, page, list_kinds(text))
             print(f"updated Doc {doc} in place: {edits} edits", file=sys.stderr)
     else:
         folder = _folder_id()
@@ -157,6 +158,7 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
                              f"recorded for {src}. Bind it, then publish again: publish {src} --doc <id or link>")
         meta = {"name": title, "mimeType": DOC_MIME, "parents": [folder]}
         doc = _upload("POST", f"{UPLOAD}/files?uploadType=multipart&fields=id", meta, page)["id"]
+        gdoc_sync.normalize_lists(_docs_api, doc, list_kinds(text))
         print(f"created new Doc {doc} for {src}", file=sys.stderr)
     _share(doc)
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -169,6 +171,45 @@ def publish(src: Path, title: str | None, reg: dict, agents: list[str], replace:
     tmp.write_text(json.dumps(reg, indent=1))
     tmp.replace(REGISTRY)
     return reg[str(src)]["url"]
+
+
+# CommonMark (as on GitHub), with tables and strikethrough: a list may follow a paragraph line without a blank line,
+# and nested list items need only be indented to their parent's text (2 spaces after "- "). Python-Markdown, used
+# before, needs a blank line before a list and 4-space nesting, so most report lists came out as text or flat.
+# The Drive import keeps a font set on a block or a span, not on <code>, and shows a bare <blockquote> as plain text.
+CODE_FONT = "font-family:'Courier New',monospace"
+MARKDOWN = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+MARKDOWN.add_render_rule(  # inline code as a monospace span (the Drive import drops the font of <code>)
+    "code_inline", lambda self, tokens, idx, options, env:
+    f'<span style="{CODE_FONT}">{escapeHtml(tokens[idx].content)}</span>')
+
+
+def _to_html(text: str) -> str:
+    """The report's Markdown as HTML for the Drive import (which turns it into Doc paragraphs, lists and tables)."""
+    html = MARKDOWN.render(text)
+    html = html.replace("<pre><code", f'<pre style="{CODE_FONT}"><code')
+    # A <th> row imports as a repeated header row, not bold, with an extra blank line in exports: use bold cells.
+    html = re.sub(r"<th( style=\"[^\"]*\")?>(.*?)</th>", r"<td\1><b>\2</b></td>", html, flags=re.S)
+    html = re.sub(r"</?thead>\n?", "", html)
+    return html.replace("<blockquote>", '<blockquote style="margin-left:24pt;border-left:3pt solid #c8c8c8;'
+                                        'padding-left:9pt;color:#555555">')
+
+
+def list_kinds(text: str) -> list[tuple[int, int, bool]]:
+    """One (list number, nesting level, numbered) per list item of the Markdown, in order. The number counts
+    top-level lists; numbered is the type of the item's top-level list (one preset per Doc list). The Drive import
+    drops list types, so gdoc_sync.normalize_lists rebuilds the lists with these."""
+    out, stack, top = [], [], -1
+    for t in MARKDOWN.parse(text):
+        if t.type in ("bullet_list_open", "ordered_list_open"):
+            if not stack:
+                top += 1
+            stack.append(t.type == "ordered_list_open")
+        elif t.type in ("bullet_list_close", "ordered_list_close"):
+            stack.pop()
+        elif t.type == "list_item_open":
+            out.append((top, len(stack) - 1, stack[0]))
+    return out
 
 
 def _header(people: list[str], agents: list[str], created: float, changed: float) -> str:
@@ -396,13 +437,15 @@ def _folder_id() -> str:
     return parent
 
 
-def _update_in_place(doc: str, title: str, page: str) -> int:
+def _update_in_place(doc: str, title: str, page: str, kinds: list | None = None) -> int:
     # The new version goes into a temporary Doc (Drive's HTML import does the formatting); gdoc_sync then edits the
     # published Doc to match it, touching only what changed. The temporary Doc is deleted in every case.
     _docs_api("GET", f"{gdoc_sync.DOCS}/{doc}?fields=documentId", None)
     temp = _upload("POST", f"{UPLOAD}/files?uploadType=multipart&fields=id",
                    {"name": f"(temporary) {title}", "mimeType": DOC_MIME}, page)["id"]
     try:
+        if kinds is not None:
+            gdoc_sync.normalize_lists(_docs_api, temp, kinds)
         edits = gdoc_sync.sync(_docs_api, doc, temp)
     finally:
         _request("DELETE", f"{API}/files/{temp}", None, "application/json")

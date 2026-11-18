@@ -137,3 +137,28 @@ class SyncImageTests(unittest.TestCase):
         self.assertEqual(deletes, [{"startIndex": 1, "endIndex": 2}])  # the image only, not its newline (2-3)
         (img,) = [r["insertInlineImage"] for r in reqs if "insertInlineImage" in r]
         self.assertEqual((img["location"]["index"], img["uri"]), (1, "new"))
+
+
+class MarkdownTests(unittest.TestCase):
+    """The Markdown → HTML step before the Drive import (task #58); tests/gdoc_render_live.py checks a real Doc."""
+
+    def test_list_right_after_a_paragraph_line(self):
+        html = gdoc._to_html("Intro line:\n- one\n- two\n")
+        self.assertIn("<ul>", html)
+        self.assertNotIn("- one", html)
+
+    def test_two_space_nesting(self):
+        self.assertEqual(gdoc._to_html("- a\n  - b\n").count("<ul>"), 2)
+
+    def test_list_kinds(self):
+        md = "- a\n  - b\n    - c\n- d\n\ntext\n\n1. x\n   - y\n2. z\n"
+        self.assertEqual(gdoc.list_kinds(md), [(0, 0, False), (0, 1, False), (0, 2, False), (0, 0, False),
+                                               (1, 0, True), (1, 1, True), (1, 0, True)])
+
+    def test_code_quote_and_table_styles(self):
+        html = gdoc._to_html("`x<y`\n\n```\nblock\n```\n\n> q\n\n| H |\n|---|\n| v |\n")
+        self.assertIn(f'<span style="{gdoc.CODE_FONT}">x&lt;y</span>', html)  # inline code: a monospace span
+        self.assertIn(f'<pre style="{gdoc.CODE_FONT}"><code>block', html)
+        self.assertIn('<blockquote style="margin-left', html)
+        self.assertIn("<td><b>H</b></td>", html)  # header cells as bold cells, no <th>/<thead>
+        self.assertNotIn("<th", html)
