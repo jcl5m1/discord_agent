@@ -113,7 +113,7 @@ def _check_health(prev: str, now: float) -> str:
         return prev  # the uptime monitor isn't writing it
     level = state.get("level", "ok")
     if health.LEVELS.index(level) > health.LEVELS.index(prev):
-        top = ", ".join(f"{(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB `{p['cmd'][:50]}`"
+        top = ", ".join(f"{(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB `{p['cmd'][:50]}` ({p.get('owner', '?')})"
                         for p in state.get("top_mem", [])[:3])
         acts = "".join(f"\n• {a['text'][:150]}" for a in state.get("actions", [])[-2:]
                        if now - a["ts"] < 600)

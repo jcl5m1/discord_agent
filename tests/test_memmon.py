@@ -52,7 +52,8 @@ class MemmonTests(unittest.TestCase):
         for pct in (30, 8, 5, 12, 20, 25):
             rec.events(row(pct))
         self.assertEqual([e for e, _ in events], ["mem_low", "mem_ok"])
-        self.assertIn("9100 MiB python big.py", events[0][1]["top"][0])
+        self.assertIn("9100 MiB", events[0][1]["top"][0])
+        self.assertIn("python big.py", events[0][1]["top"][0])
         text = "\n".join(memmon.summary_lines([{"ts": time.time(), "event": "mem_low", **events[0][1]}], time.time()))
         self.assertIn("Low memory", text)
 

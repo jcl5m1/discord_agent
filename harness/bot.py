@@ -929,9 +929,9 @@ def _health_agent() -> Instance | None:
 _HEALTH_ORDERS = """\
 Take preventive measures now, so this machine does not run out of memory and freeze (a hard crash
 stops every agent and every job). Work quickly:
-1. Find what uses and grows the memory: `ps -eo pid,user,rss,etime,args --sort=-rss | head -15`,
-   and the per-minute record in {mem_dir}. Find the owner of each heavy job: `wl status`, `docker ps`,
-   `systemctl --user list-units --type=service --state=running`.
+1. Find what uses and grows the memory. Each top process above names its owner (an agent, a unit,
+   cron, a container or a heavy job); `wl status` shows what each agent works on. More detail:
+   `ps -eo pid,user,rss,etime,args --sort=-rss | head -15`, the per-minute record in {mem_dir}.
 2. Ask each owner to pause or reduce its job now: `wl send <worker> "..."`. Ask for fewer parallel
    workers, smaller batches, or a memory limit (`systemd-run --user -p MemoryMax=8G ...`).
 3. If memory keeps falling and the owner does not act within a few minutes, stop or restart the job
@@ -1001,9 +1001,10 @@ async def _health_loop() -> None:
                 log.warning("system health %s, but no health agent to tell (set HEALTH_AGENT)", level)
                 continue
             last_sent = time.time()
-            top = "\n".join(f"- {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB pid {p['pid']}: {p['cmd'][:150]}"
-                             for p in state.get("top_mem", []))
-            cpu = "\n".join(f"- {p['cpu_pct']}% pid {p['pid']}: {p['cmd'][:120]}" for p in state.get("top_cpu", [])[:3])
+            top = "\n".join(f"- {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB pid {p['pid']} [owner: {p.get('owner', '?')}]: "
+                             f"{p['cmd'][:150]}" for p in state.get("top_mem", []))
+            cpu = "\n".join(f"- {p['cpu_pct']}% pid {p['pid']} [owner: {p.get('owner', '?')}]: {p['cmd'][:120]}"
+                             for p in state.get("top_cpu", [])[:3])
             acts = "\n".join(f"- {a['text']}" for a in state.get("actions", []) if time.time() - a["ts"] < 900)
             prompt = (f"[System health: {level.upper()}] {'; '.join(state.get('reasons', []))}. "
                       f"Swap {state.get('swap_used_pct')}% used.\nTop memory:\n{top}\nTop CPU:\n{cpu}\n"

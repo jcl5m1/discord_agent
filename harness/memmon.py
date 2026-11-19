@@ -103,9 +103,18 @@ class Recorder:
                 if pct >= 1:
                     cpu.append((pct, d))
         self.prev_cpu, self.prev_t = ticks, now
-        top_mem = [{"pid": int(d.name), "rss_mib": rss // 1024, "swap_mib": swap // 1024, "cmd": _cmd(d)}
-                   for _, rss, swap, d in sorted(mem, key=lambda p: -p[0])[:TOP_N]]
-        top_cpu = [{"pid": int(d.name), "cpu_pct": round(pct), "cmd": _cmd(d)}
+        from . import owners
+        ctx = owners.Context()
+
+        def who(pid: int) -> str:
+            try:
+                return owners.owner(pid, ctx)
+            except Exception:
+                return "?"
+
+        top_mem = [{"pid": int(d.name), "rss_mib": rss // 1024, "swap_mib": swap // 1024, "cmd": _cmd(d),
+                    "owner": who(int(d.name))} for _, rss, swap, d in sorted(mem, key=lambda p: -p[0])[:TOP_N]]
+        top_cpu = [{"pid": int(d.name), "cpu_pct": round(pct), "cmd": _cmd(d), "owner": who(int(d.name))}
                    for pct, d in sorted(cpu, key=lambda p: -p[0])[:TOP_N]]
         return top_mem, top_cpu
 
@@ -126,7 +135,8 @@ class Recorder:
             return
         if not self.low and avail < LOW_PCT:
             self.low = True
-            top = [f"{p['rss_mib'] + p['swap_mib']} MiB {p['cmd'][:80]}" for p in json.loads(row[6])[:3]]
+            top = [f"{p['rss_mib'] + p['swap_mib']} MiB [{p.get('owner', '?')}] {p['cmd'][:80]}"
+                   for p in json.loads(row[6])[:3]]
             self.append_event("mem_low", avail_pct=avail, swap_used_pct=row[3], top=top)
         elif self.low and avail > OK_PCT:
             self.low = False
@@ -222,7 +232,8 @@ def summary_lines(events: list[dict], now: float, days: int = 30) -> list[str]:
         lines += ["", f"**Memory** ({cur['time'][11:16]}): {cur['avail_pct']}% available, "
                       f"swap {cur['swap_used_pct'] or '?'}% used, pressure {cur['psi_some_avg10'] or '?'}%"]
         for p in json.loads(cur["top_mem"])[:3]:
-            lines.append(f"• {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB — `{_short(p['cmd'])}`")
+            by = f" — {p['owner']}" if p.get("owner") else ""
+            lines.append(f"• {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB — `{_short(p['cmd'], 60)}`{by}")
         busy = json.loads(cur["top_cpu"])[:3]
         if busy:
             lines.append("**CPU**: " + " · ".join(f"{p['cpu_pct']}% `{_short(p['cmd'], 40)}`" for p in busy))
