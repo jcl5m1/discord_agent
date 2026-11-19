@@ -152,6 +152,9 @@ HEALTH_WARN_PCT: float = float(os.environ.get("HEALTH_WARN_PCT", "20"))  # avail
 HEALTH_CRIT_PCT: float = float(os.environ.get("HEALTH_CRIT_PCT", "6"))  # available RAM % for `critical`
 HEALTH_ACTIONS: bool = os.environ.get("HEALTH_ACTIONS", "1").lower() not in ("0", "false", "no", "off")
 HEALTH_AGENT: str = os.environ.get("HEALTH_AGENT", "")  # instance name; default: the one in the harness repo
+# heavy (bin/heavy): machine-wide slots per job class, and the default memory limit of a job.
+HEAVY_SLOTS: str = os.environ.get("HEAVY_SLOTS", "video-decode=1,gpu=1,ml-cpu=2,default=3")
+HEAVY_MEM: str = os.environ.get("HEAVY_MEM", "8G")
 # Disk space alerts (harness/disk.py): % used for warn and critical, MB free for full, % used to clear.
 DISK_WARN_PCT: float = float(os.environ.get("DISK_WARN_PCT", "90"))
 DISK_CRIT_PCT: float = float(os.environ.get("DISK_CRIT_PCT", "95"))

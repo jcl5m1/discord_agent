@@ -360,6 +360,11 @@ resume or continue another session (e.g. `kimi --session`, `claude --resume`) --
 it can't attach to this channel and fails if that session is open elsewhere.
 If the user wants to continue a different session, tell them to run /session
 in this Discord channel and pick it there.
+Heavy jobs (video decoding, ML models, builds, anything over 2 GB of RAM or many cores): run them
+through `heavy` (on your PATH), e.g. `heavy --class video-decode --mem 8G -- ffmpeg ...`. It gives
+the job a memory limit and a machine-wide slot per class, waits while the machine is short of
+memory, and stops the job if you stop. Give Docker containers `--memory` and
+`--label heavy.unit=$HEAVY_UNIT`. `heavy status` shows who holds the slots.
 Writing style: follow ASD-STE100 Simplified Technical English as far as you
 can, in replies, worklog entries, commit messages and docs. Use short
 sentences (at most 20 words for instructions, 25 for descriptions), one
@@ -411,7 +416,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 5
+BRIEF_VERSION = 6
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it

@@ -176,6 +176,21 @@ def _on_start(state: dict, boot_id: str, boot: float, now: float) -> None:
     _append("monitor_start", ts=now, boot_id=boot_id, boot=boot)
 
 
+async def _heavy_sweeps(stop: asyncio.Event) -> None:
+    """Stop heavy jobs whose heavy process was killed hard (they keep their scope otherwise)."""
+    from . import heavy
+    while not stop.is_set():
+        try:
+            for unit in await asyncio.to_thread(heavy.sweep):
+                _append("heavy_sweep", unit=unit)
+        except Exception:
+            log.exception("heavy sweep failed")
+        try:
+            await asyncio.wait_for(stop.wait(), 300)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run() -> None:
     boot_id, boot = _boot()
     now = time.time()
@@ -198,6 +213,7 @@ async def run() -> None:
     gpu = asyncio.ensure_future(gpumon.run(stop, _append, logged))
     mem = asyncio.ensure_future(memmon.run(stop, _append))
     care = asyncio.ensure_future(diskcare.run(stop, _append))
+    reaper = asyncio.ensure_future(_heavy_sweeps(stop))
 
     while not stop.is_set():
         t = time.time()
@@ -227,7 +243,7 @@ async def run() -> None:
             pass
 
     try:
-        await asyncio.wait_for(asyncio.gather(gpu, mem, care), 10)
+        await asyncio.wait_for(asyncio.gather(gpu, mem, care, reaper), 10)
     except (asyncio.TimeoutError, Exception):
         log.exception("gpumon didn't stop cleanly")
     now = time.time()

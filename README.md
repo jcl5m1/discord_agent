@@ -541,6 +541,28 @@ disk every 10 minutes (at once when its level rises):
 Each action goes to `data/disk_actions.jsonl` and `/uptime`'s event log. By hand:
 `python -m harness.diskcare status | scan | clean | offload <folder> | restore <folder>`.
 
+### Heavy jobs (`heavy`)
+
+Agents run heavy work through one shared runner, so jobs don't collide
+(`harness/heavy.py`, `bin/heavy`; the onboarding tells them):
+
+```
+heavy --class video-decode --mem 8G [--swap 1G] [--cpus 4] [--name ...] -- <command>
+heavy status          # who holds which slots; is the gate open
+```
+
+- **Slots:** `HEAVY_SLOTS` (default `video-decode=1,gpu=1,ml-cpu=2,default=3`)
+  machine-wide slots per class; a job waits for a free one and says who holds them.
+- **Gate:** a job waits while memory health is warn/critical or the disk is full
+  (`--force` skips the gate, not the slot; `--max-wait`, default 4 h, then exit 75).
+- **Limits:** the job runs in its own systemd scope `heavy-<class>-<pid>` with
+  `MemoryMax`/`MemorySwapMax` (and `CPUQuota` with `--cpus`): over the limit, the
+  kernel stops the job, not the machine.
+- **Stops with its caller:** stopping heavy stops the scope and the Docker
+  containers labelled `heavy.unit=$HEAVY_UNIT`; the uptime monitor sweeps up what a
+  hard-killed heavy left.
+- **Log:** `data/heavy/jobs.jsonl` (who, class, command, wait, peak memory, exit code).
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
