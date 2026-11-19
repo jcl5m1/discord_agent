@@ -38,6 +38,9 @@ log = logging.getLogger("discord_agent.worklog")
 SETTLE = 2.5  # seconds after posting before a change is confirmed
 REMIND_AT = CHECKIN_EVERY - 5 * 60  # remind this long after the last check-in
 WAKE_LIMIT = 12  # deliveries that start a turn, per worker per hour
+OFFER_AFTER = 10 * 60  # an agent idle this long with no claim is offered the best open task
+OFFER_WAIT = 30 * 60  # a task offered to one agent isn't offered to another for this long
+OFFER_GAP = 60 * 60  # at most one offer per agent per this long
 
 
 class WorklogService:
@@ -46,9 +49,15 @@ class WorklogService:
         client: discord.Client,
         deliver: Callable[[str, str, str], Awaitable[None]],
         notify: Callable[[str, str], Awaitable[None]],
+        idle_for: Callable[[str], float | None] | None = None,
     ):
         """deliver(worker, sender, text) hands a message to that worker's agent;
-        notify(worker, text) posts a line in that worker's Discord channel."""
+        notify(worker, text) posts a line in that worker's Discord channel;
+        idle_for(worker) is how long that worker's agent has been idle, in seconds
+        (None: busy, stopped, or not one to offer work to)."""
+        self.idle_for = idle_for
+        self._offers: dict[int, tuple[str, float]] = {}  # task -> (worker, when) it was last offered
+        self._offered: dict[str, float] = {}  # worker -> when it was last offered a task
         self.client = client
         self.deliver = deliver
         self.notify = notify
@@ -259,8 +268,52 @@ class WorklogService:
             await asyncio.sleep(60)
             try:
                 await self._check_claims()
+                if config.WORKLOG_OFFERS:
+                    await self._offer_work()
             except Exception:
                 log.exception("worklog duty check failed")
+
+    def _offer_plan(self, now: float) -> list[tuple[str, object]]:
+        """(worker, task) offers to make now: each idle agent of this bot with no claim gets the best open,
+        unblocked task it hasn't passed on, if no other agent was offered that task in the last OFFER_WAIT.
+        An agent whose task area matches its name or folder goes first."""
+        if self.idle_for is None:
+            return []
+        idle = []
+        for w in sorted(self.my_workers()):
+            if self.state.owned_by(w) or now - self._offered.get(w, 0) < OFFER_GAP:
+                continue
+            quiet = self.idle_for(w)
+            if quiet is not None and quiet >= OFFER_AFTER:
+                idle.append(w)
+        plan, taken = [], set()
+        for w in idle:
+            here = f"{w} {self.state.workers[w].desc}".lower() if w in self.state.workers else w.lower()
+            choices = [t for t in self.state.ready(w) if t.num not in taken
+                       and not (t.num in self._offers and self._offers[t.num][0] != w
+                                and now - self._offers[t.num][1] < OFFER_WAIT)]
+            choices.sort(key=lambda t: (t.prio, not (t.area and t.area.lower() in here), t.num))
+            if choices:
+                plan.append((w, choices[0]))
+                taken.add(choices[0].num)
+        return plan
+
+    async def _offer_work(self) -> None:
+        now = time.time()
+        for worker, task in self._offer_plan(now):
+            if not self._may_wake(worker):
+                continue
+            self._offers[task.num] = (worker, now)
+            self._offered[worker] = now
+            log.info("worklog: offering #%d to idle %s", task.num, worker)
+            desc = f"\n{task.desc[:600]}" if task.desc else ""
+            await self.deliver(worker, "harness:offer", (
+                f"You have no claimed task, and #{task.num} (p{task.prio}"
+                + (f", {task.area}" if task.area else "") + f") is open: {task.title}{desc}\n"
+                f'If you can do it, claim it (`wl claim {task.num} "<what you start>"`) and work on it, '
+                "or give it to a subagent. If it isn't yours to do (other project, needs the user, "
+                f'waits on other work), say why: `wl pass {task.num} "<why>"`, or '
+                f"`wl depends {task.num} --on <tasks>`. Then stop; don't start other work."))
 
     def _orphans(self, now: float) -> list:
         """Lapsed claims of workers no harness bot runs (e.g. terminal sessions)

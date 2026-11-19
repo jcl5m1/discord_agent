@@ -27,7 +27,7 @@ CHECKIN_WORDS = 10
 STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
-       "reopen", "drop", "lease", "unlease", "send"}
+       "reopen", "drop", "lease", "unlease", "send", "depends", "pass"}
 
 
 def event_time(event_id: int) -> float:
@@ -72,6 +72,8 @@ class Task:
     via: int = 0  # the bot that posted the latest claim or check-in (it releases a lapsed one)
     result: str = ""
     notes: list[tuple[float, str, str]] = field(default_factory=list)
+    after: list[int] = field(default_factory=list)  # tasks that must be done (or dropped) before this one
+    passes: dict[str, str] = field(default_factory=dict)  # worker -> why it didn't take this task
 
     def lapsed(self, now: float) -> bool:
         return self.status == "claimed" and now - self.checkin_at > CHECKIN_EVERY
@@ -152,6 +154,7 @@ class Worklog:
             num, str(ev.get("title", "")).strip() or "(untitled)", desc=str(ev.get("desc", "")),
             area=str(ev.get("area", "")), files=str(ev.get("files", "")),
             prio=int(ev.get("prio", 2) or 2), created_by=by, created=t, updated=t,
+            after=_nums(ev.get("after")),
         )
         if ev.get("owner"):
             task = self.tasks[num]
@@ -255,6 +258,41 @@ class Worklog:
         self.leases.pop(res, None)
         return True, f"released {res}"
 
+    def _op_depends(self, by, t, ev):
+        task = self._task(ev)
+        if task is None:
+            return False, f"no task #{ev.get('task')}"
+        after = [n for n in _nums(ev.get("after")) if n != task.num]
+        missing = [n for n in after if n not in self.tasks]
+        if missing:
+            return False, f"no task #{missing[0]}"
+        task.after, task.updated = after, t
+        task.notes.append((t, by, "[depends] " + (", ".join(f"#{n}" for n in after) or "nothing")))
+        return True, f"#{task.num} waits on " + (", ".join(f"#{n}" for n in after) or "nothing")
+
+    def _op_pass(self, by, t, ev):
+        task = self._task(ev)
+        text = str(ev.get("text", "")).strip()
+        if task is None:
+            return False, f"no task #{ev.get('task')}"
+        if not text:
+            return False, "say why you don't take it"
+        task.passes[by] = text
+        task.notes.append((t, by, f"[pass] {text}"))
+        return True, f"passed on #{task.num}"
+
+    def waiting_on(self, task: Task) -> list[int]:
+        """The tasks this one waits for that aren't done or dropped yet."""
+        return [n for n in task.after if n in self.tasks and self.tasks[n].status not in ("done", "dropped")]
+
+    def ready(self, worker: str = "") -> list[Task]:
+        """Open tasks nobody holds and nothing blocks, best first; without those `worker` passed on."""
+        base = worker.split("/")[0]
+        return sorted((t for t in self.tasks.values()
+                       if t.status == "open" and not self.waiting_on(t)
+                       and not (worker and (worker in t.passes or base in t.passes))),
+                      key=lambda t: (t.prio, t.num))
+
     def _op_send(self, by, t, ev):
         to = str(ev.get("to", "")).strip()
         text = str(ev.get("text", "")).strip()
@@ -293,6 +331,21 @@ class _Parser(argparse.ArgumentParser):
         raise CommandError(f"{message}\n{self.format_usage()}")
 
 
+def _nums(value) -> list[int]:
+    """Task numbers from a list or a text like "42, #43"."""
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = str(value or "").replace(",", " ").split()
+    out = []
+    for x in items:
+        try:
+            out.append(int(str(x).lstrip("#")))
+        except ValueError:
+            continue
+    return out
+
+
 def _parser() -> _Parser:
     p = _Parser(prog="wl", add_help=False)
     p.add_argument("--as", dest="as_")
@@ -312,7 +365,10 @@ def _parser() -> _Parser:
     sub("add", lambda sp: sp.add_argument("title"), lambda sp: sp.add_argument("--desc", default=""),
         lambda sp: sp.add_argument("--area", default=""), lambda sp: sp.add_argument("--files", default=""),
         lambda sp: sp.add_argument("--prio", type=int, default=2),
-        lambda sp: sp.add_argument("--owner", default=""))
+        lambda sp: sp.add_argument("--owner", default=""), lambda sp: sp.add_argument("--after", default=""))
+    sub("depends", num, lambda sp: sp.add_argument("--on", default=""))
+    sub("pass", num, lambda sp: sp.add_argument("text"))
+    sub("next")
     sub("claim", num, text)
     for name in ("checkin", "ci"):
         sub(name, num, lambda sp: sp.add_argument("text"))
@@ -340,7 +396,9 @@ def _parser() -> _Parser:
 HELP = f"""wl — the shared worklog for every agent on this Discord server (all machines).
   wl status                         workers, open tasks, leases, your unread messages
   wl list [--all] | show N | log [-n 30] | workers
-  wl add "title" [--desc ..] [--area ..] [--files a.py,b.py] [--prio 1-3]
+  wl add "title" [--desc ..] [--area ..] [--files a.py,b.py] [--prio 1-3] [--after 42,43]
+  wl next                           the best open task you can take now
+  wl pass N "why you don't take it"  |  wl depends N --on 42,43  (N waits until they are done)
   wl claim N ["what you're starting, ≤{CHECKIN_WORDS} words"]
   wl checkin N "progress, ≤{CHECKIN_WORDS} words"     at least every {CHECKIN_EVERY // 60} min while you hold N
   wl note N "longer progress, commits, findings"
@@ -356,6 +414,8 @@ def _task_line(t: Task, now: float) -> str:
         ago = int((now - t.checkin_at) / 60)
         owner += f" ({'LAPSED' if t.lapsed(now) else f'{ago}m ago'})"
     progress = f" — {t.progress}" if t.progress and t.status == "claimed" else ""
+    if t.after and t.status == "open":
+        progress += " (after " + ", ".join(f"#{n}" for n in t.after) + ")"
     area = f"[{t.area}] " if t.area else ""
     return f"#{t.num:<3} p{t.prio} {t.status:<8} {owner:<34} {area}{t.title}{progress}"
 
@@ -392,7 +452,19 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         return "", {"op": "register", "by": who, "desc": a.desc, "session": a.session}, []
     if cmd == "add":
         return "", {"op": "add", "by": who, "title": a.title, "desc": a.desc, "area": a.area,
-                    "files": a.files, "prio": a.prio, "owner": a.owner}, []
+                    "files": a.files, "prio": a.prio, "owner": a.owner, "after": _nums(a.after)}, []
+    if cmd == "depends":
+        return "", {"op": "depends", "by": who, "task": a.task, "after": _nums(a.on)}, []
+    if cmd == "pass":
+        return "", {"op": "pass", "by": who, "task": a.task, "text": a.text}, []
+    if cmd == "next":
+        ready = state.ready(who)
+        if not ready:
+            return "(no open task you can take now)", None, []
+        t = ready[0]
+        return (_task_line(t, now) + (f"\n  {t.desc}" if t.desc else "")
+                + f"\nClaim it: wl claim {t.num} \"<what you start>\"   Or say why not: "
+                  f"wl pass {t.num} \"<why>\"", None, [])
     if cmd == "claim":
         if a.text and words(a.text) > CHECKIN_WORDS:
             raise CommandError(f"keep the claim's status to {CHECKIN_WORDS} words")
@@ -435,7 +507,9 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         rows = [("title", t.title), ("status", t.status), ("owner", t.owner),
                 ("progress", t.progress if t.status == "claimed" else ""), ("prio", t.prio),
                 ("area", t.area), ("files", t.files), ("created_by", t.created_by),
-                ("desc", t.desc), ("result", t.result)]
+                ("desc", t.desc), ("result", t.result),
+                ("after", ", ".join(f"#{n}" for n in t.after)),
+                ("waiting on", ", ".join(f"#{n}" for n in state.waiting_on(t)))]
         out = [f"{k:>10}: {v}" for k, v in rows if v not in ("", None)]
         out.append(f"{'created':>10}: {fmt_time(t.created)}   updated: {fmt_time(t.updated)}"
                    + (f"   last check-in: {fmt_time(t.checkin_at)}" if t.status == "claimed" else ""))
@@ -503,6 +577,8 @@ def summary(ev: dict) -> str:
         "release": f"🔓 {by} released #{num}" + (f": {text[:300]}" if text else ""),
         "drop": f"🗑️ {by} dropped #{num}",
         "reopen": f"♻️ {by} reopened #{num}",
+        "depends": f"🔗 #{num} waits on " + (", ".join(f"#{n}" for n in _nums(ev.get("after"))) or "nothing"),
+        "pass": f"↪️ {by} passes on #{num}: {text[:300]}",
         "lease": f"🔑 {by} leases {ev.get('res')} ({ev.get('ttl')}s): {ev.get('why', '')}",
         "unlease": f"🔓 {by} released lease {ev.get('res')}",
         "send": f"✉️ {by} → {ev.get('to')}" + (f" re #{ev['task']}" if ev.get("task") else "")

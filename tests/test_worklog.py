@@ -102,6 +102,37 @@ class StaleTests(unittest.TestCase):
         self.assertTrue(st.is_stale("nobody", T0))
 
 
+class ReadyTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.log = Log()
+        self.log.wl(0, "a", 'add "base" --prio 2')
+        self.log.wl(1, "a", 'add "later" --prio 1 --after 1')
+        self.log.wl(2, "a", 'add "low" --prio 3')
+
+    def test_dependencies_hold_a_task_back_until_done(self):
+        st = self.log.state
+        self.assertEqual([t.num for t in st.ready()], [1, 3])
+        self.assertEqual(st.waiting_on(st.tasks[2]), [1])
+        self.log.wl(3, "b", "claim 1")
+        self.log.wl(4, "b", 'done 1 "ok"')
+        self.assertEqual([t.num for t in st.ready()], [2, 3])  # p1 first
+
+    def test_pass_hides_a_task_from_that_worker_and_its_subagents(self):
+        self.assertTrue(self.log.wl(3, "b", 'pass 1 "other project"')[0])
+        self.assertEqual([t.num for t in self.log.state.ready("b/sub-1")], [3])
+        self.assertEqual([t.num for t in self.log.state.ready("c")], [1, 3])
+        self.assertIn("other project", self.log.state.tasks[1].passes["b"])
+        self.assertFalse(self.log.post(4, {"op": "pass", "by": "b", "task": 3, "text": ""})[0])
+
+    def test_depends_and_next(self):
+        self.assertTrue(self.log.wl(3, "a", "depends 3 --on 1,2")[0])
+        self.assertEqual([t.num for t in self.log.state.ready()], [1])
+        text = run_command(self.log.state, "next", "c", set())[0]
+        self.assertIn("#1", text)
+        self.assertIn("wl claim 1", text)
+        self.assertFalse(self.log.wl(4, "a", "depends 3 --on 99")[0])
+
+
 class LeaseAndMessageTests(unittest.TestCase):
     def test_lease_exclusive_until_expiry(self):
         log = Log()

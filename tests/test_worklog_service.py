@@ -143,6 +143,22 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mail), 1)
         self.assertIn("released", mail[0].text)
 
+    async def test_idle_agents_are_offered_open_tasks_once(self):
+        await self.a.run(["add", "Fix lists", "--prio", "1", "--area", "x"], "alice@m1")
+        await self.a.run(["add", "Port tool", "--prio", "1"], "alice@m1")
+        await asyncio.sleep(0.3)
+        later = time.time() + 1
+        self.a.idle_for = lambda w: 20 * 60
+        plan = self.a._offer_plan(later)
+        self.assertEqual([(w, t.num) for w, t in plan], [("alice@m1", 1)])  # "x" is in alice's folder /x
+        await self.a._offer_work()
+        self.assertEqual(self.delivered[-1][:3], (1, "alice@m1", "harness:offer"))
+        self.assertIn("wl claim 1", self.delivered[-1][3])
+        self.assertEqual(self.a._offer_plan(time.time()), [])  # one offer per agent per OFFER_GAP
+        self.a.idle_for = lambda w: 60  # idle only a minute: no offer
+        self.a._offered.clear()
+        self.assertEqual(self.a._offer_plan(time.time()), [])
+
     async def test_late_event_triggers_replay(self):
         now = time.time()
         sid = lambda t, s: (int(t * 1000) - EPOCH_MS) << 22 | s  # noqa: E731

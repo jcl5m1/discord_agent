@@ -100,6 +100,8 @@ _global_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TURNS)
 # Turns currently running, keyed by channel id. Feeds the in-channel progress
 # updates and the heartbeat file the watchdog process monitors.
 _active_turns: dict[int, dict] = {}
+# When each channel's last turn ended (for worklog offers to idle agents).
+_turn_ended: dict[int, float] = {}
 # Channels whose current turn is a resume after a restart: how many resumes in a row (harness/resume.py).
 _resume_counts: dict[int, int] = {}
 # Most recent channel with user activity; the watchdog's fallback alert target.
@@ -350,6 +352,11 @@ shared worklog with the `wl` command (on your PATH; you are worker {worker}).
   the task, and you show as stale; claim it again if you're still on it.
 - Finish with `wl done <id> "<result, commits>"`, `wl block <id> "<what you need>"`
   or `wl release <id>`. Use `wl note <id> "..."` for longer progress notes.
+- Open tasks are everyone's work. When you finish a task and hold no claim, run
+  `wl next` and take the task it shows (or give it to a subagent). When you are
+  idle, the harness also offers you the best open task. If a task is not yours
+  to do, say why: `wl pass <id> "<why>"`. If it waits on other tasks:
+  `wl depends <id> --on <ids>`. Add new work with `--after <ids>` when it waits.
 - Shared resources (the GPU, a repo during a rebase, a service restart):
   `wl lease <name> --ttl 3600 --why "..."`, then `wl unlease <name>`.
 - Messages: `wl send <worker|all> "text" [--task <id>]`. The harness delivers
@@ -370,7 +377,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 3
+BRIEF_VERSION = 4
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it
@@ -702,6 +709,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         stop_view.stop()
         interrupt_wait.cancel()
         _active_turns.pop(inst.channel_id, None)
+        _turn_ended[inst.channel_id] = time.time()
         progress.cancel()
         # Messages sent into the turn that the agent never read: after an
         # interrupt they're dropped like the rest of the queue; otherwise they
@@ -733,7 +741,7 @@ async def on_ready() -> None:
         asyncio.get_running_loop().create_task(_catch_up(inst))
     global worklog
     if config.WORKLOG_ENABLED and worklog is None and (g := client.get_guild(config.GUILD_ID)):
-        worklog = WorklogService(client, _worklog_deliver, _worklog_notify)
+        worklog = WorklogService(client, _worklog_deliver, _worklog_notify, _worklog_idle_for)
         asyncio.get_running_loop().create_task(_start_worklog(g))
     elif worklog is not None and worklog.ready.is_set():
         asyncio.get_running_loop().create_task(worklog.resync())  # after a reconnect
@@ -824,6 +832,30 @@ async def _worklog_notify(worker: str, text: str) -> None:
         await channel.send(text[:DISCORD_MSG_LIMIT])
 
 
+def _worklog_idle_for(worker: str) -> float | None:
+    """Seconds this worker's agent has been idle; None if it is busy, stopped, or unused lately."""
+    inst = _instance_for_worker(worker)
+    if inst is None or inst.stopped or inst.channel_id in _active_turns:
+        return None
+    lock = _channel_locks.get(inst.channel_id)
+    if lock is not None and lock.locked():
+        return None
+    last_user = _snowflake_time(inst.last_message_id)
+    if last_user is None or time.time() - last_user > config.WORKLOG_OFFER_ACTIVE_DAYS * 86400:
+        return None  # nobody has used this channel lately: don't wake it
+    return time.time() - max(last_user, _turn_ended.get(inst.channel_id, 0), _BOOT)
+
+
+def _snowflake_time(message_id: str | int | None) -> float | None:
+    try:
+        return ((int(message_id) >> 22) + 1420070400000) / 1000
+    except (TypeError, ValueError):
+        return None
+
+
+_BOOT = time.time()
+
+
 async def _worklog_deliver(worker: str, sender: str, text: str) -> None:
     """Hand a worklog message to the agent: into its running turn, or as a new turn."""
     inst = _instance_for_worker(worker)
@@ -832,6 +864,8 @@ async def _worklog_deliver(worker: str, sender: str, text: str) -> None:
         return
     if sender == "harness":
         prompt, shown = f"[Worklog reminder] {text}", f"⏰ {text}"
+    elif sender == "harness:offer":
+        prompt, shown = f"[Worklog: open task for you]\n{text}", f"📥 **worklog**: {text.splitlines()[0]}"
     else:
         prompt = (f"[Worklog message from {sender}]\n{text}\n"
                   f'(Reply with `wl send {sender} "..."` if it needs an answer; don\'t reply to acks.)')

@@ -422,6 +422,15 @@ provides it, so sessions don't each build their own.
   (or by any bot an hour later, if that one is down), and the session gets a message
   saying so. `wl status` shows a worker as stale after 30 minutes without activity,
   or while it holds a lapsed claim.
+- **Open work is pulled, not left waiting.** A task is *ready* when it is open
+  and every task it waits on (`--after`, `wl depends N --on 42,43`) is done or
+  dropped. `wl next` shows the best ready task. Each minute, the harness looks for
+  its agents that are idle for 10 minutes, hold no claim, and had a user message
+  in the last 2 days (`WORKLOG_OFFER_ACTIVE_DAYS`). It offers each one the best
+  ready task, preferring a task whose area matches the agent's name or folder: at
+  most one offer per agent per hour, and one agent per task for 30 minutes. The
+  agent claims it, or says why not with `wl pass N "<why>"`; a pass hides the task
+  from that agent and its subagents. `WORKLOG_OFFERS=0` turns offers off.
 - **Mail:** `wl send <worker|all> "…"`. The harness delivers a direct message to its
   agent, into the running turn or as a new turn (at most 12 per agent per hour, so
   two agents can't ping-pong forever); messages to `all` wait in inboxes.

@@ -123,6 +123,10 @@ WORKLOG_ENABLED: bool = os.environ.get("WORKLOG_ENABLED", "true").lower() not in
 WORKLOG_CHANNEL: str = os.environ.get("WORKLOG_CHANNEL", "worklog")
 # Local port for agents' `wl` command (outside the 8100-8999 agent server range).
 WORKLOG_PORT: int = int(os.environ.get("WORKLOG_PORT", "8091"))
+# Offer the best open, unblocked task to an agent that is idle with no claim (worklog_service._offer_work).
+# Only agents with user activity in the last WORKLOG_OFFER_ACTIVE_DAYS days are offered work.
+WORKLOG_OFFERS: bool = os.environ.get("WORKLOG_OFFERS", "1").lower() not in ("0", "false", "no", "off")
+WORKLOG_OFFER_ACTIVE_DAYS: float = float(os.environ.get("WORKLOG_OFFER_ACTIVE_DAYS", "2"))
 
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
 # Seconds between internet checks; only state changes are logged.
