@@ -148,17 +148,19 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         await self.a.run(["add", "Port tool", "--prio", "1"], "alice@m1")  # no area: offered to nobody
         await self.a.run(["add", "Other project", "--prio", "1", "--area", "y"], "alice@m1")
         await asyncio.sleep(0.3)
-        later = time.time() + 1
         self.a.idle_for = lambda w: 20 * 60
+        self.assertEqual(self.a._offer_plan(time.time()), [])  # just added: its creator may add dependencies
+        later = time.time() + svc.OFFER_NEW_AFTER + 1
         plan = self.a._offer_plan(later)
         self.assertEqual([(w, t.num) for w, t in plan], [("alice@m1", 1)])  # "x" is in alice's folder /x
-        await self.a._offer_work()
+        with mock.patch.object(svc.time, "time", return_value=later):
+            await self.a._offer_work()
         self.assertEqual(self.delivered[-1][:3], (1, "alice@m1", "harness:offer"))
         self.assertIn("wl claim 1", self.delivered[-1][3])
-        self.assertEqual(self.a._offer_plan(time.time()), [])  # one offer per agent per OFFER_GAP
+        self.assertEqual(self.a._offer_plan(later), [])  # one offer per agent per OFFER_GAP
         self.a.idle_for = lambda w: 60  # idle only a minute: no offer
         self.a._offered.clear()
-        self.assertEqual(self.a._offer_plan(time.time()), [])
+        self.assertEqual(self.a._offer_plan(later), [])
 
     async def test_after_a_restart_the_agent_hears_of_its_subagents_claims(self):
         await self.b.run(["add", "Long build"], "bob@m2")

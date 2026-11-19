@@ -42,6 +42,7 @@ WAKE_LIMIT = 12  # deliveries that start a turn, per worker per hour
 OFFER_AFTER = 10 * 60  # an agent idle this long with no claim is offered the best open task
 OFFER_WAIT = 30 * 60  # a task offered to one agent isn't offered to another for this long
 OFFER_GAP = 60 * 60  # at most one offer per agent per this long
+OFFER_NEW_AFTER = 120  # a task is offered only this long after it was added (time to add its dependencies)
 
 
 class WorklogService:
@@ -319,6 +320,7 @@ class WorklogService:
             # Only tasks in this agent's own project areas: other projects' work would fill its context.
             keys = area_keys(self.state.workers[w], config.WORKLOG_AREA_ALIASES) if w in self.state.workers else set()
             choices = [t for t in self.state.ready(w) if t.num not in taken and area_matches(t.area, keys)
+                       and now - t.created >= OFFER_NEW_AFTER
                        and not (t.num in self._offers and self._offers[t.num][0] != w
                                 and now - self._offers[t.num][1] < OFFER_WAIT)]
             if choices:
