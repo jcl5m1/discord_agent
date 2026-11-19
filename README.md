@@ -14,7 +14,11 @@ Discord — designed for driving agents from your phone.
 - **Background work survives the reply.** An agent's subagents and background commands keep
   running after it replies: while the CLI reports background tasks, the harness keeps the turn's
   input open. With its input closed, the Claude CLI exits at the end of its next turn (for example
-  the turn that reports a finished subagent) and stops every background task still running. The turn gives its concurrency slot back meanwhile, and messages sent to
+  the turn that reports a finished subagent) and stops every background task still running.
+  While a turn only waits for background tasks it posts no "still working" notes, it is listed
+  under `background_turns` (not `turns`) in `data/heartbeat.json`, and `/update` treats it as
+  idle (the restart resumes it). A message sent then goes into the session, and the turn takes
+  its slot back while the agent answers. The turn gives its concurrency slot back meanwhile, and messages sent to
   the channel go into the running session. Input closes when no background task is left, or after
   `BACKGROUND_WAIT_MAX_HOURS` (12).
 - **Work cut off by a restart resumes by itself.** A turn lasts as long as the agent's
