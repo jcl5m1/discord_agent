@@ -175,6 +175,7 @@ class Recorder:
         self.last_incident = 0.0
         self.incident_dir: Path | None = None
         self.last_event: dict[object, float] = {}  # Xid code (or "other") -> time logged
+        self.lost = False  # the GPU fell off the bus: later errors are its echo, not new incidents
         self._file = None
         self._file_path: Path | None = None
         self._last_sync = 0.0
@@ -204,6 +205,8 @@ class Recorder:
             log.warning("nvidia-smi: %s", line.strip()[:200])
             return
         t = _parse_time(row[0]) or time.time()
+        if "GPU is lost" not in line:
+            self.lost = False  # it answers again (after a reset or reboot)
         self._write_sample(t, row)
         if int(t // 60) != int(self.minute_start // 60) and self.minute:
             self._write_minute()
@@ -263,7 +266,15 @@ class Recorder:
         if not KERNEL_PATTERN.search(line):
             return
         t = t or time.time()
+        if self.lost and not XID.search(line):
+            # The GPU is already gone: these are echoes. Keep them in the open report; no new event or report.
+            if self.incident_dir and t - self.last_incident <= INCIDENT_GAP:
+                with (self.incident_dir / "kernel.log").open("a") as f:
+                    f.write(line.rstrip() + "\n")
+            return
         m = XID.search(line)
+        if (m and m.group(2) == "79") or "fallen off the bus" in line:
+            self.lost = True
         key = int(m.group(2)) if m else "other"
         if t - self.last_event.get(key, 0) > INCIDENT_GAP:  # one event per kind per gap
             self.last_event[key] = t
