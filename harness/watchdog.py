@@ -34,7 +34,6 @@ import urllib.request
 
 from . import config, disk, health, logfile
 
-logfile.setup("watchdog")
 log = logging.getLogger("discord_agent.watchdog")
 
 
@@ -133,6 +132,7 @@ def _check_health(prev: str, now: float) -> str:
 
 
 def main() -> None:
+    logfile.setup("watchdog")  # here, not at import: tests import this module
     if not config.BOT_TOKEN:
         raise SystemExit("DISCORD_BOT_TOKEN is not set — copy .env.example to .env and fill it in")
     log.info(

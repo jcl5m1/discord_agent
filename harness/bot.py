@@ -1017,8 +1017,14 @@ async def _health_loop() -> None:
 def _worklog_idle_for(worker: str) -> float | None:
     """Seconds this worker's agent has been idle; None if it is busy, stopped, or unused lately."""
     inst = _instance_for_worker(worker)
-    if inst is None or inst.stopped or inst.channel_id in _active_turns:
+    if inst is None or inst.stopped:
         return None
+    turn = _active_turns.get(inst.channel_id)
+    if turn is not None:
+        # A turn that only waits for its background subagents counts as idle: the offer goes into it.
+        if not turn.get("waiting_background"):
+            return None
+        return time.time() - turn.get("last_event_at", time.time())
     if inst.provider == "claude" and limits.resume_at():
         return None  # waiting for the usage limit to reset
     lock = _channel_locks.get(inst.channel_id)
