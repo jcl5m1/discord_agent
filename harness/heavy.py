@@ -17,7 +17,9 @@ Every agent on the machine shares it, so jobs stop colliding:
   the Docker containers labelled heavy.unit=$HEAVY_UNIT (start them with `--label heavy.unit=$HEAVY_UNIT`
   and a `--memory` limit: containers run outside the scope). If heavy itself is killed hard, the next
   heavy run or the uptime monitor's sweep stops what it left.
-- Log: one line per job in data/heavy/jobs.jsonl (who, class, command, wait, peak memory, exit code).
+- Log: one line per job in data/heavy/jobs.jsonl: who, class, command, wait and wall time, exit
+  code, and the scope's totals (peak memory, CPU seconds, MiB read and written), sampled every
+  POLL seconds, so a job shorter than that has no totals.
 
 Exit code: the job's; 75 if it waited longer than --max-wait; 2 for a usage error.
 """
@@ -163,12 +165,32 @@ def sweep() -> list[str]:
 
 
 # ------------------------------------------------------------- running
-def _peak(pid: int) -> int:
+def _usage(pid: int) -> dict:
+    """The job's scope totals so far: peak memory, CPU seconds, bytes read and written."""
+    out: dict = {}
     try:
-        cg = Path(f"/proc/{pid}/cgroup").read_text().split(":", 2)[2].strip()
-        return int(Path(f"/sys/fs/cgroup{cg}/memory.peak").read_text())
-    except (OSError, ValueError, IndexError):
-        return 0
+        cg = Path("/sys/fs/cgroup" + Path(f"/proc/{pid}/cgroup").read_text().split(":", 2)[2].strip())
+    except (OSError, IndexError):
+        return out
+    try:
+        out["peak"] = int((cg / "memory.peak").read_text())
+    except (OSError, ValueError):
+        pass
+    try:
+        cpu = dict(line.split() for line in (cg / "cpu.stat").read_text().splitlines())
+        out["cpu_s"] = round(int(cpu.get("usage_usec", 0)) / 1e6, 1)
+    except (OSError, ValueError):
+        pass
+    try:
+        rd = wr = 0
+        for line in (cg / "io.stat").read_text().splitlines():
+            fields = dict(f.split("=") for f in line.split()[1:] if "=" in f)
+            rd += int(fields.get("rbytes", 0))
+            wr += int(fields.get("wbytes", 0))
+        out["read"], out["written"] = rd, wr
+    except (OSError, ValueError):
+        pass
+    return out
 
 
 def _log(rec: dict) -> None:
@@ -220,7 +242,7 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
         except OSError:
             pass
 
-    rc, peak = 1, 0
+    rc, use = 1, {}
     proc = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", unit,
                              *props, "--", *cmd], env=env, preexec_fn=pdeathsig)
 
@@ -235,7 +257,8 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
                 rc = proc.wait(timeout=POLL)
                 break
             except subprocess.TimeoutExpired:
-                peak = max(peak, _peak(proc.pid))
+                now = _usage(proc.pid)  # the scope is gone once the job ends: keep the last sample
+                use = {k: max(v, use.get(k, 0)) for k, v in now.items()} or use
     finally:
         if proc.poll() is None:
             _stop_unit(unit)
@@ -244,8 +267,10 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
         else:
             _stop_unit(unit)  # what the job left running in its scope or in labelled containers
         slot.release()
-        _log({**info, "class": cls, "end": time.time(), "waited_s": round(waited), "rc": rc,
-              "peak_mib": peak // 1048576, "mem": mem})
+        _log({**info, "class": cls, "end": time.time(), "wall_s": round(time.time() - info["since"] - waited),
+              "waited_s": round(waited), "rc": rc, "mem": mem, "peak_mib": use.get("peak", 0) // 1048576,
+              "cpu_s": use.get("cpu_s"), "read_mib": use.get("read", 0) // 1048576,
+              "written_mib": use.get("written", 0) // 1048576})
     return rc
 
 
