@@ -141,6 +141,8 @@ GDOC_SHARE_FILE: Path = Path(os.path.expanduser(
     os.environ.get("GDOC_SHARE_FILE", "") or "~/.config/discord-agent/gdoc_share"))
 GDOC_WEB_REGISTRY: Path | None = (Path(os.path.expanduser(os.environ["GDOC_WEB_REGISTRY"]))
                                   if os.environ.get("GDOC_WEB_REGISTRY") else None)
+# Memory recorder in the uptime monitor (harness/memmon.py): top processes by memory, each minute.
+MEM_MONITOR: bool = os.environ.get("MEM_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.
