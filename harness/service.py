@@ -48,6 +48,9 @@ Environment=PATH={path}
 ExecStart={python} -m harness.bot
 Restart=on-failure
 RestartSec=5
+# Agents run builds and tools inside this unit. When the kernel kills one of them for lack of memory, only that
+# process dies; the default (stop) would stop the harness and every agent session with it.
+OOMPolicy=continue
 
 [Install]
 WantedBy=default.target
