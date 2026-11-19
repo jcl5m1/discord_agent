@@ -429,6 +429,11 @@ provides it, so sessions don't each build their own.
   in the last 2 days (`WORKLOG_OFFER_ACTIVE_DAYS`). It offers each one the best
   ready task, preferring a task whose area matches the agent's name or folder: at
   most one offer per agent per hour, and one agent per task for 30 minutes. The
+  agent is offered only tasks in its own areas, so other projects' work never
+  enters its context: its folder's name, its name, the areas it adds with
+  `wl areas a,b,c`, and `WORKLOG_AREA_ALIASES` (default `discord_agent=harness`).
+  An area matches an area that extends it (`placeframe` ~ `placeframe-insta360`).
+  A task with no area is offered to nobody, so give each task an `--area`. The
   agent claims it, or says why not with `wl pass N "<why>"`; a pass hides the task
   from that agent and its subagents. `WORKLOG_OFFERS=0` turns offers off.
 - **Mail:** `wl send <worker|all> "…"`. The harness delivers a direct message to its

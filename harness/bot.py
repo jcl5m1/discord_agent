@@ -352,10 +352,13 @@ shared worklog with the `wl` command (on your PATH; you are worker {worker}).
   the task, and you show as stale; claim it again if you're still on it.
 - Finish with `wl done <id> "<result, commits>"`, `wl block <id> "<what you need>"`
   or `wl release <id>`. Use `wl note <id> "..."` for longer progress notes.
-- Open tasks are everyone's work. When you finish a task and hold no claim, run
-  `wl next` and take the task it shows (or give it to a subagent). When you are
-  idle, the harness also offers you the best open task. If a task is not yours
-  to do, say why: `wl pass <id> "<why>"`. If it waits on other tasks:
+- Open tasks in your project are your work. When you finish a task and hold no
+  claim, run `wl next` and take the task it shows (or give it to a subagent).
+  When you are idle, the harness also offers you the best open task in your
+  areas. Your areas are your folder's name and your name; add the other areas
+  of your project once: `wl areas <a,b,c>` (see the areas in `wl list`). Give
+  every new task an area: `wl add "..." --area <project or part>`. If a task is
+  not yours to do, say why: `wl pass <id> "<why>"`. If it waits on other tasks:
   `wl depends <id> --on <ids>`. Add new work with `--after <ids>` when it waits.
 - Shared resources (the GPU, a repo during a rebase, a service restart):
   `wl lease <name> --ttl 3600 --why "..."`, then `wl unlease <name>`.
@@ -377,7 +380,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 4
+BRIEF_VERSION = 5
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it

@@ -52,6 +52,7 @@ class Worker:
     desc: str = ""
     session: str = ""
     seen: float = 0.0
+    areas: list[str] = field(default_factory=list)  # extra task areas it takes work in (`wl areas`)
 
 
 @dataclass
@@ -146,6 +147,9 @@ class Worklog:
         for key in ("bot", "channel"):
             if ev.get(key):
                 setattr(w, key, int(ev[key]))
+        if isinstance(ev.get("areas"), list):
+            w.areas = [norm_area(a) for a in ev["areas"] if norm_area(a)]
+            return True, f"{by} works in: " + (", ".join(w.areas) or "(its folder and name only)")
         return True, "registered"
 
     def _op_add(self, by, t, ev):
@@ -331,6 +335,28 @@ class _Parser(argparse.ArgumentParser):
         raise CommandError(f"{message}\n{self.format_usage()}")
 
 
+def norm_area(area: str) -> str:
+    return "-".join("".join(c if c.isalnum() else " " for c in str(area).lower()).split())
+
+
+def area_keys(worker: Worker, aliases: dict[str, str] | None = None) -> set[str]:
+    """The task areas a worker takes work in: its folder's name, its name, and `wl areas`."""
+    keys = {norm_area(worker.name.split("@")[0].split("/")[0])}
+    if " in " in worker.desc:
+        folder = worker.desc.split(" in ", 1)[1].strip().rstrip("/").rsplit("/", 1)[-1]
+        keys.add(norm_area(folder))
+    keys |= set(worker.areas)
+    alias = {norm_area(k): norm_area(v) for k, v in (aliases or {}).items()}
+    keys |= {alias[k] for k in keys if k in alias}
+    return {k for k in keys if k}
+
+
+def area_matches(area: str, keys: set[str]) -> bool:
+    """A task area matches a key that equals it or extends it ("placeframe" ~ "placeframe-insta360")."""
+    a = norm_area(area)
+    return bool(a) and any(a == k or k.startswith(a + "-") or a.startswith(k + "-") for k in keys)
+
+
 def _nums(value) -> list[int]:
     """Task numbers from a list or a text like "42, #43"."""
     if isinstance(value, (list, tuple)):
@@ -369,6 +395,7 @@ def _parser() -> _Parser:
     sub("depends", num, lambda sp: sp.add_argument("--on", default=""))
     sub("pass", num, lambda sp: sp.add_argument("text"))
     sub("next")
+    sub("areas", lambda sp: sp.add_argument("list", nargs="?"))
     sub("claim", num, text)
     for name in ("checkin", "ci"):
         sub(name, num, lambda sp: sp.add_argument("text"))
@@ -397,7 +424,8 @@ HELP = f"""wl — the shared worklog for every agent on this Discord server (all
   wl status                         workers, open tasks, leases, your unread messages
   wl list [--all] | show N | log [-n 30] | workers
   wl add "title" [--desc ..] [--area ..] [--files a.py,b.py] [--prio 1-3] [--after 42,43]
-  wl next                           the best open task you can take now
+  wl next                           the best open task in your areas
+  wl areas [a,b,c]                  show or set the extra task areas you take work in
   wl pass N "why you don't take it"  |  wl depends N --on 42,43  (N waits until they are done)
   wl claim N ["what you're starting, ≤{CHECKIN_WORDS} words"]
   wl checkin N "progress, ≤{CHECKIN_WORDS} words"     at least every {CHECKIN_EVERY // 60} min while you hold N
@@ -457,8 +485,18 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         return "", {"op": "depends", "by": who, "task": a.task, "after": _nums(a.on)}, []
     if cmd == "pass":
         return "", {"op": "pass", "by": who, "task": a.task, "text": a.text}, []
+    if cmd == "areas":
+        if a.list is None:
+            w = state.workers.get(who)
+            from . import config
+            keys = sorted(area_keys(w, config.WORKLOG_AREA_ALIASES)) if w else []
+            return f"{who} takes tasks in: " + (", ".join(keys) or "(none)"), None, []
+        return "", {"op": "register", "by": who, "areas": [x for x in a.list.replace(",", " ").split()]}, []
     if cmd == "next":
-        ready = state.ready(who)
+        w = state.workers.get(who.split("/")[0]) or state.workers.get(who)
+        from . import config  # lazy: this module is otherwise free of harness settings
+        keys = area_keys(w, config.WORKLOG_AREA_ALIASES) if w else set()
+        ready = [t for t in state.ready(who) if area_matches(t.area, keys)]
         if not ready:
             return "(no open task you can take now)", None, []
         t = ready[0]

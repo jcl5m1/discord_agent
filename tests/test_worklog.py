@@ -105,9 +105,10 @@ class StaleTests(unittest.TestCase):
 class ReadyTaskTests(unittest.TestCase):
     def setUp(self):
         self.log = Log()
-        self.log.wl(0, "a", 'add "base" --prio 2')
-        self.log.wl(1, "a", 'add "later" --prio 1 --after 1')
-        self.log.wl(2, "a", 'add "low" --prio 3')
+        self.log.wl(0, "a", 'add "base" --prio 2 --area x')
+        self.log.wl(1, "a", 'add "later" --prio 1 --after 1 --area x')
+        self.log.wl(2, "a", 'add "low" --prio 3 --area x')
+        self.log.wl(2, "c", "areas x")
 
     def test_dependencies_hold_a_task_back_until_done(self):
         st = self.log.state
@@ -131,6 +132,32 @@ class ReadyTaskTests(unittest.TestCase):
         self.assertIn("#1", text)
         self.assertIn("wl claim 1", text)
         self.assertFalse(self.log.wl(4, "a", "depends 3 --on 99")[0])
+
+
+class AreaTests(unittest.TestCase):
+    def test_keys_and_matching(self):
+        from harness.worklog import Worker, area_keys, area_matches
+        w = Worker("placeframe-compute@m", desc="claude in /home/u/github/placeframe-insta360", areas=["localizer"])
+        keys = area_keys(w)
+        self.assertEqual(keys, {"placeframe-compute", "placeframe-insta360", "localizer"})
+        self.assertTrue(area_matches("placeframe", keys))  # extends "placeframe-..."
+        self.assertTrue(area_matches("Localizer", keys))
+        self.assertFalse(area_matches("harness", keys))
+        self.assertFalse(area_matches("", keys))  # no area: nobody's
+        h = Worker("harness-2@m", desc="claude in /x/discord_agent")
+        self.assertTrue(area_matches("harness", area_keys(h)))
+        self.assertTrue(area_matches("harness", area_keys(Worker("bot@m", desc="claude in /x/discord_agent"),
+                                                           {"discord_agent": "harness"})))
+
+    def test_wl_areas_and_next(self):
+        log = Log()
+        log.wl(0, "a", 'add "harness work" --area harness')
+        log.wl(0, "a", 'add "app work" --area app')
+        log.wl(1, "pf@m", "register")
+        self.assertIn("no open task", run_command(log.state, "next", "pf@m", set())[0])
+        self.assertTrue(log.wl(2, "pf@m", "areas app,maps")[0])
+        self.assertIn("#2", run_command(log.state, "next", "pf@m", set())[0])
+        self.assertIn("app", run_command(log.state, "areas", "pf@m", set())[0])
 
 
 class LeaseAndMessageTests(unittest.TestCase):

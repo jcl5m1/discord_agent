@@ -145,7 +145,8 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idle_agents_are_offered_open_tasks_once(self):
         await self.a.run(["add", "Fix lists", "--prio", "1", "--area", "x"], "alice@m1")
-        await self.a.run(["add", "Port tool", "--prio", "1"], "alice@m1")
+        await self.a.run(["add", "Port tool", "--prio", "1"], "alice@m1")  # no area: offered to nobody
+        await self.a.run(["add", "Other project", "--prio", "1", "--area", "y"], "alice@m1")
         await asyncio.sleep(0.3)
         later = time.time() + 1
         self.a.idle_for = lambda w: 20 * 60

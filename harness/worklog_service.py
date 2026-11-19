@@ -31,7 +31,8 @@ import discord
 from aiohttp import web
 
 from . import config
-from .worklog import CHECKIN_EVERY, CommandError, Worklog, decode, encode, fmt_time, run_command, summary
+from .worklog import (CHECKIN_EVERY, CommandError, Worklog, area_keys, area_matches, decode, encode, fmt_time,
+                      run_command, summary)
 
 log = logging.getLogger("discord_agent.worklog")
 
@@ -302,8 +303,8 @@ class WorklogService:
 
     def _offer_plan(self, now: float) -> list[tuple[str, object]]:
         """(worker, task) offers to make now: each idle agent of this bot with no claim gets the best open,
-        unblocked task it hasn't passed on, if no other agent was offered that task in the last OFFER_WAIT.
-        An agent whose task area matches its name or folder goes first."""
+        unblocked task in its own areas (folder, name, `wl areas`) that it hasn't passed on, if no other agent
+        was offered that task in the last OFFER_WAIT. Tasks with no area are offered to nobody."""
         if self.idle_for is None:
             return []
         idle = []
@@ -315,11 +316,11 @@ class WorklogService:
                 idle.append(w)
         plan, taken = [], set()
         for w in idle:
-            here = f"{w} {self.state.workers[w].desc}".lower() if w in self.state.workers else w.lower()
-            choices = [t for t in self.state.ready(w) if t.num not in taken
+            # Only tasks in this agent's own project areas: other projects' work would fill its context.
+            keys = area_keys(self.state.workers[w], config.WORKLOG_AREA_ALIASES) if w in self.state.workers else set()
+            choices = [t for t in self.state.ready(w) if t.num not in taken and area_matches(t.area, keys)
                        and not (t.num in self._offers and self._offers[t.num][0] != w
                                 and now - self._offers[t.num][1] < OFFER_WAIT)]
-            choices.sort(key=lambda t: (t.prio, not (t.area and t.area.lower() in here), t.num))
             if choices:
                 plan.append((w, choices[0]))
                 taken.add(choices[0].num)

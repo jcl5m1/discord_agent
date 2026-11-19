@@ -126,6 +126,10 @@ WORKLOG_PORT: int = int(os.environ.get("WORKLOG_PORT", "8091"))
 # Offer the best open, unblocked task to an agent that is idle with no claim (worklog_service._offer_work).
 # Only agents with user activity in the last WORKLOG_OFFER_ACTIVE_DAYS days are offered work.
 WORKLOG_OFFERS: bool = os.environ.get("WORKLOG_OFFERS", "1").lower() not in ("0", "false", "no", "off")
+# Task areas that mean the same project, as folder=area pairs ("discord_agent=harness").
+WORKLOG_AREA_ALIASES: dict[str, str] = dict(
+    pair.split("=", 1) for pair in os.environ.get("WORKLOG_AREA_ALIASES", "discord_agent=harness").split(",")
+    if "=" in pair)
 WORKLOG_OFFER_ACTIVE_DAYS: float = float(os.environ.get("WORKLOG_OFFER_ACTIVE_DAYS", "2"))
 
 # --- Uptime log (discord-agent-uptime.service, /uptime) ---
