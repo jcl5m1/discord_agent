@@ -159,6 +159,20 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.a._offered.clear()
         self.assertEqual(self.a._offer_plan(time.time()), [])
 
+    async def test_after_a_restart_the_agent_hears_of_its_subagents_claims(self):
+        await self.b.run(["add", "Long build"], "bob@m2")
+        await self.b.run(["claim", "1"], "bob@m2/sub-1")
+        await self.b.run(["add", "Other"], "bob@m2")
+        await self.b.run(["claim", "2"], "bob@m2")  # the agent's own claim: not listed
+        await asyncio.sleep(0.3)
+        self.assertEqual({w: [t.num for t in ts] for w, ts in self.b.orphaned_subagents().items()},
+                         {"bob@m2": [1]})
+        self.assertEqual(self.a.orphaned_subagents(), {})  # bob runs on bot b
+        await self.b._after_restart(delay=0)
+        (bot, worker, sender, text) = self.delivered[-1]
+        self.assertEqual((bot, worker, sender), (2, "bob@m2", "harness"))
+        self.assertIn("#1 Long build (held by bob@m2/sub-1", text)
+
     async def test_late_event_triggers_replay(self):
         now = time.time()
         sid = lambda t, s: (int(t * 1000) - EPOCH_MS) << 22 | s  # noqa: E731

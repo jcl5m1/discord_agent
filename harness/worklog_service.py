@@ -31,7 +31,7 @@ import discord
 from aiohttp import web
 
 from . import config
-from .worklog import CHECKIN_EVERY, CommandError, Worklog, decode, encode, run_command, summary
+from .worklog import CHECKIN_EVERY, CommandError, Worklog, decode, encode, fmt_time, run_command, summary
 
 log = logging.getLogger("discord_agent.worklog")
 
@@ -122,6 +122,7 @@ class WorklogService:
                  self.channel.name, len(self.state.history), len(self.state.tasks),
                  len(self.state.workers))
         asyncio.get_running_loop().create_task(self._duty_loop())
+        asyncio.get_running_loop().create_task(self._after_restart())
         await self._serve()
 
     async def _find_channel(self, guild: discord.Guild) -> discord.TextChannel:
@@ -262,6 +263,32 @@ class WorklogService:
             return
         await self.post({"op": "register", "by": worker, "bot": me, "channel": channel_id,
                          "machine": self.machine, "session": session, "desc": desc})
+
+    def orphaned_subagents(self) -> dict[str, list]:
+        """For each agent of this bot, the tasks its subagents (`<agent>/sub-N`) still hold. At startup these
+        subagents are gone: they ran inside the agent's process, which the restart stopped."""
+        mine = self.my_workers()
+        out: dict[str, list] = {}
+        for task in sorted(self.state.tasks.values(), key=lambda t: t.num):
+            parent = task.owner.split("/")[0]
+            if task.status == "claimed" and "/" in task.owner and parent in mine:
+                out.setdefault(parent, []).append(task)
+        return out
+
+    async def _after_restart(self, delay: float = 45) -> None:
+        # After the resume turns have started, so the message goes into them where there is one.
+        await asyncio.sleep(delay)
+        for worker, tasks in self.orphaned_subagents().items():
+            lines = "\n".join(f"- #{t.num} {t.title} (held by {t.owner}, last check-in {fmt_time(t.checkin_at)})"
+                              for t in tasks)
+            log.info("worklog: telling %s about %d subagent claims cut off by the restart", worker, len(tasks))
+            await self.deliver(worker, "harness", (
+                "The harness restarted, and that stopped your background subagents. "
+                f"They still hold these claims:\n{lines}\n"
+                "For each one, start a new subagent on it at once, with the same `--as` name, and tell it to "
+                "read the task notes and continue. If you don't continue a task, release it: "
+                '`wl release <id> --as <name>`. Run long jobs as systemd units, not inside a subagent, '
+                "so a restart does not stop them."))
 
     async def _duty_loop(self) -> None:
         while True:
