@@ -205,3 +205,23 @@ class PictureIdTests(unittest.TestCase):
         other.paste((255, 255, 255), (0, 0, 200, 150))  # a changed chart
         self.assertNotEqual(a, gs._picture_id(self.jpeg(other, 95), cache))
         self.assertNotEqual(a, gs._picture_id(self.jpeg(img.resize((200, 150)), 95), cache))  # other size
+
+
+class ListGroupTests(unittest.TestCase):
+    """gdoc_sync._list_items: Drive's import makes each nested run a list of its own (task #99)."""
+
+    def test_nested_run_continues_its_parent_list(self):
+        from harness import gdoc_sync as gs
+
+        def para(list_id=None, level=0, text="x\n"):
+            p = {"elements": [{"textRun": {"content": text}}]}
+            if list_id:
+                p["bullet"] = {"listId": list_id, "nestingLevel": level}
+            return ({}, p)
+        doc = {"lists": {"a": {"listProperties": {"nestingLevels": [{"glyphType": "DECIMAL"}]}},
+                         "b": {"listProperties": {"nestingLevels": [{}, {}]}},
+                         "c": {"listProperties": {"nestingLevels": [{}]}}}}
+        paras = [para("a"), para("b", 1), para("b", 1), para("a"), para(), para("c")]
+        got = gs._list_items(doc, paras)
+        self.assertEqual([got[i] for i in range(4)], [(0, 0, True), (0, 1, True), (0, 1, True), (0, 0, True)])
+        self.assertEqual(got[5], (1, 0, False))  # a new top-level list after a paragraph

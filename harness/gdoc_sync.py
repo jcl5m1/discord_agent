@@ -25,7 +25,8 @@ DOCS = "https://docs.googleapis.com/v1/documents"
 OBJ = "\ufffc"  # one index in the Doc: an inline image
 TEXT_KEYS = ("bold", "italic", "underline", "strikethrough", "smallCaps", "baselineOffset", "link",
              "weightedFontFamily", "fontSize", "foregroundColor", "backgroundColor")
-PARA_KEYS = ("namedStyleType", "alignment", "lineSpacing", "direction", "spacingMode", "spaceAbove", "spaceBelow",
+# Not spacingMode: Drive sets COLLAPSE_LISTS on some paragraphs, and the Docs API does not keep it when it is set.
+PARA_KEYS = ("namedStyleType", "alignment", "lineSpacing", "direction", "spaceAbove", "spaceBelow",
              "indentFirstLine", "indentStart", "indentEnd", "keepLinesTogether", "keepWithNext", "avoidWidowAndOrphan")
 INDENTS = ("indentFirstLine", "indentStart", "indentEnd")
 MAX_PASSES = 8
@@ -210,10 +211,12 @@ def _image(index: int, props: dict) -> dict:
 def _style_para(start: int, n: Para) -> list[dict]:
     end = start + _u16(n.text)
     reqs: list[dict] = []
-    # An indent left out of the request is not cleared: set no indent as 0.
-    style = {k: {"magnitude": 0, "unit": "PT"} for k in INDENTS} | json.loads(n.style)
+    # An indent left out of the request is not cleared: set no indent as 0. A list item's indents belong to its
+    # list (the list pass sets them per nesting level): they are not set here, or the two passes undo each other.
+    keys = [k for k in PARA_KEYS if not (n.bullet and k in ("indentFirstLine", "indentStart"))]
+    style = {k: {"magnitude": 0, "unit": "PT"} for k in INDENTS if k in keys} | json.loads(n.style)
     reqs.append({"updateParagraphStyle": {"range": {"startIndex": start, "endIndex": end},
-                                          "paragraphStyle": style, "fields": ",".join(PARA_KEYS)}})
+                                          "paragraphStyle": style, "fields": ",".join(keys)}})
     # A link is not removed by an update that clears it along with the other fields: clear links on their own first.
     reqs.append({"updateTextStyle": {"range": {"startIndex": start, "endIndex": end}, "textStyle": {},
                                      "fields": "link"}})
@@ -252,7 +255,9 @@ def normalize_lists(api: Api, doc: str, kinds: list[tuple[int, int, bool]]) -> i
     the Markdown's one for one."""
     d = api("GET", f"{DOCS}/{doc}", None)
     paras = _body_paras(d)
-    items = [i for i, (_, p) in enumerate(paras) if "bullet" in p]
+    # An empty list paragraph is not a Markdown item: Drive adds one after a table inside a list item. It loses its
+    # bullet in the rebuild.
+    items = [i for i, (_, p) in enumerate(paras) if "bullet" in p and _para_text(p).strip()]
     if len(items) != len(kinds):
         return 0
     want = {i: k for i, k in zip(items, kinds)}
@@ -260,6 +265,10 @@ def normalize_lists(api: Api, doc: str, kinds: list[tuple[int, int, bool]]) -> i
     if reqs:
         api("POST", f"{DOCS}/{doc}:batchUpdate", {"requests": reqs})
     return len(reqs)
+
+
+def _para_text(p: dict) -> str:
+    return "".join(e.get("textRun", {}).get("content", "") for e in p.get("elements", []))
 
 
 def _body_paras(doc: dict) -> list[tuple[dict, dict]]:
@@ -270,19 +279,25 @@ def _list_items(doc: dict, paras: list[tuple[dict, dict]]) -> dict[int, tuple[in
     """Paragraph number -> (list group, nesting level, numbered) for the list items. A list group is a run of items of
     one list; the type is that of the list's top level, as createParagraphBullets gives one preset to a whole list."""
     out: dict[int, tuple[int, int, bool]] = {}
-    group, prev = -1, None
+    group, prev, members = -1, None, set()
     for i, (_, p) in enumerate(paras):
         b = p.get("bullet")
         if not b:
             prev = None
             continue
+        # Drive's import makes each run of nested items a list of its own: a new list continues the group when its
+        # first item is nested, and the parent list continues it after the run; only another top-level list starts a
+        # new group.
         if b["listId"] != prev:
-            group += 1
+            if prev is None or (b.get("nestingLevel", 0) == 0 and b["listId"] not in members):
+                group += 1
+                members = set()
+                levels = doc.get("lists", {}).get(b["listId"], {}).get("listProperties", {}).get("nestingLevels", [{}])
+                top = levels[0] if levels else {}
+                numbered = top.get("glyphType", "GLYPH_TYPE_UNSPECIFIED") not in ("GLYPH_TYPE_UNSPECIFIED", "NONE")
             prev = b["listId"]
-        levels = doc.get("lists", {}).get(b["listId"], {}).get("listProperties", {}).get("nestingLevels", [{}])
-        top = levels[0] if levels else {}
-        numbered = top.get("glyphType", "GLYPH_TYPE_UNSPECIFIED") not in ("GLYPH_TYPE_UNSPECIFIED", "NONE")
-        out[i] = (group, b.get("nestingLevel", 0), numbered)
+            members.add(prev)
+        out[i] = (group, b.get("nestingLevel", 0), numbered)  # the group's type: one preset per rebuilt list
     return out
 
 
@@ -375,8 +390,11 @@ def _para(el: dict, doc: dict, images: dict[str, str]) -> Para:
         lst = doc.get("lists", {}).get(p["bullet"]["listId"], {})
         glyph = lst.get("listProperties", {}).get("nestingLevels", [{}] * (level + 1))[level]
         bullet = (level, bool(glyph.get("glyphType")) and glyph.get("glyphType") != "GLYPH_TYPE_UNSPECIFIED")
+    style = p.get("paragraphStyle", {})
+    if "bullet" in p:  # a list item's indents come from its list and nesting level (see _style_para)
+        style = {k: v for k, v in style.items() if k not in ("indentFirstLine", "indentStart")}
     return Para(el["startIndex"], el["endIndex"], text, _merge(_breaks_unstyled(runs, text)),
-                _style(p.get("paragraphStyle", {}), PARA_KEYS), bullet, imgs, atomic)
+                _style(style, PARA_KEYS), bullet, imgs, atomic)
 
 
 def _breaks_unstyled(runs: list[tuple[int, int, str]], text: str) -> list[tuple[int, int, str]]:
