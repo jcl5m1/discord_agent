@@ -25,7 +25,7 @@ from pathlib import Path
 
 import discord
 
-from . import config, discord_markdown, files, guard, logfile, logins, resume, service, triggers, uptime, workdirs
+from . import config, discord_markdown, files, guard, limits, logfile, logins, resume, service, triggers, uptime, workdirs
 from .worklog_service import WorklogService
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
@@ -509,6 +509,7 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
             log.info("[%s] session id captured: %s", inst.name, inst.session_id)
 
     interrupted = False
+    limited = None  # the provider's "limit" event, if the usage limit stopped the turn
     interrupt_wait = asyncio.ensure_future(turn["interrupt"].wait())
     try:
         try:
@@ -574,6 +575,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                     capture_session(event.session_id)
                 elif event.kind == "error":
                     error = event.text
+                elif event.kind == "limit":
+                    limited = event
+                    capture_session(event.session_id)
                 elif event.kind == "done":
                     buf = event.text or buf
                     capture_session(event.session_id)
@@ -585,6 +589,22 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         except Exception:
             log.exception("turn failed for %s", inst.name)
             error = "harness error while running the agent (see logs)"
+
+        if limited is not None:
+            running = _running_message.get(inst.channel_id)
+            at = limits.hit(limited.reset_at, inst.channel_id, inst.name, prompt,
+                            int(running[0]) if running else None)
+            log.warning("[%s] usage limit reached: %s; resumes at %s", inst.name, limited.text[:200],
+                        time.strftime("%H:%M", time.localtime(at)))
+            when = f"<t:{int(at)}:t>" + ("" if limited.reset_at else " (reset time unknown: tries again then)")
+            note = (f"⏸️ Claude usage limit reached. This agent continues by itself at {when}, "
+                    "1 minute after the limit resets. Messages sent meanwhile wait until then.")
+            body = display(buf) if buf.strip() else ""
+            await status_msg.edit(content=(f"{body}\n\n{note}" if body else note)[:DISCORD_MSG_LIMIT], view=None)
+            if wa:
+                _wa_task(wa.send_text(inst, note))
+            _start_limit_resumer()
+            return "limited"
 
         if interrupted:
             who = turn["interrupted_by"] or "you"
@@ -741,6 +761,8 @@ async def on_ready() -> None:
         _resumed = True
         _resume_cut_off_turns()
         asyncio.get_running_loop().create_task(_health_loop())
+        if limits.pending():
+            _start_limit_resumer()  # turns cut off by a usage limit before the restart
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
     global worklog
@@ -836,6 +858,29 @@ async def _worklog_notify(worker: str, text: str) -> None:
         await channel.send(text[:DISCORD_MSG_LIMIT])
 
 
+_limit_task: asyncio.Task | None = None
+
+
+def _start_limit_resumer() -> None:
+    global _limit_task
+    if _limit_task is None or _limit_task.done():
+        _limit_task = asyncio.get_running_loop().create_task(_limit_resumer())
+
+
+async def _limit_resumer() -> None:
+    """Resume the turns the usage limit cut off, RESUME_AFTER seconds after it resets."""
+    while (at := limits.resume_at()):
+        await asyncio.sleep(min(300.0, max(1.0, at - time.time())))
+    for channel_id, record in limits.take().items():
+        inst = store.get(channel_id)
+        channel = client.get_channel(channel_id)
+        if inst is None or inst.stopped or not isinstance(channel, discord.TextChannel) or record is None:
+            continue
+        log.info("[%s] usage limit reset: resuming", inst.name)
+        await channel.send("▶️ The Claude usage limit has reset. This agent continues now.")
+        asyncio.get_running_loop().create_task(on_message_simple(channel, limits.prompt(record)))
+
+
 def _health_agent() -> Instance | None:
     """The instance told to prevent crashes: HEALTH_AGENT, else the one working in the harness repo."""
     live = [i for i in store.all() if not i.stopped]
@@ -906,6 +951,8 @@ def _worklog_idle_for(worker: str) -> float | None:
     inst = _instance_for_worker(worker)
     if inst is None or inst.stopped or inst.channel_id in _active_turns:
         return None
+    if inst.provider == "claude" and limits.resume_at():
+        return None  # waiting for the usage limit to reset
     lock = _channel_locks.get(inst.channel_id)
     if lock is not None and lock.locked():
         return None
@@ -1630,6 +1677,19 @@ async def _run_turn_recovering(inst: Instance, prompt: str, status_msg: discord.
     First the same session again (a transient failure), then, if it crashes once
     more, a fresh session: the message isn't lost either way.
     """
+    if inst.provider == "claude" and (at := limits.resume_at()):
+        # The account's usage limit: wait for the reset without holding a turn slot.
+        await status_msg.edit(content=f"⏸️ Waiting for the Claude usage limit to reset; this runs at <t:{int(at)}:t>.")
+        _global_semaphore.release()
+        try:
+            while (at := limits.resume_at()):
+                await asyncio.sleep(min(60.0, max(1.0, at - time.time())))
+        finally:
+            await _global_semaphore.acquire()
+        cut = limits.take(inst.channel_id)  # this message continues the cut-off work too
+        if cut:
+            prompt = limits.prompt(cut[inst.channel_id]) + "\n\nThe user's newer message:\n" + prompt
+        await status_msg.edit(content="🤔 …")
     if await _run_turn(inst, prompt, status_msg) != "crashed":
         return
     channel = status_msg.channel

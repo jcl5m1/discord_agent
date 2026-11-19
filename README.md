@@ -658,6 +658,21 @@ class MyProvider(AgentProvider):
 It then shows up as a `provider` choice in `/new`. The harness, instance store,
 streaming UI, and resume-on-message logic are all provider-agnostic.
 
+## Claude usage limits
+
+When the account's Claude usage limit stops a turn (`harness/limits.py`), the
+harness reads the reset time from the CLI's `rate_limit_event` (status
+`rejected`, `resetsAt`) or from its error text ("resets 9pm"), and:
+
+- posts "⏸️ Claude usage limit reached … continues at <time>" in the channel,
+- records the cut-off turn in `data/usage_limit.json` (it survives a restart),
+- makes every Claude turn wait until 1 minute after the reset (the limit is per
+  account), without holding a turn slot, and offers no worklog tasks meanwhile,
+- then gives each cut-off channel a turn to continue the work. A message you
+  send meanwhile runs at that time too, together with the cut-off work.
+
+If the reset time is unknown, it tries again after 30 minutes.
+
 ## Liveness: progress updates and the watchdog
 
 While a turn runs long, the bot posts a short "⏳ still working" status in the

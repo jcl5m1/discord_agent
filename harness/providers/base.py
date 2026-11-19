@@ -87,7 +87,9 @@ class StreamEvent:
     """Incremental event while a turn is running.
 
     kind is one of: "text", "status", "session", "delivered", "interrupted",
-    "done", "error", "background".
+    "done", "error", "background", "limit".
+    "limit": the account's usage limit stopped the turn; reset_at is when it
+    resets (None if unknown), text the CLI's message.
     "background" (text = a count): after the agent's reply, how many
     background tasks (subagents, background commands) still run; the turn
     stays open for them. 0 means none are left.
@@ -102,6 +104,7 @@ class StreamEvent:
     kind: str
     text: str = ""
     session_id: str | None = None
+    reset_at: float | None = None  # "limit": when the usage limit resets (unix time), if known
 
 
 @dataclass

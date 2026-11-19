@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
-from .. import config
+from .. import config, limits
 from .base import (
     SPAWN_KWARGS, AgentProvider, SessionInfo, StreamEvent, TurnControl, finish_process,
     kill_process_tree, read_line, register, run_text,
@@ -149,6 +149,7 @@ class ClaudeProvider(AgentProvider):
             captured_session: str | None = None
             announced_session = False
             result_error: str | None = None
+            limit_hit, limit_reset = False, None
             tool_count = 0
             # Messages sent into the turn that Claude hasn't read yet.
             unread: set[str] = control.unread if control is not None else set()
@@ -250,6 +251,16 @@ class ClaudeProvider(AgentProvider):
                 if captured_session and not announced_session:
                     announced_session = True
                     yield StreamEvent(kind="session", session_id=captured_session)
+                if etype == "rate_limit_event":
+                    info = event.get("rate_limit_info") or {}
+                    if info.get("status") == "rejected":
+                        windows = [w.get("resetsAt") for w in (info.get("unifiedWindows") or {}).values()
+                                   if w.get("status") == "rejected" and w.get("resetsAt")]
+                        limit_reset = float(max(windows) if windows else info.get("resetsAt") or 0) or None
+                        limit_hit = True
+                        log.warning("claude pid=%d: usage limit reached (%s), resets %s", proc.pid,
+                                    info.get("rateLimitType"), limit_reset)
+                    continue
                 if etype == "system" and event.get("subtype") == "background_tasks_changed":
                     background = list(event.get("tasks") or [])
                     if holding_since:  # reported only after the reply: before it, the turn is still working
@@ -308,7 +319,14 @@ class ClaudeProvider(AgentProvider):
                 log.debug("claude pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
 
             final_text = "".join(final_text_parts).strip()
-            if interrupted:
+            # The stream's rate_limit_event, or an error result that says so (not the agent's own text:
+            # a reply that talks about limits is not one).
+            said = result_error or ""
+            if not interrupted and (limit_hit or limits.is_limit_text(said)):
+                yield StreamEvent(kind="limit", text=(result_error or final_text or "usage limit reached")[-500:],
+                                  session_id=captured_session,
+                                  reset_at=limit_reset or limits.reset_from_text(said))
+            elif interrupted:
                 yield StreamEvent(kind="interrupted", text=final_text, session_id=captured_session)
             elif returncode != 0 or result_error:
                 err = result_error or stderr_data.decode("utf-8", "replace").strip()
