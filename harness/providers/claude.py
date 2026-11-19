@@ -157,6 +157,10 @@ class ClaudeProvider(AgentProvider):
             # Set when a turn ended with a message still unread: Claude should start
             # another turn for it at once. If it stays silent, its input is closed.
             waiting_since: float | None = None
+            # Background tasks (subagents, background commands) the CLI reports. While any run after the reply,
+            # input stays open: once it is closed, the CLI stops waiting for them after about 10 minutes and they die.
+            background: list = []
+            holding_since: float | None = None
             assert proc.stdin is not None and proc.stdout is not None
             proc.stdin.write(self._user_line(str(uuid.uuid4()), prompt))
             await proc.stdin.drain()
@@ -210,6 +214,12 @@ class ClaudeProvider(AgentProvider):
             while True:
                 line = await read_line(proc, _UNREAD_GRACE if waiting_since else _STALL_WARN_INTERVAL)
                 if line is None:
+                    if holding_since and time.monotonic() - holding_since > config.BACKGROUND_WAIT_MAX:
+                        log.warning("claude pid=%d: background tasks still running after %.0f h; closing input",
+                                    proc.pid, config.BACKGROUND_WAIT_MAX / 3600)
+                        holding_since = None
+                        close_stdin()
+                        continue
                     if waiting_since:
                         log.warning("claude pid=%d didn't pick up %d message(s) after its turn; "
                                     "ending it", proc.pid, len(unread))
@@ -239,7 +249,14 @@ class ClaudeProvider(AgentProvider):
                 if captured_session and not announced_session:
                     announced_session = True
                     yield StreamEvent(kind="session", session_id=captured_session)
-                if etype == "user" and event.get("isReplay"):
+                if etype == "system" and event.get("subtype") == "background_tasks_changed":
+                    background = list(event.get("tasks") or [])
+                    yield StreamEvent(kind="background", text=str(len(background)))
+                    if not background and holding_since and not unread:
+                        log.info("claude pid=%d: background tasks done; closing input", proc.pid)
+                        holding_since = None
+                        close_stdin()
+                elif etype == "user" and event.get("isReplay"):
                     if event.get("uuid") in unread:
                         unread.discard(event["uuid"])
                         yield StreamEvent(kind="delivered", text=event["uuid"])
@@ -263,7 +280,13 @@ class ClaudeProvider(AgentProvider):
                     elif event.get("is_error"):
                         result_error = str(event.get("result") or event.get("subtype") or "claude error")
                         close_stdin()
+                    elif background and not unread:
+                        if not holding_since:
+                            log.info("claude pid=%d: %d background task(s) running; input stays open",
+                                     proc.pid, len(background))
+                        holding_since = holding_since or time.monotonic()
                     elif not unread:
+                        holding_since = None
                         close_stdin()
                     else:
                         # A message sent near the end hasn't been read yet; Claude

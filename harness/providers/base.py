@@ -87,7 +87,9 @@ class StreamEvent:
     """Incremental event while a turn is running.
 
     kind is one of: "text", "status", "session", "delivered", "interrupted",
-    "done", "error".
+    "done", "error", "background".
+    "background" (text = a count): how many background tasks (subagents,
+    background commands) the agent has running now.
     "session" carries the provider session id as soon as it's known, so a turn
     that's interrupted before "done" can still be resumed.
     "delivered" (text = the id TurnControl.send returned): the agent has read a

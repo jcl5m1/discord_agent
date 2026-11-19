@@ -145,3 +145,46 @@ class HoldTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A fake CLI with one background task, as the real CLI reports it. If its input closes while the task runs, it
+# gives up on the task after a short time (the real CLI after about 10 minutes) and exits: the task dies.
+FAKE_BACKGROUND = r'''
+import json, select, sys, time
+def out(ev): print(json.dumps(ev), flush=True)
+first = json.loads(sys.stdin.readline())
+out({"type": "system", "subtype": "init", "session_id": "sess-bg"})
+out({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "t1"}]})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": "started"}]}})
+out({"type": "result", "subtype": "success", "is_error": False})
+deadline = time.time() + 1.5
+while time.time() < deadline:
+    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if r and not sys.stdin.readline():
+        time.sleep(0.5)
+        out({"type": "assistant", "message": {"content": [{"type": "text", "text": " | task killed"}]}})
+        sys.exit(0)
+out({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": " | task finished"}]}})
+out({"type": "result", "subtype": "success", "is_error": False})
+sys.stdin.readline()
+'''
+
+
+class ClaudeBackgroundTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        fake = Path(self.tmp.name) / "claude"
+        fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(FAKE_BACKGROUND))
+        fake.chmod(0o755)
+        patcher = mock.patch.object(config, "CLAUDE_BIN", str(fake))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_input_stays_open_until_background_tasks_end(self):
+        events = [ev async for ev in ClaudeProvider().run_turn(self.tmp.name, "go", None, "haiku")]
+        self.assertEqual([ev.text for ev in events if ev.kind == "background"], ["1", "0"])
+        done = next(ev for ev in events if ev.kind == "done")
+        self.assertIn("task finished", done.text)
+        self.assertNotIn("task killed", done.text)

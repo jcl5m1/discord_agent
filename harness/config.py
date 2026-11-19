@@ -114,6 +114,8 @@ if not ALLOW_AGENT_API_KEYS:
             IGNORED_API_KEYS.append(_var)
 
 # --- Shared worklog (all agents on the server, every machine; see worklog.py) ---
+# How long a turn may stay open for the agent's background tasks (subagents, background commands) after its reply.
+BACKGROUND_WAIT_MAX: float = float(os.environ.get("BACKGROUND_WAIT_MAX_HOURS", "12")) * 3600
 # After a restart, give each agent whose turn (or background work) the restart cut off a resume turn.
 AUTO_RESUME: bool = os.environ.get("AUTO_RESUME", "true").lower() not in {"0", "false", "no"}
 WORKLOG_ENABLED: bool = os.environ.get("WORKLOG_ENABLED", "true").lower() not in {"0", "false", "no"}

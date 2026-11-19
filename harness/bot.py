@@ -449,6 +449,9 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         "control": TurnControl() if provider.supports_graceful_interrupt else None,
         "live_input": provider.supports_live_input,
         "steered": {},
+        # Background tasks the agent has running, and whether this turn gave its slot back while they run.
+        "background": 0,
+        "slot_freed": False,
     }
     _active_turns[inst.channel_id] = turn
     # Kept until the turn ends, so a restart that cuts it off leaves the record (see harness/resume.py).
@@ -526,6 +529,13 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                     log.info("[%s] %s", inst.name, event.text)
                 elif event.kind == "session":
                     capture_session(event.session_id)
+                elif event.kind == "background":
+                    turn["background"] = int(event.text or 0)
+                    # Waiting only for background work: let other channels' turns run meanwhile.
+                    if turn["background"] and not turn["slot_freed"]:
+                        turn["slot_freed"] = True
+                        _global_semaphore.release()
+                        log.info("[%s] %d background task(s) running; turn slot freed", inst.name, turn["background"])
                 elif event.kind == "delivered":
                     if (msg := turn["steered"].pop(event.text, None)) is not None:
                         _wa_task(_react(msg, "✅"))
@@ -666,6 +676,8 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         cut_off = True  # the harness is shutting down: keep the record for the resume
         raise
     finally:
+        if turn["slot_freed"] and not cut_off:
+            await _global_semaphore.acquire()  # the caller's `async with` gives it back
         if not cut_off:
             resume.clear(inst.channel_id)
         stop_view.stop()
