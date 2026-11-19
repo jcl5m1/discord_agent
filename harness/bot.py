@@ -307,6 +307,12 @@ around it. Before you publish again, read and answer the comments:
 `gdoc comments <file.md>`, then `gdoc reply <file.md> <id> "text" --resolve`.
 Link to another report with a relative link to its .md file: the Doc links to
 that report's Doc. `gdoc check` tells what setup is missing.
+Report Markdown is CommonMark, as on GitHub: a list may follow a paragraph line
+directly; nest an item by indenting it to its parent's text (2 spaces after
+"- ", 3 after "1. "). Bullet and numbered lists keep their levels and numbers,
+code renders in Courier New, quotes are indented, table header rows are bold.
+A link to a section of the same report (#anchor) becomes plain text. If you
+change harness/gdoc.py or gdoc_sync.py, run tests/gdoc_render_live.py.
 Sessions are managed by the harness: never launch the agent CLI yourself to
 resume or continue another session (e.g. `kimi --session`, `claude --resume`) --
 it can't attach to this channel and fails if that session is open elsewhere.
