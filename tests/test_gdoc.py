@@ -139,6 +139,26 @@ class SyncImageTests(unittest.TestCase):
         self.assertEqual((img["location"]["index"], img["uri"]), (1, "new"))
 
 
+class SyncTableTests(unittest.TestCase):
+    """gdoc_sync: paragraphs replaced by a new table must not put the table inside the deleted range."""
+
+    @staticmethod
+    def para(i: int, text: str) -> dict:
+        return {"startIndex": i, "endIndex": i + len(text), "paragraph": {"elements": [
+            {"startIndex": i, "endIndex": i + len(text), "textRun": {"content": text}}]}}
+
+    def test_new_table_waits_for_the_deleted_paragraphs(self):
+        from harness import gdoc_sync as gs
+        old_doc = {"body": {"content": [self.para(1, "aa\n"), self.para(4, "bb\n"), self.para(7, "end\n")]}}
+        cell = {"content": [self.para(3, "x\n")]}
+        new_doc = {"body": {"content": [{"startIndex": 1, "endIndex": 6, "table": {"tableRows": [
+            {"tableCells": [cell]}]}}, self.para(6, "end\n")]}}
+        reqs = gs.plan(gs._blocks(old_doc, {}), gs._blocks(new_doc, {}), new_doc, 11)
+        self.assertFalse([r for r in reqs if "insertTable" in r])  # the next pass inserts it
+        self.assertEqual([r["deleteContentRange"]["range"] for r in reqs if "deleteContentRange" in r],
+                         [{"startIndex": 1, "endIndex": 7}])
+
+
 class MarkdownTests(unittest.TestCase):
     """The Markdown → HTML step before the Drive import (task #58); tests/gdoc_render_live.py checks a real Doc."""
 

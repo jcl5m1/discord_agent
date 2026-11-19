@@ -94,7 +94,9 @@ def plan(old: list, new: list, src_doc: dict, seg_end: int) -> list[dict]:
         pairs, dels, ins = _pair(old[i1:i2], new[j1:j2])
         # Back to front: the inserted run sits after the paired ones, the deleted ones are after them too. New text
         # at the end of the segment would hang on a block deleted in this pass: it waits for the next pass.
-        if ins and not (dels and i2 == len(old)):
+        # A new table goes after old[i2 - 1]; when that block is deleted in this pass, the table would sit inside the
+        # deleted range (the newline before a table cannot be deleted): it waits for the next pass too.
+        if ins and not (dels and i2 == len(old)) and not (dels and isinstance(ins[0], Table)):
             reqs += _insert_blocks(old, i2, ins, src_doc, seg_end)
         if dels:
             reqs += _delete_blocks(old, dels, seg_end)
