@@ -61,6 +61,29 @@ class SlotAndGateTests(unittest.TestCase):
         self.assertEqual(rc, 75)
 
 
+class InputTests(unittest.TestCase):
+    def test_inputs_from_flag_and_arguments(self):
+        with tempfile.TemporaryDirectory() as d:
+            video = Path(d) / "a.insv"
+            video.write_bytes(b"x" * 3000)
+            other = Path(d) / "b.insv"
+            other.write_bytes(b"x" * 3000)
+            folder = Path(d) / "imgs"
+            folder.mkdir()
+            for i in range(3):
+                (folder / f"{i}.jpg").write_bytes(b"j" * 10)
+            ins = heavy.inputs(["ffmpeg", "-i", str(video), "-vf", "fps=1", f"--in={other}", "/no/such/file",
+                                str(Path(d) / "out.mp4")], [str(folder)])
+        self.assertEqual([i["path"] for i in ins], [str(folder), str(video), str(other)])
+        self.assertEqual((ins[0]["files"], ins[0]["bytes"]), (3, 30))
+        self.assertEqual(ins[1]["bytes"], 3000)
+        self.assertEqual(ins[1]["id"], ins[2]["id"])  # same size and first MiB: same content id
+        self.assertEqual(len(ins[1]["id"]), 16)
+
+    def test_cgroup_usage_of_a_missing_cgroup_is_empty(self):
+        self.assertEqual(heavy._cg_usage(Path("/sys/fs/cgroup/no-such-group")), {})
+
+
 @unittest.skipUnless(HAS_SYSTEMD, "needs a systemd user session")
 class RunTests(unittest.TestCase):
     def heavy(self, *args, **kw):
@@ -73,6 +96,22 @@ class RunTests(unittest.TestCase):
         out, _ = p.communicate(timeout=60)
         self.assertNotEqual(p.returncode, 0)
         self.assertNotIn("survived", out)
+
+    def test_log_has_inputs_and_totals(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "in.bin"
+            f.write_bytes(b"y" * 5000)
+            log = Path(d) / "jobs.jsonl"
+            with mock.patch.object(heavy, "LOG", log), mock.patch.object(heavy, "DIR", Path(d)), \
+                    mock.patch.object(heavy, "POLL", 0.2), mock.patch.object(heavy, "gate", return_value=None):
+                rc = heavy.run("test-heavy", [sys.executable, "-c", "import time; time.sleep(1)", str(f)], "100M",
+                               "0", None, max_wait=10, force=True, name="t")
+            rec = json.loads(log.read_text().splitlines()[-1])
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec["inputs"][0]["path"], str(f))
+        self.assertEqual(rec["inputs"][0]["bytes"], 5000)
+        for k in ("wall_s", "cpu_s", "peak_mib", "read_mib", "written_mib"):  # the old keys stay
+            self.assertIn(k, rec)
 
     def test_job_stops_with_its_caller(self):
         p = self.heavy("--mem", "100M", "--", "sh", "-c", "sleep 300 & sleep 300; wait")

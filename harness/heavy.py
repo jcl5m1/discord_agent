@@ -19,7 +19,11 @@ Every agent on the machine shares it, so jobs stop colliding:
   heavy run or the uptime monitor's sweep stops what it left.
 - Log: one line per job in data/heavy/jobs.jsonl: who, class, command, wait and wall time, exit
   code, and the scope's totals (peak memory, CPU seconds, MiB read and written), sampled every
-  POLL seconds, so a job shorter than that has no totals.
+  POLL seconds, so a job shorter than that has no totals. Labelled containers run outside the scope:
+  their cgroup totals are the ctr_* keys (summed over the job's containers). "inputs" lists the job's
+  input files (--input PATH, repeatable, and the command's arguments that are existing files) with
+  size, mtime and id = sha1(size + first MiB)[:16], so the same input processed twice is visible;
+  a directory gives its file count and bytes (first 10000 files).
 
 Exit code: the job's; 75 if it waited longer than --max-wait; 2 for a usage error.
 """
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -167,10 +172,17 @@ def sweep() -> list[str]:
 # ------------------------------------------------------------- running
 def _usage(pid: int) -> dict:
     """The job's scope totals so far: peak memory, CPU seconds, bytes read and written."""
-    out: dict = {}
     try:
         cg = Path("/sys/fs/cgroup" + Path(f"/proc/{pid}/cgroup").read_text().split(":", 2)[2].strip())
     except (OSError, IndexError):
+        return {}
+    return _cg_usage(cg)
+
+
+def _cg_usage(cg: Path) -> dict:
+    """A cgroup's totals: peak memory, CPU seconds, bytes read and written."""
+    out: dict = {}
+    if not cg.is_dir():
         return out
     try:
         out["peak"] = int((cg / "memory.peak").read_text())
@@ -193,6 +205,81 @@ def _usage(pid: int) -> dict:
     return out
 
 
+INPUT_MAX = 20
+DIR_MAX_FILES = 10000
+
+
+def _input(path: str) -> dict | None:
+    """A cheap content record of an input file or directory (None: not an existing path)."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    p = os.path.abspath(path)
+    if os.path.isdir(p):
+        files = size = 0
+        for root, _dirs, names in os.walk(p):
+            for n in names:
+                try:
+                    size += os.stat(os.path.join(root, n)).st_size
+                except OSError:
+                    continue
+                files += 1
+                if files >= DIR_MAX_FILES:
+                    return {"path": p, "files": files, "bytes": size, "partial": True}
+        return {"path": p, "files": files, "bytes": size}
+    if not os.path.isfile(p):
+        return None
+    h = hashlib.sha1(str(st.st_size).encode())
+    try:
+        with open(p, "rb") as f:
+            h.update(f.read(1 << 20))
+    except OSError:
+        return {"path": p, "bytes": st.st_size, "mtime": int(st.st_mtime)}
+    return {"path": p, "bytes": st.st_size, "mtime": int(st.st_mtime), "id": h.hexdigest()[:16]}
+
+
+def inputs(cmd: list[str], given: list[str]) -> list[dict]:
+    """--input paths (files or dirs), then the command's arguments that are existing files."""
+    out, seen = [], set()
+    for path in given:
+        rec = _input(path)
+        if rec and rec["path"] not in seen:
+            seen.add(rec["path"])
+            out.append(rec)
+    for arg in cmd[1:]:
+        if len(out) >= INPUT_MAX:
+            break
+        for a in (arg, arg.partition("=")[2]):  # --in=/x/y.insv
+            if not a or a.startswith("-") or "/" not in a and "." not in a:
+                continue
+            try:
+                if not os.path.isfile(a):
+                    continue
+            except (OSError, ValueError):
+                continue
+            rec = _input(a)
+            if rec and rec["path"] not in seen:
+                seen.add(rec["path"])
+                out.append(rec)
+    return out
+
+
+def _ctr_usage(unit: str, known: dict) -> None:
+    """Fold the cgroup totals of the job's labelled containers into known[id] (kept after they exit)."""
+    if not shutil.which("docker"):
+        return
+    try:
+        ids = subprocess.run(["docker", "ps", "-q", "--no-trunc", "--filter", f"label=heavy.unit={unit}"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return
+    for cid in ids:
+        now = _cg_usage(Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope"))
+        if now:
+            known[cid] = {k: max(v, known.get(cid, {}).get(k, 0)) for k, v in now.items()}
+
+
 def _log(rec: dict) -> None:
     try:
         DIR.mkdir(parents=True, exist_ok=True)
@@ -203,7 +290,7 @@ def _log(rec: dict) -> None:
 
 
 def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_wait: float,
-        force: bool, name: str = "") -> int:
+        force: bool, name: str = "", given_inputs: list[str] | None = None) -> int:
     cls = _cls(cls)
     who = os.environ.get("WORKLOG_WORKER") or os.environ.get("USER", "?")
     unit = f"heavy-{cls}-{os.getpid()}"
@@ -242,7 +329,8 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
         except OSError:
             pass
 
-    rc, use = 1, {}
+    rc, use, ctrs = 1, {}, {}
+    ins = inputs(cmd, given_inputs or [])
     proc = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", unit,
                              *props, "--", *cmd], env=env, preexec_fn=pdeathsig)
 
@@ -259,6 +347,7 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
             except subprocess.TimeoutExpired:
                 now = _usage(proc.pid)  # the scope is gone once the job ends: keep the last sample
                 use = {k: max(v, use.get(k, 0)) for k, v in now.items()} or use
+                _ctr_usage(unit, ctrs)
     finally:
         if proc.poll() is None:
             _stop_unit(unit)
@@ -270,7 +359,12 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
         _log({**info, "class": cls, "end": time.time(), "wall_s": round(time.time() - info["since"] - waited),
               "waited_s": round(waited), "rc": rc, "mem": mem, "peak_mib": use.get("peak", 0) // 1048576,
               "cpu_s": use.get("cpu_s"), "read_mib": use.get("read", 0) // 1048576,
-              "written_mib": use.get("written", 0) // 1048576})
+              "written_mib": use.get("written", 0) // 1048576, "inputs": ins,
+              **({"ctr_cpu_s": round(sum(c.get("cpu_s", 0) for c in ctrs.values()), 1),
+                  "ctr_peak_mib": max(c.get("peak", 0) for c in ctrs.values()) // 1048576,
+                  "ctr_read_mib": sum(c.get("read", 0) for c in ctrs.values()) // 1048576,
+                  "ctr_written_mib": sum(c.get("written", 0) for c in ctrs.values()) // 1048576,
+                  "containers": len(ctrs)} if ctrs else {})})
     return rc
 
 
@@ -305,13 +399,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--swap", default="1G", help="swap limit")
     ap.add_argument("--cpus", type=float, help="CPU limit in cores")
     ap.add_argument("--name", default="", help="a short label for status and the log")
+    ap.add_argument("--input", action="append", default=[], metavar="PATH",
+                    help="an input file or folder, for the log (repeatable; existing-file arguments are added)")
     ap.add_argument("--max-wait", type=float, default=4 * 3600, help="seconds to wait for a slot and room")
     ap.add_argument("--force", action="store_true", help="start even if system health is warn")
     a = ap.parse_args(argv[:i])
     if not argv[i + 1:]:
         print("heavy: no command after --", file=sys.stderr)
         return 2
-    return run(a.cls, argv[i + 1:], a.mem, a.swap, a.cpus, a.max_wait, a.force, a.name)
+    return run(a.cls, argv[i + 1:], a.mem, a.swap, a.cpus, a.max_wait, a.force, a.name, a.input)
 
 
 if __name__ == "__main__":
