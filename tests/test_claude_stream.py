@@ -185,6 +185,67 @@ class ClaudeBackgroundTests(unittest.IsolatedAsyncioTestCase):
     async def test_input_stays_open_until_background_tasks_end(self):
         events = [ev async for ev in ClaudeProvider().run_turn(self.tmp.name, "go", None, "haiku")]
         self.assertEqual([ev.text for ev in events if ev.kind == "background"], ["1", "0"])
+        # The CLI reports the task before its reply; the turn hears of it only after the reply (slot accounting).
+        first_bg = next(i for i, ev in enumerate(events) if ev.kind == "background")
+        reply = next(i for i, ev in enumerate(events) if ev.kind == "text" and "started" in ev.text)
+        self.assertGreater(first_bg, reply)
         done = next(ev for ev in events if ev.kind == "done")
         self.assertIn("task finished", done.text)
         self.assertNotIn("task killed", done.text)
+
+
+# After the reply, one background task runs; a message sent then is read and answered in the same process,
+# and the task still finishes.
+FAKE_BACKGROUND_STEER = r'''
+import json, select, sys, time
+def out(ev): print(json.dumps(ev), flush=True)
+first = json.loads(sys.stdin.readline())
+out({"type": "system", "subtype": "init", "session_id": "sess-bg"})
+out({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "t1"}]})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": "started"}]}})
+out({"type": "result", "subtype": "success", "is_error": False})
+deadline = time.time() + 2.0
+while time.time() < deadline:
+    r, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if r:
+        line = sys.stdin.readline()
+        if not line:
+            out({"type": "assistant", "message": {"content": [{"type": "text", "text": " | task killed"}]}})
+            sys.exit(0)
+        ev = json.loads(line)
+        out({"type": "user", "isReplay": True, "uuid": ev["uuid"], "message": ev["message"]})
+        out({"type": "assistant", "message": {"content": [{"type": "text", "text": " | late: " + ev["message"]["content"]}]}})
+        out({"type": "result", "subtype": "success", "is_error": False})
+out({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": " | task finished"}]}})
+out({"type": "result", "subtype": "success", "is_error": False})
+sys.stdin.readline()
+'''
+
+
+class ClaudeBackgroundSteerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        fake = Path(self.tmp.name) / "claude"
+        fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(FAKE_BACKGROUND_STEER))
+        fake.chmod(0o755)
+        for attr, value in (("CLAUDE_BIN", str(fake)), ("STEER_HOLD", 0)):
+            patcher = mock.patch.object(config, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def test_message_after_reply_goes_into_the_held_session(self):
+        control = TurnControl()
+        events, sent = [], None
+        async for ev in ClaudeProvider().run_turn(self.tmp.name, "go", None, "haiku", control=control):
+            events.append(ev)
+            if ev.kind == "background" and ev.text == "1" and sent is None:
+                sent = control.send("hello")  # the user writes after the reply, while the task runs
+        kinds = [(ev.kind, ev.text) for ev in events if ev.kind in ("background", "delivered")]
+        self.assertEqual(kinds[0], ("background", "1"))  # nothing before the reply
+        self.assertIn(("delivered", sent), kinds)
+        self.assertEqual(kinds[-1], ("background", "0"))
+        done = next(ev for ev in events if ev.kind == "done")
+        self.assertIn("late: hello", done.text)
+        self.assertIn("task finished", done.text)

@@ -88,8 +88,9 @@ class StreamEvent:
 
     kind is one of: "text", "status", "session", "delivered", "interrupted",
     "done", "error", "background".
-    "background" (text = a count): how many background tasks (subagents,
-    background commands) the agent has running now.
+    "background" (text = a count): after the agent's reply, how many
+    background tasks (subagents, background commands) still run; the turn
+    stays open for them. 0 means none are left.
     "session" carries the provider session id as soon as it's known, so a turn
     that's interrupted before "done" can still be resumed.
     "delivered" (text = the id TurnControl.send returned): the agent has read a

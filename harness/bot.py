@@ -155,6 +155,13 @@ async def _heartbeat_loop() -> None:
                         "tools": t["tools"],
                     }
                     for channel_id, t in _active_turns.items()
+                    if not t.get("waiting_background")
+                ],
+                # Turns whose reply is done and that only wait for background tasks: idle for idle-waiters.
+                "background_turns": [
+                    {"channel_id": channel_id, "instance": t["instance"], "background": t.get("background", 0)}
+                    for channel_id, t in _active_turns.items()
+                    if t.get("waiting_background")
                 ],
             }
             tmp = config.HEARTBEAT_PATH.with_suffix(".tmp")
@@ -169,6 +176,8 @@ async def _progress_updates(inst: Instance, channel: discord.abc.Messageable, tu
     """Post a short 'still working' status while a turn runs long."""
     while True:
         await asyncio.sleep(config.STATUS_UPDATE_INTERVAL)
+        if turn.get("waiting_background"):
+            continue  # the reply is done; only background tasks run
         elapsed = _fmt_duration(time.time() - turn["started_at"])
         silent = _fmt_duration(time.time() - turn["last_event_at"])
         log.info("[%s] still running: %s elapsed, %d tools, last output %s ago",
@@ -452,6 +461,8 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # Background tasks the agent has running, and whether this turn gave its slot back while they run.
         "background": 0,
         "slot_freed": False,
+        # Set after the reply while only background tasks run: no "still working" notes, idle for restarts.
+        "waiting_background": False,
     }
     _active_turns[inst.channel_id] = turn
     # Kept until the turn ends, so a restart that cuts it off leaves the record (see harness/resume.py).
@@ -530,13 +541,21 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 elif event.kind == "session":
                     capture_session(event.session_id)
                 elif event.kind == "background":
+                    # After the reply, only background work is left: other channels' turns may run meanwhile.
                     turn["background"] = int(event.text or 0)
-                    # Waiting only for background work: let other channels' turns run meanwhile.
-                    if turn["background"] and not turn["slot_freed"]:
+                    turn["waiting_background"] = turn["background"] > 0
+                    if turn["waiting_background"] and not turn["slot_freed"]:
                         turn["slot_freed"] = True
                         _global_semaphore.release()
-                        log.info("[%s] %d background task(s) running; turn slot freed", inst.name, turn["background"])
+                        log.info("[%s] reply done; waiting for %d background task(s); turn slot freed",
+                                 inst.name, turn["background"])
                 elif event.kind == "delivered":
+                    if turn["waiting_background"]:
+                        # A message sent after the reply: the agent works on it now, so the turn needs its slot.
+                        turn["waiting_background"] = False
+                        if turn["slot_freed"]:
+                            await _global_semaphore.acquire()
+                            turn["slot_freed"] = False
                     if (msg := turn["steered"].pop(event.text, None)) is not None:
                         _wa_task(_react(msg, "✅"))
                 elif event.kind == "interrupted":
@@ -1531,8 +1550,8 @@ async def _run_turn_recovering(inst: Instance, prompt: str, status_msg: discord.
 def _busy_notice(inst: Instance, *, steered: bool) -> str | None:
     """A one-per-turn note when a message has to wait for (or went into) a busy turn."""
     turn = _active_turns.get(inst.channel_id)
-    if turn is None or turn.get("notified"):
-        return None
+    if turn is None or turn.get("notified") or turn.get("waiting_background"):
+        return None  # after the reply, only background tasks run: the message goes straight to the agent
     silent = time.time() - turn["last_event_at"]
     if steered and silent < STUCK_AFTER:
         return None  # ⏩ says enough while the agent is visibly working
@@ -2285,10 +2304,11 @@ async def _announce_update() -> None:
 )
 @discord.app_commands.default_permissions(administrator=True)
 async def cmd_update(interaction: discord.Interaction, force: bool = False) -> None:
-    if _active_turns and not force:
-        names = ", ".join(t["instance"] for t in _active_turns.values())
+    working = [t for t in _active_turns.values() if not t.get("waiting_background")]
+    if working and not force:
+        names = ", ".join(t["instance"] for t in working)
         await interaction.response.send_message(
-            f"⏳ {len(_active_turns)} turn(s) running ({names}); a restart would kill them. "
+            f"⏳ {len(working)} turn(s) running ({names}); a restart would kill them. "
             "Retry when they finish, or use `force:True`."
         )
         return

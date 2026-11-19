@@ -252,7 +252,8 @@ class ClaudeProvider(AgentProvider):
                     yield StreamEvent(kind="session", session_id=captured_session)
                 if etype == "system" and event.get("subtype") == "background_tasks_changed":
                     background = list(event.get("tasks") or [])
-                    yield StreamEvent(kind="background", text=str(len(background)))
+                    if holding_since:  # reported only after the reply: before it, the turn is still working
+                        yield StreamEvent(kind="background", text=str(len(background)))
                     if not background and holding_since and not unread:
                         log.info("claude pid=%d: background tasks done; closing input", proc.pid)
                         holding_since = None
@@ -286,6 +287,7 @@ class ClaudeProvider(AgentProvider):
                             log.info("claude pid=%d: %d background task(s) running; input stays open",
                                      proc.pid, len(background))
                         holding_since = holding_since or time.monotonic()
+                        yield StreamEvent(kind="background", text=str(len(background)))
                     elif not unread:
                         holding_since = None
                         close_stdin()
