@@ -11,6 +11,12 @@ Discord — designed for driving agents from your phone.
 - **Sessions survive restarts.** The harness stores each instance's provider session
   ID on disk. If the harness (or the whole machine) goes down, the next message in
   the channel transparently resumes the agent exactly where it left off.
+- **Background work survives the reply.** An agent's subagents and background commands keep
+  running after it replies: while the CLI reports background tasks, the harness keeps the turn's
+  input open (once input closes, the Claude CLI stops waiting for background tasks after about 10
+  minutes and they die). The turn gives its concurrency slot back meanwhile, and messages sent to
+  the channel go into the running session. Input closes when no background task is left, or after
+  `BACKGROUND_WAIT_MAX_HOURS` (12).
 - **Work cut off by a restart resumes by itself.** A turn lasts as long as the agent's
   process, including background subagents after its reply. Each running turn is recorded
   in `data/interrupted_turns.json` until it ends. After a restart, each channel whose turn
