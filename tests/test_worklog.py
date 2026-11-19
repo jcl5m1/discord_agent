@@ -178,6 +178,19 @@ class GoneWorkerTests(unittest.TestCase):
         self.assertIn("2 gone", text)
         self.assertIn("old@m", run_command(log.state, "workers --all", "", set(), now=later)[0])
 
+    def test_workers_without_an_instance_on_this_machine_are_gone(self):
+        log = Log()
+        for w in ("pf@m", "pf@m/sub-1", "harness@m", "issues@m", "other@m2", "term"):
+            log.wl(0, w, "register")
+        text = run_command(log.state, "workers", "", set(), now=T0 + 60, live={"pf@m"}, machine="m")[0]
+        self.assertIn("pf@m/sub-1", text)
+        for gone in ("harness@m", "issues@m"):
+            self.assertNotIn(gone, text)
+        self.assertIn("other@m2", text)  # another machine's: its own bot knows
+        self.assertIn("term", text)  # a terminal session, seen a minute ago
+        later = run_command(log.state, "workers", "", set(), now=T0 + 2 * 86400, live={"pf@m"}, machine="m")[0]
+        self.assertNotIn("term ", later)  # no bot runs it: gone after a day
+
 
 class LeaseAndMessageTests(unittest.TestCase):
     def test_lease_exclusive_until_expiry(self):

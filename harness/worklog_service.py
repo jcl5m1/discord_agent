@@ -249,6 +249,14 @@ class WorklogService:
         me = self.client.user.id if self.client.user else 0
         return {w.name for w in self.state.workers.values() if w.bot == me}
 
+    def live_workers(self) -> set[str] | None:
+        """The worker names of the harness instances on this machine now (None if unknown)."""
+        try:
+            data = json.loads((config.DATA_DIR / "instances.json").read_text())
+            return {self.worker_name(i["name"]) for i in data.values() if not i.get("stopped")}
+        except (OSError, ValueError, KeyError, AttributeError):
+            return None
+
     def worker_name(self, instance_name: str) -> str:
         from .bot import _slug  # local import: bot imports this module
 
@@ -430,7 +438,8 @@ class WorklogService:
         if argv[:1] == ["wait"] and not self._has_harness(worker):
             await self._wait_for_mail(worker, argv)
         try:
-            text, ev, read = run_command(self.state, argv, worker, self.reads(worker))
+            text, ev, read = run_command(self.state, argv, worker, self.reads(worker),
+                                         live=self.live_workers(), machine=self.machine)
         except CommandError as e:
             return False, str(e)
         if read:

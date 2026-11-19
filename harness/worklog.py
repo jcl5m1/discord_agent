@@ -26,6 +26,7 @@ CHECKIN_EVERY = 30 * 60  # seconds a claim stays valid without a check-in
 CHECKIN_WORDS = 10
 GONE_AFTER = 3 * 86400  # status hides an agent not seen this long (and holding no claim)
 GONE_AFTER_SUB = 2 * 3600  # ... and a subagent (`<agent>/sub-N`) after this long
+GONE_AFTER_TERMINAL = 86400  # ... and a worker no harness bot runs (a terminal session) after this long
 STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
@@ -322,12 +323,24 @@ class Worklog:
             return True
         return any(t.lapsed(now) for t in self.owned_by(worker))
 
-    def is_gone(self, worker: str, now: float) -> bool:
-        """A worker that no longer exists, for the status list: long unseen and holding no claim."""
+    def is_gone(self, worker: str, now: float, live: set[str] | None = None, machine: str = "") -> bool:
+        """A worker that no longer exists, for the status list (never one that holds a claim).
+
+        live (with machine): the harness agents that exist on `machine` now. A worker of that machine
+        that isn't one of them is gone (a removed instance, or a sender that isn't an agent), and so
+        are its subagents. Otherwise: unseen for GONE_AFTER (an agent a bot runs), GONE_AFTER_TERMINAL
+        (no bot: a terminal session) or GONE_AFTER_SUB (a subagent).
+        """
         w = self.workers.get(worker)
         if w is None or self.owned_by(worker):
             return False
-        return now - w.seen >= (GONE_AFTER_SUB if "/" in worker else GONE_AFTER)
+        base = worker.split("/")[0]
+        if live is not None and machine and base.endswith("@" + machine) and base not in live:
+            return True
+        if "/" in worker:
+            return now - w.seen >= GONE_AFTER_SUB or (base in self.workers and self.is_gone(base, now, live, machine))
+        parent = self.workers.get(base)
+        return now - w.seen >= (GONE_AFTER if parent and parent.bot else GONE_AFTER_TERMINAL)
 
     def owned_by(self, worker: str) -> list[Task]:
         return [t for t in self.tasks.values() if t.owner == worker and t.status == "claimed"]
@@ -458,7 +471,8 @@ def _task_line(t: Task, now: float) -> str:
 
 
 def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[int],
-                now: float | None = None) -> tuple[str, dict | None, list[int]]:
+                now: float | None = None, live: set[str] | None = None,
+                machine: str = "") -> tuple[str, dict | None, list[int]]:
     """Run a `wl` command for `worker`.
 
     Returns (text to print, event to post or None, message ids now read). For a
@@ -564,15 +578,16 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         return "\n".join(out), None, []
     if cmd in ("status", "workers"):
         out = ["Workers:"]
-        shown = [w for w in state.workers.values() if a.all or not state.is_gone(w.name, now)]
+        shown = [w for w in state.workers.values() if a.all or not state.is_gone(w.name, now, live, machine)]
         hidden = len(state.workers) - len(shown)
         for w in sorted(shown, key=lambda w: -w.seen):
             st = "stale" if state.is_stale(w.name, now) else "active"
             where = f" on {w.machine}" if w.machine else ""
             out.append(f"  {w.name:<34} {st:<6} seen {fmt_time(w.seen)}{where}  {w.desc}")
         if hidden:
-            out.append(f"  ({hidden} gone: not seen for {GONE_AFTER // 86400} days, subagents "
-                       f"{GONE_AFTER_SUB // 3600} h, no claims; --all shows them)")
+            out.append(f"  ({hidden} gone: no harness instance on {machine or 'this machine'}, or unseen "
+                       f"{GONE_AFTER // 86400} days (terminal sessions {GONE_AFTER_TERMINAL // 3600} h, subagents "
+                       f"{GONE_AFTER_SUB // 3600} h); none hold claims; --all shows them)")
         if cmd == "workers":
             return "\n".join(out), None, []
         out.append("Leases:")
