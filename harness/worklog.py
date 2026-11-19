@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 
 CHECKIN_EVERY = 30 * 60  # seconds a claim stays valid without a check-in
 CHECKIN_WORDS = 10
+GONE_AFTER = 3 * 86400  # status hides an agent not seen this long (and holding no claim)
+GONE_AFTER_SUB = 2 * 3600  # ... and a subagent (`<agent>/sub-N`) after this long
 STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
@@ -320,6 +322,13 @@ class Worklog:
             return True
         return any(t.lapsed(now) for t in self.owned_by(worker))
 
+    def is_gone(self, worker: str, now: float) -> bool:
+        """A worker that no longer exists, for the status list: long unseen and holding no claim."""
+        w = self.workers.get(worker)
+        if w is None or self.owned_by(worker):
+            return False
+        return now - w.seen >= (GONE_AFTER_SUB if "/" in worker else GONE_AFTER)
+
     def owned_by(self, worker: str) -> list[Task]:
         return [t for t in self.tasks.values() if t.owner == worker and t.status == "claimed"]
 
@@ -413,8 +422,8 @@ def _parser() -> _Parser:
         lambda sp: sp.add_argument("--poll", type=float, default=0))
     sub("list", lambda sp: sp.add_argument("--all", action="store_true"))
     sub("show", num)
-    sub("status")
-    sub("workers")
+    sub("status", lambda sp: sp.add_argument("--all", action="store_true"))
+    sub("workers", lambda sp: sp.add_argument("--all", action="store_true"))
     sub("log", lambda sp: sp.add_argument("-n", type=int, default=30))
     sub("help")
     return p
@@ -422,7 +431,7 @@ def _parser() -> _Parser:
 
 HELP = f"""wl — the shared worklog for every agent on this Discord server (all machines).
   wl status                         workers, open tasks, leases, your unread messages
-  wl list [--all] | show N | log [-n 30] | workers
+  wl list [--all] | show N | log [-n 30] | workers [--all]
   wl add "title" [--desc ..] [--area ..] [--files a.py,b.py] [--prio 1-3] [--after 42,43]
   wl next                           the best open task in your areas
   wl areas [a,b,c]                  show or set the extra task areas you take work in
@@ -555,10 +564,15 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         return "\n".join(out), None, []
     if cmd in ("status", "workers"):
         out = ["Workers:"]
-        for w in sorted(state.workers.values(), key=lambda w: -w.seen):
+        shown = [w for w in state.workers.values() if a.all or not state.is_gone(w.name, now)]
+        hidden = len(state.workers) - len(shown)
+        for w in sorted(shown, key=lambda w: -w.seen):
             st = "stale" if state.is_stale(w.name, now) else "active"
             where = f" on {w.machine}" if w.machine else ""
             out.append(f"  {w.name:<34} {st:<6} seen {fmt_time(w.seen)}{where}  {w.desc}")
+        if hidden:
+            out.append(f"  ({hidden} gone: not seen for {GONE_AFTER // 86400} days, subagents "
+                       f"{GONE_AFTER_SUB // 3600} h, no claims; --all shows them)")
         if cmd == "workers":
             return "\n".join(out), None, []
         out.append("Leases:")

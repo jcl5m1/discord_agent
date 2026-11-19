@@ -160,6 +160,25 @@ class AreaTests(unittest.TestCase):
         self.assertIn("app", run_command(log.state, "areas", "pf@m", set())[0])
 
 
+class GoneWorkerTests(unittest.TestCase):
+    def test_status_hides_gone_workers(self):
+        from harness.worklog import GONE_AFTER
+        log = Log()
+        log.wl(0, "old@m", "register")
+        log.wl(0, "busy@m/sub-1", 'add "x"')
+        log.wl(0, "busy@m/sub-1", "claim 1")
+        log.wl(0, "done@m/sub-2", "register")
+        log.wl(GONE_AFTER - 3600, "new@m", "register")
+        later = T0 + GONE_AFTER + 60
+        text = run_command(log.state, "workers", "", set(), now=later)[0]
+        self.assertIn("new@m", text)
+        self.assertIn("busy@m/sub-1", text)  # holds a claim
+        self.assertNotIn("old@m", text)
+        self.assertNotIn("done@m/sub-2", text)
+        self.assertIn("2 gone", text)
+        self.assertIn("old@m", run_command(log.state, "workers --all", "", set(), now=later)[0])
+
+
 class LeaseAndMessageTests(unittest.TestCase):
     def test_lease_exclusive_until_expiry(self):
         log = Log()
