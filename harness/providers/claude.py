@@ -158,7 +158,8 @@ class ClaudeProvider(AgentProvider):
             # another turn for it at once. If it stays silent, its input is closed.
             waiting_since: float | None = None
             # Background tasks (subagents, background commands) the CLI reports. While any run after the reply,
-            # input stays open: once it is closed, the CLI stops waiting for them after about 10 minutes and they die.
+            # input stays open: with input closed, the CLI exits at the end of its next turn (e.g. the one that
+            # reports a finished subagent) and stops every background task still running.
             background: list = []
             holding_since: float | None = None
             assert proc.stdin is not None and proc.stdout is not None
