@@ -17,6 +17,8 @@ with a "last alive" timestamp. Only *state changes* are appended to the log
     monitor_gap     same boot, monitor not running (suspend, stopped unit) {start, end}
     net_down        internet unreachable since ts   {targets}
     gpu_error       NVIDIA Xid or PCIe error (gpumon) {xid, pci, what, live}
+    mem_low         available memory under 10% (memmon) {avail_pct, swap_used_pct, top}
+    mem_ok          available memory back over 15%    {avail_pct}
     net_up          internet back               {down_since}
 
 A reboot is detected on startup by a changed kernel boot id: the system was
@@ -181,7 +183,7 @@ async def run() -> None:
 
     logged = {int(e["ts"]) for e in read_events() if e.get("event") == "gpu_error"}
     gpu = asyncio.ensure_future(gpumon.run(stop, _append, logged))
-    mem = asyncio.ensure_future(memmon.run(stop))
+    mem = asyncio.ensure_future(memmon.run(stop, _append))
 
     while not stop.is_set():
         t = time.time()
@@ -342,6 +344,7 @@ def summary(now: float | None = None, recent: int = 5) -> str:
         for kind, a, b in outages:
             ongoing = " (ongoing)" if b >= now - 1 else ""
             lines.append(f"• {kind} <t:{int(a)}:f> — {fmt_duration(b - a)}{ongoing}")
+    lines += memmon.summary_lines(events, now)
     lines += gpumon.summary_lines(events, now)
     return "\n".join(lines)
 

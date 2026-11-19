@@ -1,13 +1,17 @@
-"""Memory recorder: which processes used the memory, before a machine runs out.
+"""Process recorder: which processes used the memory and the CPU (health telemetry).
 
 Runs inside the uptime monitor (python -m harness.uptime). Linux only.
 
-Each minute it appends one line to data/mem/<month>.csv: available memory,
-swap use, memory pressure (PSI: the share of time tasks waited for memory), and
-the TOP_N processes by resident memory, with their command lines. When
-available memory is below TIGHT_PCT, it writes a line every TIGHT_EVERY seconds
-instead, so the minutes before an out-of-memory freeze are recorded in detail.
-Each line is flushed and synced, so it survives a hard reset.
+- Each minute it appends one line to data/mem/<month>.csv: available memory,
+  swap use, memory pressure (PSI: the share of time tasks waited for memory),
+  the TOP_N processes by memory (resident + swapped) and the TOP_N by CPU since
+  the previous line, each with its command line. When available memory is
+  below LOW_PCT, it writes a line every TIGHT_EVERY seconds, so the minutes
+  before an out-of-memory freeze are recorded in detail. Lines are synced to
+  disk, so they survive a hard reset.
+- Events in data/uptime.jsonl (shown by /uptime): `mem_low` when available
+  memory falls below LOW_PCT (with the top processes), `mem_ok` when it is back
+  above OK_PCT.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from . import config
 
@@ -28,9 +33,12 @@ log = logging.getLogger("memmon")
 DIR: Path = config.DATA_DIR / "mem"
 EVERY = 60.0
 TIGHT_EVERY = 10.0
-TIGHT_PCT = 10.0  # available memory below this % of RAM: record every TIGHT_EVERY seconds
+LOW_PCT = 10.0  # available memory below this % of RAM: record every TIGHT_EVERY s, and a mem_low event
+OK_PCT = 15.0  # back above this: a mem_ok event
 TOP_N = 6
-HEADER = ["time", "avail_pct", "avail_mib", "swap_used_pct", "psi_some_avg10", "psi_full_avg10", "top"]
+HEADER = ["time", "avail_pct", "avail_mib", "swap_used_pct", "psi_some_avg10", "psi_full_avg10",
+          "top_mem", "top_cpu"]
+TICK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def _meminfo() -> dict[str, int]:
@@ -46,47 +54,83 @@ def _psi() -> tuple[float | None, float | None]:
         lines = Path("/proc/pressure/memory").read_text().splitlines()
     except OSError:
         return None, None
-    vals = []
-    for line in lines[:2]:
-        part = dict(x.split("=") for x in line.split()[1:])
-        vals.append(float(part.get("avg10", 0)))
-    return (vals + [None, None])[0], (vals + [None, None])[1]
+    vals = [float(dict(x.split("=") for x in line.split()[1:]).get("avg10", 0)) for line in lines[:2]]
+    vals += [None, None]
+    return vals[0], vals[1]
 
 
-def top_processes(n: int = TOP_N) -> list[dict]:
-    """The n processes with the most resident memory: pid, rss MiB, swap MiB, command line."""
-    procs = []
-    for d in Path("/proc").iterdir():
-        if not d.name.isdigit():
-            continue
+def _cmd(d: Path) -> str:
+    try:
+        cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return ""
+    if not cmd:  # a kernel thread
         try:
-            status = {k: v for k, _, v in (x.partition(":") for x in (d / "status").read_text().splitlines())}
-            rss = int(status.get("VmRSS", "0 kB").split()[0])
-            swap = int(status.get("VmSwap", "0 kB").split()[0])
-            if rss + swap == 0:
-                continue
-            procs.append((rss, swap, d))
-        except (OSError, ValueError):
-            continue
-    out = []
-    for rss, swap, d in sorted(procs, key=lambda p: -(p[0] + p[1]))[:n]:
-        try:
-            cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            cmd = f"[{(d / 'comm').read_text().strip()}]"
         except OSError:
-            cmd = ""
-        out.append({"pid": int(d.name), "rss_mib": rss // 1024, "swap_mib": swap // 1024, "cmd": cmd[:200]})
-    return out
+            pass
+    return cmd[:200]
 
 
-def sample() -> list:
-    m = _meminfo()
-    total, avail = m["MemTotal"], m["MemAvailable"]
-    swap_total, swap_free = m.get("SwapTotal", 0), m.get("SwapFree", 0)
-    some, full = _psi()
-    return [time.strftime("%Y-%m-%d %H:%M:%S"), f"{100 * avail / total:.1f}", avail // 1024,
-            f"{100 * (swap_total - swap_free) / swap_total:.1f}" if swap_total else "",
-            "" if some is None else some, "" if full is None else full,
-            json.dumps(top_processes(), separators=(",", ":"))]
+class Recorder:
+    def __init__(self, append_event: Callable[..., dict] | None = None):
+        self.append_event = append_event
+        self.prev_cpu: dict[int, int] = {}  # pid -> CPU ticks at the previous sample
+        self.prev_t = 0.0
+        self.low = False
+
+    def processes(self) -> tuple[list[dict], list[dict]]:
+        """(top by memory, top by CPU % since the previous call)."""
+        now = time.monotonic()
+        mem, cpu, ticks = [], [], {}
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            pid = int(d.name)
+            try:
+                stat = (d / "stat").read_text()
+                fields = stat[stat.rindex(")") + 2:].split()
+                ticks[pid] = int(fields[11]) + int(fields[12])  # utime + stime
+                status = {k: v for k, _, v in (x.partition(":") for x in (d / "status").read_text().splitlines())}
+                rss = int(status.get("VmRSS", "0 kB").split()[0])
+                swap = int(status.get("VmSwap", "0 kB").split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if rss + swap:
+                mem.append((rss + swap, rss, swap, d))
+            if self.prev_t and pid in self.prev_cpu:
+                pct = 100 * (ticks[pid] - self.prev_cpu[pid]) / TICK / (now - self.prev_t)
+                if pct >= 1:
+                    cpu.append((pct, d))
+        self.prev_cpu, self.prev_t = ticks, now
+        top_mem = [{"pid": int(d.name), "rss_mib": rss // 1024, "swap_mib": swap // 1024, "cmd": _cmd(d)}
+                   for _, rss, swap, d in sorted(mem, key=lambda p: -p[0])[:TOP_N]]
+        top_cpu = [{"pid": int(d.name), "cpu_pct": round(pct), "cmd": _cmd(d)}
+                   for pct, d in sorted(cpu, key=lambda p: -p[0])[:TOP_N]]
+        return top_mem, top_cpu
+
+    def sample(self) -> list:
+        m = _meminfo()
+        total, avail = m["MemTotal"], m["MemAvailable"]
+        swap_total, swap_free = m.get("SwapTotal", 0), m.get("SwapFree", 0)
+        some, full = _psi()
+        top_mem, top_cpu = self.processes()
+        return [time.strftime("%Y-%m-%d %H:%M:%S"), f"{100 * avail / total:.1f}", avail // 1024,
+                f"{100 * (swap_total - swap_free) / swap_total:.1f}" if swap_total else "",
+                "" if some is None else some, "" if full is None else full,
+                json.dumps(top_mem, separators=(",", ":")), json.dumps(top_cpu, separators=(",", ":"))]
+
+    def events(self, row: list) -> None:
+        avail = float(row[1])
+        if not self.append_event:
+            return
+        if not self.low and avail < LOW_PCT:
+            self.low = True
+            top = [f"{p['rss_mib'] + p['swap_mib']} MiB {p['cmd'][:80]}" for p in json.loads(row[6])[:3]]
+            self.append_event("mem_low", avail_pct=avail, swap_used_pct=row[3], top=top)
+        elif self.low and avail > OK_PCT:
+            self.low = False
+            self.append_event("mem_ok", avail_pct=avail)
 
 
 def write(row: list) -> None:
@@ -102,22 +146,69 @@ def write(row: list) -> None:
         os.fsync(f.fileno())
 
 
-async def run(stop: asyncio.Event) -> None:
+def latest() -> dict | None:
+    """The newest recorded line, as a dict (None if there is none)."""
+    files = sorted(DIR.glob("*.csv"))
+    if not files:
+        return None
+    with files[-1].open(newline="") as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 2 or rows[0] != HEADER:
+        return None
+    return dict(zip(HEADER, rows[-1]))
+
+
+async def run(stop: asyncio.Event, append_event: Callable[..., dict] | None = None) -> None:
     if not sys.platform.startswith("linux") or not config.MEM_MONITOR:
         return
     log.info("memmon: recording to %s", DIR)
+    rec = Recorder(append_event)
+    await asyncio.to_thread(rec.processes)  # a CPU baseline for the first line
     last = 0.0
     while not stop.is_set():
-        try:
-            row = await asyncio.to_thread(sample)
-            tight = float(row[1]) < TIGHT_PCT
-            if tight or time.time() - last >= EVERY:
-                await asyncio.to_thread(write, row)
-                last = time.time()
-        except Exception:
-            log.exception("memmon sample failed")
-            tight = False
         try:
             await asyncio.wait_for(stop.wait(), TIGHT_EVERY)
         except asyncio.TimeoutError:
             pass
+        if stop.is_set():
+            break
+        try:
+            if time.time() - last < EVERY and float((await asyncio.to_thread(_meminfo_pct))) >= LOW_PCT:
+                continue
+            row = await asyncio.to_thread(rec.sample)
+            await asyncio.to_thread(write, row)
+            rec.events(row)
+            last = time.time()
+        except Exception:
+            log.exception("memmon sample failed")
+
+
+def _meminfo_pct() -> float:
+    m = _meminfo()
+    return 100 * m["MemAvailable"] / m["MemTotal"]
+
+
+def summary_lines(events: list[dict], now: float, days: int = 30) -> list[str]:
+    """Lines for /uptime: memory now, the top processes, and low-memory events."""
+    lines = []
+    cur = latest()
+    if cur:
+        lines += ["", f"**Memory** ({cur['time'][11:16]}): {cur['avail_pct']}% available, "
+                      f"swap {cur['swap_used_pct'] or '?'}% used, pressure {cur['psi_some_avg10'] or '?'}%"]
+        for p in json.loads(cur["top_mem"])[:3]:
+            lines.append(f"• {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB — `{_short(p['cmd'])}`")
+        busy = json.loads(cur["top_cpu"])[:3]
+        if busy:
+            lines.append("**CPU**: " + " · ".join(f"{p['cpu_pct']}% `{_short(p['cmd'], 40)}`" for p in busy))
+    low = [e for e in events if e.get("event") == "mem_low" and now - e["ts"] < days * 86400]
+    if low:
+        lines.append(f"**Low memory** (last {days} days): {len(low)}")
+        for e in low[-3:]:
+            top = (e.get("top") or ["?"])[0]
+            lines.append(f"• <t:{int(e['ts'])}:f> — {e.get('avail_pct')}% free; top: `{_short(top, 60)}`")
+    return lines
+
+
+def _short(cmd: str, n: int = 70) -> str:
+    cmd = cmd.replace("`", "'")
+    return cmd if len(cmd) <= n else cmd[: n - 1] + "…"

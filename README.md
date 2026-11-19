@@ -462,6 +462,17 @@ On first run, earlier reboots are backfilled from the journal.
 downtime for 24h / 7d / 30d / all time, and the most recent outages. Internet
 downtime only counts while the machine was up and monitored.
 
+### Process recorder (memory and CPU)
+
+The uptime monitor also records which processes use the memory and the CPU
+(`harness/memmon.py`, Linux; `MEM_MONITOR=0` turns it off). Each minute it
+appends a line to `data/mem/<month>.csv`: available memory, swap use, memory
+pressure (PSI), the top 6 processes by memory and the top 6 by CPU, with their
+command lines. When less than 10% of RAM is available, it records every 10 s,
+so the minutes before an out-of-memory freeze are kept (synced to disk).
+`/uptime` shows the current memory, the top processes, and `mem_low` events
+(under 10% available) from the last 30 days.
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
