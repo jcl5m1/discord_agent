@@ -172,3 +172,28 @@ class MarkdownTests(unittest.TestCase):
         from harness import gdoc_sync as gs
         self.assertEqual(gs._style({"bold": True, "link": {"bookmarkId": "id.x"}}, gs.TEXT_KEYS), '{"bold": true}')
         self.assertIn("url", gs._style({"link": {"url": "https://x.org"}}, gs.TEXT_KEYS))
+
+
+class PictureIdTests(unittest.TestCase):
+    """gdoc_sync: a JPEG that Google re-encodes is still the same picture (the storey report looped, #55)."""
+
+    @staticmethod
+    def jpeg(img: Image.Image, quality: int) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        return buf.getvalue()
+
+    def test_reencoded_copy_has_the_same_id(self):
+        from harness import gdoc_sync as gs
+        img = Image.new("RGB", (400, 300))
+        for x in range(400):
+            for y in range(0, 300, 7):
+                img.putpixel((x, y), (x % 256, y % 256, 128))
+        cache: dict = {}
+        a = gs._picture_id(self.jpeg(img, 95), cache)
+        b = gs._picture_id(self.jpeg(img, 70), cache)
+        self.assertEqual(a, b)
+        other = img.copy()
+        other.paste((255, 255, 255), (0, 0, 200, 150))  # a changed chart
+        self.assertNotEqual(a, gs._picture_id(self.jpeg(other, 95), cache))
+        self.assertNotEqual(a, gs._picture_id(self.jpeg(img.resize((200, 150)), 95), cache))  # other size

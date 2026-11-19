@@ -412,17 +412,34 @@ def _image_hash(props: dict, cache: dict[str, str]) -> str:
     if uri and uri not in cache:
         with urllib.request.urlopen(uri, timeout=60) as r:
             data = r.read()
-        # Hash the decoded pixels, not the file: Google re-encodes an image that insertInlineImage adds, so its
-        # bytes differ from the temporary Doc's copy even when the picture is the same.
-        try:
-            with Image.open(io.BytesIO(data)) as im:
-                data = im.convert("RGBA").tobytes()
-        except OSError:
-            pass
-        cache[uri] = hashlib.sha1(data).hexdigest()[:16]
+        cache[uri] = _picture_id(data, cache)
     size = emb.get("size", {})
     dims = tuple(round(size.get(k, {}).get("magnitude", 0)) for k in ("width", "height"))
     return f"{cache.get(uri, '')}:{dims}"
+
+
+THUMB = 32  # side of the grey thumbnail two copies of a picture are compared on
+SAME_PICTURE = 2.0  # largest mean difference (0-255) of two thumbnails of the same picture
+
+
+def _picture_id(data: bytes, cache: dict) -> str:
+    """An id for the picture, the same for its copies. Google re-encodes an image that insertInlineImage adds
+    (lossy for JPEG), so neither the file nor the decoded pixels of the copy equal the source. Two images with the
+    same size whose grey thumbnails differ by at most SAME_PICTURE on average are the same picture: the first one
+    seen in this sync gives its id to the others."""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            size = im.size
+            thumb = im.convert("L").resize((THUMB, THUMB), Image.Resampling.BOX).tobytes()
+    except OSError:
+        return hashlib.sha1(data).hexdigest()[:16]
+    seen = cache.setdefault("\0thumbs", [])
+    for other_size, other, pid in seen:
+        if other_size == size and sum(abs(x - y) for x, y in zip(thumb, other)) / len(thumb) <= SAME_PICTURE:
+            return pid
+    pid = hashlib.sha1(thumb + repr(size).encode()).hexdigest()[:16]
+    seen.append((size, thumb, pid))
+    return pid
 
 
 def _u16(text: str) -> int:
