@@ -158,34 +158,60 @@ def latest() -> dict | None:
     return dict(zip(HEADER, rows[-1]))
 
 
+def _quick() -> tuple[float, float | None, float | None, float | None]:
+    """(available %, swap used %, PSI some avg10, PSI full avg10): cheap, for every tick."""
+    m = _meminfo()
+    swap = (100 * (m["SwapTotal"] - m["SwapFree"]) / m["SwapTotal"]) if m.get("SwapTotal") else None
+    return (100 * m["MemAvailable"] / m["MemTotal"], swap, *_psi())
+
+
+def _bot_pid() -> set[int]:
+    try:
+        return {int(json.loads(config.HEARTBEAT_PATH.read_text())["pid"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return set()
+
+
 async def run(stop: asyncio.Event, append_event: Callable[..., dict] | None = None) -> None:
     if not sys.platform.startswith("linux") or not config.MEM_MONITOR:
         return
-    log.info("memmon: recording to %s", DIR)
+    from . import health
+
+    log.info("memmon: recording to %s; health state in %s", DIR, health.STATE_PATH)
     rec = Recorder(append_event)
+    actor = health.Actor(append_event)
     await asyncio.to_thread(rec.processes)  # a CPU baseline for the first line
-    last = 0.0
+    last_line, level, actions = 0.0, "ok", []
+    top_mem: list = []
+    top_cpu: list = []
     while not stop.is_set():
         try:
-            await asyncio.wait_for(stop.wait(), TIGHT_EVERY)
+            await asyncio.wait_for(stop.wait(), TIGHT_EVERY if level == "ok" else 2.0)
         except asyncio.TimeoutError:
             pass
         if stop.is_set():
             break
         try:
-            if time.time() - last < EVERY and float((await asyncio.to_thread(_meminfo_pct))) >= LOW_PCT:
-                continue
-            row = await asyncio.to_thread(rec.sample)
-            await asyncio.to_thread(write, row)
-            rec.events(row)
-            last = time.time()
+            avail, swap, some, full = await asyncio.to_thread(_quick)
+            level, reasons = health.classify(avail, swap, some, full)
+            now = time.time()
+            due = now - last_line >= (EVERY if avail >= LOW_PCT else TIGHT_EVERY)
+            if due or level == "critical":
+                row = await asyncio.to_thread(rec.sample)
+                top_mem, top_cpu = json.loads(row[6]), json.loads(row[7])
+                await asyncio.to_thread(write, row)
+                rec.events(row)
+                last_line = now
+            if level == "critical" and config.HEALTH_ACTIONS:
+                done = await asyncio.to_thread(actor.act, top_mem, _bot_pid())
+                if done:
+                    actions = (actions + [{"ts": now, "text": done}])[-10:]
+            health.write_state({"ts": now, "level": level, "reasons": reasons, "avail_pct": round(avail, 1),
+                                "swap_used_pct": None if swap is None else round(swap, 1),
+                                "psi_some": some, "psi_full": full, "top_mem": top_mem[:5],
+                                "top_cpu": top_cpu[:5], "actions": actions})
         except Exception:
             log.exception("memmon sample failed")
-
-
-def _meminfo_pct() -> float:
-    m = _meminfo()
-    return 100 * m["MemAvailable"] / m["MemTotal"]
 
 
 def summary_lines(events: list[dict], now: float, days: int = 30) -> list[str]:

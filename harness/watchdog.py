@@ -11,6 +11,11 @@ REST API with the bot token (no gateway connection needed):
 - a turn with no events for > WATCHDOG_STALL_AFTER while the harness is alive
   → "agent may be hung" warning, once per turn.
 
+- system health (data/health.json, from the uptime monitor) rises to `warn`
+  or `critical` → one alert per rise, with the reasons and the top memory
+  users, and the actions the monitor took. (The bot tells the health agent to
+  act; see harness/health.py.)
+
 Alerts go to channels with an active turn, falling back to the channel that
 last saw user activity. Long-turn "still working" updates while the harness is
 healthy are posted by the bot itself (STATUS_UPDATE_INTERVAL), not here.
@@ -23,7 +28,7 @@ import logging
 import time
 import urllib.request
 
-from . import config, logfile
+from . import config, health, logfile
 
 logfile.setup("watchdog")
 log = logging.getLogger("discord_agent.watchdog")
@@ -68,6 +73,31 @@ def _alert_channels(payload: dict) -> list[int]:
     return channels
 
 
+def _check_health(prev: str, now: float) -> str:
+    """Alert once when system health rises to warn or critical; returns the level now."""
+    state = health.read_state()
+    if not state or now - state.get("ts", 0) > 300:
+        return prev  # the uptime monitor isn't writing it
+    level = state.get("level", "ok")
+    if health.LEVELS.index(level) > health.LEVELS.index(prev):
+        top = ", ".join(f"{(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB `{p['cmd'][:50]}`"
+                        for p in state.get("top_mem", [])[:3])
+        acts = "".join(f"\n• {a['text'][:150]}" for a in state.get("actions", [])[-2:]
+                       if now - a["ts"] < 600)
+        icon = "🔴" if level == "critical" else "🟠"
+        text = (f"{icon} **system health {level}**: {'; '.join(state.get('reasons', []))}. "
+                f"Top memory: {top}." + (f"\nActions taken:{acts}" if acts else "")
+                + "\nThe health agent is told to take preventive measures.")
+        try:
+            payload = json.loads(config.HEARTBEAT_PATH.read_text())
+            channels = [payload["last_channel_id"]] if payload.get("last_channel_id") else []
+        except (OSError, ValueError):
+            channels = []
+        _post_all(channels, text[:1900])
+        log.warning("health %s: %s", level, state.get("reasons"))
+    return level
+
+
 def main() -> None:
     if not config.BOT_TOKEN:
         raise SystemExit("DISCORD_BOT_TOKEN is not set — copy .env.example to .env and fill it in")
@@ -79,10 +109,12 @@ def main() -> None:
     )
     harness_down = False
     seen_heartbeat = False
+    health_level = "ok"
     stall_warned: set[int] = set()
     while True:
         time.sleep(config.WATCHDOG_CHECK_INTERVAL)
         now = time.time()
+        health_level = _check_health(health_level, now)
         try:
             payload = json.loads(config.HEARTBEAT_PATH.read_text())
             age = now - payload["ts"]

@@ -737,6 +737,7 @@ async def on_ready() -> None:
     if not _resumed:  # once per process: on_ready also runs after a reconnect
         _resumed = True
         _resume_cut_off_turns()
+        asyncio.get_running_loop().create_task(_health_loop())
     for inst in store.all():
         asyncio.get_running_loop().create_task(_catch_up(inst))
     global worklog
@@ -830,6 +831,71 @@ async def _worklog_notify(worker: str, text: str) -> None:
     channel = client.get_channel(inst.channel_id) if inst else None
     if isinstance(channel, discord.TextChannel):
         await channel.send(text[:DISCORD_MSG_LIMIT])
+
+
+def _health_agent() -> Instance | None:
+    """The instance told to prevent crashes: HEALTH_AGENT, else the one working in the harness repo."""
+    live = [i for i in store.all() if not i.stopped]
+    if config.HEALTH_AGENT:
+        return next((i for i in live if i.name == config.HEALTH_AGENT or _slug(i.name) == config.HEALTH_AGENT), None)
+    base = os.path.realpath(config.BASE_DIR)
+    return next((i for i in live if os.path.realpath(os.path.expanduser(i.workdir)) == base), None)
+
+
+_HEALTH_ORDERS = """\
+Take preventive measures now, so this machine does not run out of memory and freeze (a hard crash
+stops every agent and every job). Work quickly:
+1. Find what uses and grows the memory: `ps -eo pid,user,rss,etime,args --sort=-rss | head -15`,
+   and the per-minute record in {mem_dir}. Find the owner of each heavy job: `wl status`, `docker ps`,
+   `systemctl --user list-units --type=service --state=running`.
+2. Ask each owner to pause or reduce its job now: `wl send <worker> "..."`. Ask for fewer parallel
+   workers, smaller batches, or a memory limit (`systemd-run --user -p MemoryMax=8G ...`).
+3. If memory keeps falling and the owner does not act within a few minutes, stop or restart the job
+   yourself. Prefer jobs that can restart (`docker restart`, `systemctl --user restart`). Never stop the
+   harness, its agents, the desktop, sshd or the databases. Do not start heavy work yourself.
+4. When it is safe, find the cause, and prevent a repeat (a memory limit, fewer workers, a fix).
+5. Report in one short message what you did and what the owners must change.
+At `critical`, the monitor already stops the biggest process that is safe to stop; check its actions."""
+
+
+async def _health_loop() -> None:
+    """Tell the health agent to act when system health is warn or critical (harness/health.py)."""
+    from . import health, memmon
+    last_level, last_sent = "ok", 0.0
+    while True:
+        await asyncio.sleep(20)
+        try:
+            state = health.read_state()
+            if not state or time.time() - state.get("ts", 0) > 120:
+                continue
+            level = state.get("level", "ok")
+            rose = health.LEVELS.index(level) > health.LEVELS.index(last_level)
+            again = level != "ok" and time.time() - last_sent > (600 if level == "critical" else 1800)
+            last_level = level
+            if not (rose or again):
+                continue
+            inst = _health_agent()
+            channel = client.get_channel(inst.channel_id) if inst else None
+            if not isinstance(channel, discord.TextChannel):
+                log.warning("system health %s, but no health agent to tell (set HEALTH_AGENT)", level)
+                continue
+            last_sent = time.time()
+            top = "\n".join(f"- {(p['rss_mib'] + p['swap_mib']) / 1024:.1f} GB pid {p['pid']}: {p['cmd'][:150]}"
+                             for p in state.get("top_mem", []))
+            cpu = "\n".join(f"- {p['cpu_pct']}% pid {p['pid']}: {p['cmd'][:120]}" for p in state.get("top_cpu", [])[:3])
+            acts = "\n".join(f"- {a['text']}" for a in state.get("actions", []) if time.time() - a["ts"] < 900)
+            prompt = (f"[System health: {level.upper()}] {'; '.join(state.get('reasons', []))}. "
+                      f"Swap {state.get('swap_used_pct')}% used.\nTop memory:\n{top}\nTop CPU:\n{cpu}\n"
+                      + (f"Actions the monitor took:\n{acts}\n" if acts else "")
+                      + _HEALTH_ORDERS.format(mem_dir=memmon.DIR))
+            shown = f"{'🔴' if level == 'critical' else '🟠'} **system health {level}**: " \
+                    f"{'; '.join(state.get('reasons', []))} — taking preventive measures"
+            anchor = await channel.send(shown[:DISCORD_MSG_LIMIT])
+            log.warning("[%s] system health %s: health agent told", inst.name, level)
+            if not _steer(inst, anchor, prompt):
+                asyncio.get_running_loop().create_task(on_message_simple(channel, prompt))
+        except Exception:
+            log.exception("health loop failed")
 
 
 def _worklog_idle_for(worker: str) -> float | None:

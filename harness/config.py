@@ -143,6 +143,11 @@ GDOC_WEB_REGISTRY: Path | None = (Path(os.path.expanduser(os.environ["GDOC_WEB_R
                                   if os.environ.get("GDOC_WEB_REGISTRY") else None)
 # Memory recorder in the uptime monitor (harness/memmon.py): top processes by memory, each minute.
 MEM_MONITOR: bool = os.environ.get("MEM_MONITOR", "1").lower() not in ("0", "false", "no", "off")
+# System health (harness/health.py): memory levels, the agent told to prevent a crash, the last-resort action.
+HEALTH_WARN_PCT: float = float(os.environ.get("HEALTH_WARN_PCT", "20"))  # available RAM % for `warn`
+HEALTH_CRIT_PCT: float = float(os.environ.get("HEALTH_CRIT_PCT", "6"))  # available RAM % for `critical`
+HEALTH_ACTIONS: bool = os.environ.get("HEALTH_ACTIONS", "1").lower() not in ("0", "false", "no", "off")
+HEALTH_AGENT: str = os.environ.get("HEALTH_AGENT", "")  # instance name; default: the one in the harness repo
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.

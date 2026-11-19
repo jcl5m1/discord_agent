@@ -473,6 +473,31 @@ so the minutes before an out-of-memory freeze are kept (synced to disk).
 `/uptime` shows the current memory, the top processes, and `mem_low` events
 (under 10% available) from the last 30 days.
 
+### Crash prevention (system health)
+
+Hard crashes here came from memory: programs fill the RAM and the swap, the
+machine thrashes, and it freezes. `harness/health.py` watches for it:
+
+- **Levels.** `warn`: under `HEALTH_WARN_PCT` (20%) of RAM available, swap 80%
+  used with under 30% available, or memory pressure (PSI some avg10) at 20%.
+  `critical`: under `HEALTH_CRIT_PCT` (6%) available, or PSI full avg10 at 30%.
+  The process recorder checks every 10 s (every 2 s when not ok) and writes
+  `data/health.json`.
+- **The health agent acts at `warn`.** The bot tells the health agent
+  (`HEALTH_AGENT`; default: the instance that works in the harness repo) to take
+  preventive measures: find what grows, ask its owner to pause it (`wl send`),
+  stop or restart jobs that can restart, then prevent a repeat. It repeats the
+  order every 30 min (10 min at `critical`) while the level stays up.
+- **The monitor acts at `critical`.** It stops the biggest process (at least
+  1 GB) that is safe to stop: SIGTERM, then SIGKILL after 15 s. A process in a
+  Docker container gets `docker restart`. It never stops the agents, the harness,
+  the desktop, sshd, databases or container daemons. Each action is a
+  `health_action` event. `HEALTH_ACTIONS=0` turns this off.
+- **The watchdog alerts** in Discord when the level rises.
+
+For the kernel side, install `earlyoom`, and keep enough swap (see the
+README's setup notes, or ask the harness agent for the commands).
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
