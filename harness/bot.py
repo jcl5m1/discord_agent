@@ -937,13 +937,50 @@ stops every agent and every job). Work quickly:
 At `critical`, the monitor already stops the biggest process that is safe to stop; check its actions."""
 
 
+_DISK_ORDERS = """\
+Take preventive measures now, so the main disk does not fill up (a full disk stops every agent, the logs
+and the harness). The monitor already cleaned safe caches{moved}. Work quickly:
+1. Find what grew: `du -x -d2 -h ~ | sort -h | tail -20`, `docker system df`, and the jobs that write the
+   most (`wl status`; ask agents what they write).
+2. Ask owners to delete or shrink their data: `wl send <worker> "..."` (old builds, frame dumps, logs, temp
+   folders, unused Docker images and volumes).
+3. Move data that is not used to the secondary drive: `python -m harness.diskcare offload <folder>` (it
+   leaves a symlink, so paths keep working; `restore <folder>` moves it back). Cold candidates:
+{cands}
+   Never move git repos, virtual environments, config folders, or data a running job uses.
+4. Report in one short message what you did, how much space is free, and what owners must change."""
+
+
 async def _health_loop() -> None:
     """Tell the health agent to act when system health is warn or critical (harness/health.py)."""
-    from . import health, memmon
+    from . import diskcare, health, memmon
     last_level, last_sent = "ok", 0.0
+    disk_level, disk_sent = "ok", 0.0
     while True:
         await asyncio.sleep(20)
         try:
+            dstate = diskcare.read_state()
+            if dstate and time.time() - dstate.get("ts", 0) < 1800:
+                dl = dstate.get("level", "ok")
+                rose = disk.LEVELS.index(dl) > disk.LEVELS.index(disk_level)
+                again = dl != "ok" and time.time() - disk_sent > 3600
+                disk_level = dl
+                inst = _health_agent() if (rose or again) else None
+                channel = client.get_channel(inst.channel_id) if inst else None
+                if isinstance(channel, discord.TextChannel):
+                    disk_sent = time.time()
+                    cands = "\n".join(f"   - {c['gb']} GB, unchanged {c['days']} days: {c['path']}"
+                                       for c in dstate.get("candidates", [])[:8]) or "   (none found)"
+                    moved = [a["text"] for a in dstate.get("actions", []) if time.time() - a["ts"] < 3600
+                             and a["text"].startswith("moved")]
+                    prompt = (f"[System health: DISK {dl.upper()}] {dstate.get('path')} is {dstate.get('pct')}% "
+                              f"used, {disk.fmt_bytes(dstate.get('free', 0))} free.\n"
+                              + _DISK_ORDERS.format(cands=cands, moved=(" and moved: " + "; ".join(moved)) if moved else ""))
+                    anchor = await channel.send(f"💾 **disk {dl}**: {dstate.get('pct')}% used, "
+                                                f"{disk.fmt_bytes(dstate.get('free', 0))} free — taking preventive measures")
+                    log.warning("[%s] disk %s: health agent told", inst.name, dl)
+                    if not _steer(inst, anchor, prompt):
+                        asyncio.get_running_loop().create_task(on_message_simple(channel, prompt))
             state = health.read_state()
             if not state or time.time() - state.get("ts", 0) > 120:
                 continue

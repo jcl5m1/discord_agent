@@ -157,6 +157,13 @@ DISK_WARN_PCT: float = float(os.environ.get("DISK_WARN_PCT", "90"))
 DISK_CRIT_PCT: float = float(os.environ.get("DISK_CRIT_PCT", "95"))
 DISK_FULL_MB: float = float(os.environ.get("DISK_FULL_MB", "500"))
 DISK_OK_PCT: float = float(os.environ.get("DISK_OK_PCT", "85"))
+# Disk care (harness/diskcare.py): clean caches at DISK_CLEAN_PCT; at DISK_OFFLOAD_PCT move cold data to
+# DISK_OFFLOAD_TO (a folder on a secondary drive; empty = off) until under DISK_OFFLOAD_TARGET.
+DISK_CARE: bool = os.environ.get("DISK_CARE", "1").lower() not in ("0", "false", "no", "off")
+DISK_CLEAN_PCT: float = float(os.environ.get("DISK_CLEAN_PCT", "85"))
+DISK_OFFLOAD_PCT: float = float(os.environ.get("DISK_OFFLOAD_PCT", "90"))
+DISK_OFFLOAD_TARGET: float = float(os.environ.get("DISK_OFFLOAD_TARGET", "80"))
+DISK_OFFLOAD_TO: str = os.path.expanduser(os.environ.get("DISK_OFFLOAD_TO", ""))
 DISK_PATHS: list[str] = [p for p in os.environ.get("DISK_PATHS", "").split(",") if p]  # more disks to watch
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")

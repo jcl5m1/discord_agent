@@ -519,6 +519,28 @@ log or save its heartbeat, and the logs stop. So:
 - The **uptime monitor** keeps running on a full disk: events wait in memory
   and are written when there is space again; GPU and memory samples are skipped.
 
+### Disk care (keeping the main disk from filling)
+
+`harness/diskcare.py` runs in the uptime monitor and checks the home folder's
+disk every 10 minutes (at once when its level rises):
+
+- **At 85% used** (`DISK_CLEAN_PCT`) it cleans what is safe to delete: rebuildable
+  caches under `~/.cache` (pip, thumbnails, shader and font caches, the desktop
+  search index, …), `uv cache prune`, this user's files in `/tmp` and `/var/tmp`
+  untouched for 2 days, dangling Docker images, the Docker build cache, and
+  containers stopped for a week. It never touches Docker volumes or model caches.
+- **At 90%** (`DISK_OFFLOAD_PCT`), if `DISK_OFFLOAD_TO` is set (a folder on a
+  secondary drive), it moves cold data there until the disk is under 80%
+  (`DISK_OFFLOAD_TARGET`): folders of at least 1 GB under the home folder where no
+  file changed for 14 days, never git work trees, virtual environments, config
+  folders or folders a process has open. A moved folder leaves a symlink, so its
+  path keeps working.
+- **At warn** the bot tells the health agent to find what grew, ask the owners to
+  shrink it, and move unused data, with the list of cold folders.
+
+Each action goes to `data/disk_actions.jsonl` and `/uptime`'s event log. By hand:
+`python -m harness.diskcare status | scan | clean | offload <folder> | restore <folder>`.
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
