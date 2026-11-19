@@ -18,8 +18,9 @@ Every agent on the machine shares it, so jobs stop colliding:
   and a `--memory` limit: containers run outside the scope). If heavy itself is killed hard, the next
   heavy run or the uptime monitor's sweep stops what it left.
 - Log: one line per job in data/heavy/jobs.jsonl: who, class, command, wait and wall time, exit
-  code, and the scope's totals (peak memory, CPU seconds, MiB read and written), sampled every
-  POLL seconds, so a job shorter than that has no totals. Labelled containers run outside the scope:
+  code, and the scope's totals: peak_mib (memory.peak, incl. the file cache the job caused),
+  anon_peak_mib (the job's own memory, the max of the samples), CPU seconds, MiB read and written.
+  Sampled every second for the first 10 s, then every POLL seconds; a job under 1 s has no totals. Labelled containers run outside the scope:
   their cgroup totals are the ctr_* keys (summed over the job's containers). "inputs" lists the job's
   input files (--input PATH, repeatable, and the command's arguments that are existing files) with
   size, mtime and id = sha1(size + first MiB)[:16], so the same input processed twice is visible;
@@ -185,7 +186,12 @@ def _cg_usage(cg: Path) -> dict:
     if not cg.is_dir():
         return out
     try:
-        out["peak"] = int((cg / "memory.peak").read_text())
+        out["peak"] = int((cg / "memory.peak").read_text())  # includes the file cache it caused
+    except (OSError, ValueError):
+        pass
+    try:  # the job's own memory (anonymous pages), without the file cache; its max over the samples
+        stat = dict(line.split() for line in (cg / "memory.stat").read_text().splitlines())
+        out["anon"] = int(stat.get("anon", 0))
     except (OSError, ValueError):
         pass
     try:
@@ -340,9 +346,11 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop)
     try:
+        t0 = time.monotonic()
         while True:
             try:
-                rc = proc.wait(timeout=POLL)
+                # Every second in the first 10 s (most decodes are that short), then every POLL seconds.
+                rc = proc.wait(timeout=1.0 if time.monotonic() - t0 < 10 else POLL)
                 break
             except subprocess.TimeoutExpired:
                 now = _usage(proc.pid)  # the scope is gone once the job ends: keep the last sample
@@ -358,6 +366,7 @@ def run(cls: str, cmd: list[str], mem: str, swap: str, cpus: float | None, max_w
         slot.release()
         _log({**info, "class": cls, "end": time.time(), "wall_s": round(time.time() - info["since"] - waited),
               "waited_s": round(waited), "rc": rc, "mem": mem, "peak_mib": use.get("peak", 0) // 1048576,
+              "anon_peak_mib": use.get("anon", 0) // 1048576,
               "cpu_s": use.get("cpu_s"), "read_mib": use.get("read", 0) // 1048576,
               "written_mib": use.get("written", 0) // 1048576, "inputs": ins,
               **({"ctr_cpu_s": round(sum(c.get("cpu_s", 0) for c in ctrs.values()), 1),
