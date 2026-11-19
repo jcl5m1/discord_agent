@@ -11,6 +11,10 @@ REST API with the bot token (no gateway connection needed):
 - a turn with no events for > WATCHDOG_STALL_AFTER while the harness is alive
   → "agent may be hung" warning, once per turn.
 
+- a disk (the root disk, the harness data's disk, DISK_PATHS) rises to warn
+  (90% used), critical (95%) or full (under 500 MB free) → one alert per rise,
+  with the biggest folders in the home folder; "back to normal" under 85%.
+  The bot can't report this itself once the disk is full.
 - system health (data/health.json, from the uptime monitor) rises to `warn`
   or `critical` → one alert per rise, with the reasons and the top memory
   users, and the actions the monitor took. (The bot tells the health agent to
@@ -28,7 +32,7 @@ import logging
 import time
 import urllib.request
 
-from . import config, health, logfile
+from . import config, disk, health, logfile
 
 logfile.setup("watchdog")
 log = logging.getLogger("discord_agent.watchdog")
@@ -73,6 +77,36 @@ def _alert_channels(payload: dict) -> list[int]:
     return channels
 
 
+def _check_disks(levels: dict[str, str], channels: list[int]) -> None:
+    """Alert when a disk's level rises (warn 90%, critical 95%, full), and when it is back under 85%."""
+    for path in disk.paths():
+        try:
+            pct, free = disk.usage(path)
+        except OSError:
+            continue
+        prev = levels.get(str(path), "ok")
+        level = disk.level(pct, free, prev)
+        levels[str(path)] = level
+        if level == prev:
+            continue
+        rose = disk.LEVELS.index(level) > disk.LEVELS.index(prev)
+        if rose:
+            icon = {"warn": "🟠", "critical": "🔴", "full": "🛑"}[level]
+            big = "".join(f"\n• {disk.fmt_bytes(size)} `{name}`" for size, name in disk.biggest_dirs(path))
+            text = (f"{icon} **disk {level}**: `{path}` is {pct:.0f}% used, {disk.fmt_bytes(free)} free."
+                    + (" Agents, the bot and the logs stop working when it is full." if level != "full" else
+                       " It is full: agents can't save work, and the bot can't log or save its state.")
+                    + (f"\nBiggest folders in the home folder:{big}" if big else "")
+                    + "\nFree space now: delete or move old data, caches, builds or Docker images "
+                      "(`docker system df`).")
+        elif level == "ok":
+            text = f"🟢 **disk back to normal**: `{path}` is {pct:.0f}% used, {disk.fmt_bytes(free)} free."
+        else:
+            continue  # going down from critical to warn: no message
+        log.warning("disk %s: %s %.1f%% used, %d bytes free", level, path, pct, free)
+        _post_all(channels, text[:1900])
+
+
 def _check_health(prev: str, now: float) -> str:
     """Alert once when system health rises to warn or critical; returns the level now."""
     state = health.read_state()
@@ -110,11 +144,18 @@ def main() -> None:
     harness_down = False
     seen_heartbeat = False
     health_level = "ok"
+    disk_levels: dict[str, str] = {}
+    last_channels: list[int] = []
     stall_warned: set[int] = set()
     while True:
         time.sleep(config.WATCHDOG_CHECK_INTERVAL)
         now = time.time()
         health_level = _check_health(health_level, now)
+        try:
+            last_channels = _alert_channels(json.loads(config.HEARTBEAT_PATH.read_text())) or last_channels
+        except (OSError, ValueError):
+            pass
+        _check_disks(disk_levels, last_channels)
         try:
             payload = json.loads(config.HEARTBEAT_PATH.read_text())
             age = now - payload["ts"]
@@ -137,7 +178,9 @@ def main() -> None:
                     _alert_channels(payload),
                     f"🔴 **harness appears down** — no heartbeat for {_fmt_age(age)} "
                     f"(pid {payload.get('pid')}). Any turn in progress is stuck; "
-                    "restart with `./run.sh`. Sessions are kept and will resume.",
+                    "restart with `./run.sh`. Sessions are kept and will resume."
+                    + ("\n🛑 A disk is full: that is the likely cause. Free space first."
+                       if "full" in disk_levels.values() else ""),
                 )
             continue
 

@@ -205,6 +205,14 @@ class Recorder:
             log.warning("nvidia-smi: %s", line.strip()[:200])
             return
         t = _parse_time(row[0]) or time.time()
+        try:
+            self._sample_row(t, row, line)
+        except OSError as e:  # a full disk: skip this sample, say so once a minute
+            if time.time() - getattr(self, "_disk_warned", 0) > 60:
+                self._disk_warned = time.time()
+                log.warning("gpumon: can't write samples: %s", e)
+
+    def _sample_row(self, t: float, row: list[str], line: str) -> None:
         if "GPU is lost" not in line:
             self.lost = False  # it answers again (after a reset or reboot)
         self._write_sample(t, row)

@@ -152,6 +152,12 @@ HEALTH_WARN_PCT: float = float(os.environ.get("HEALTH_WARN_PCT", "20"))  # avail
 HEALTH_CRIT_PCT: float = float(os.environ.get("HEALTH_CRIT_PCT", "6"))  # available RAM % for `critical`
 HEALTH_ACTIONS: bool = os.environ.get("HEALTH_ACTIONS", "1").lower() not in ("0", "false", "no", "off")
 HEALTH_AGENT: str = os.environ.get("HEALTH_AGENT", "")  # instance name; default: the one in the harness repo
+# Disk space alerts (harness/disk.py): % used for warn and critical, MB free for full, % used to clear.
+DISK_WARN_PCT: float = float(os.environ.get("DISK_WARN_PCT", "90"))
+DISK_CRIT_PCT: float = float(os.environ.get("DISK_CRIT_PCT", "95"))
+DISK_FULL_MB: float = float(os.environ.get("DISK_FULL_MB", "500"))
+DISK_OK_PCT: float = float(os.environ.get("DISK_OK_PCT", "85"))
+DISK_PATHS: list[str] = [p for p in os.environ.get("DISK_PATHS", "").split(",") if p]  # more disks to watch
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.

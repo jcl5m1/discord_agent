@@ -25,7 +25,7 @@ from pathlib import Path
 
 import discord
 
-from . import config, discord_markdown, files, guard, limits, logfile, logins, resume, service, triggers, uptime, workdirs
+from . import config, discord_markdown, disk, files, guard, limits, logfile, logins, resume, service, triggers, uptime, workdirs
 from .worklog_service import WorklogService
 from .instances import Instance, InstanceManager, normalize_workdir
 from .pending import PendingTurn, PendingTurns
@@ -169,9 +169,40 @@ async def _heartbeat_loop() -> None:
             tmp = config.HEARTBEAT_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload))
             tmp.replace(config.HEARTBEAT_PATH)
-        except Exception:
+        except Exception as e:
             log.exception("heartbeat write failed")
+            if disk.is_full_error(e):
+                await _report_disk_full()
         await asyncio.sleep(config.HEARTBEAT_INTERVAL)
+
+
+_disk_full_reported = 0.0
+
+
+async def _report_disk_full() -> None:
+    """The disk is full: say so in Discord (at most every 30 min), since the bot can't log or save state."""
+    global _disk_full_reported
+    if time.time() - _disk_full_reported < 1800:
+        return
+    _disk_full_reported = time.time()
+    try:
+        pct, free = disk.usage(config.DATA_DIR)
+    except OSError:
+        pct, free = 100.0, 0
+    text = (f"🛑 **disk full on {socket.gethostname()}**: `{config.DATA_DIR}` has {disk.fmt_bytes(free)} free "
+            f"({pct:.0f}% used). The harness can't save its state or log, and agents can't write files. "
+            "Free space now (old data, caches, builds, `docker system prune`).")
+    targets = {_last_channel_id} if _last_channel_id else set()
+    agent = _health_agent()
+    if agent:
+        targets.add(agent.channel_id)
+    for cid in targets:
+        channel = client.get_channel(cid)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(text)
+            except discord.HTTPException:
+                pass
 
 
 async def _progress_updates(inst: Instance, channel: discord.abc.Messageable, turn: dict) -> None:

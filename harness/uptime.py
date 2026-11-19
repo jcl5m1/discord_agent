@@ -54,13 +54,23 @@ GAP_AFTER = INTERVAL * 3
 
 # --- storage ---
 
+_unwritten: list[dict] = []  # events a full disk kept out of the log; written when space is back
+
+
 def _append(event: str, ts: float | None = None, **fields) -> dict:
     rec = {"ts": round(ts if ts is not None else time.time(), 3), "event": event, **fields}
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    _unwritten.append(rec)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in _unwritten))
+            f.flush()
+            os.fsync(f.fileno())
+        _unwritten.clear()
+    except OSError as e:  # a full disk must not stop the monitor: keep the events, retry with the next one
+        if len(_unwritten) > 1000:
+            del _unwritten[:-1000]
+        log.warning("can't write %s (%s); %d events kept in memory", LOG_PATH, e, len(_unwritten))
     log.info("%s %s", event, {k: v for k, v in rec.items() if k not in ("ts", "event")})
     return rec
 
@@ -86,8 +96,11 @@ def read_state() -> dict:
 
 def _write_state(state: dict) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    tmp.replace(STATE_PATH)
+    try:
+        tmp.write_text(json.dumps(state))
+        tmp.replace(STATE_PATH)
+    except OSError as e:  # a full disk: keep running; the next write tries again
+        log.warning("can't write %s: %s", STATE_PATH, e)
 
 
 def _boot() -> tuple[str, float]:

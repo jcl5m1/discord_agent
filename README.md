@@ -503,6 +503,22 @@ machine thrashes, and it freezes. `harness/health.py` watches for it:
 For the kernel side, install `earlyoom`, and keep enough swap (see the
 README's setup notes, or ask the harness agent for the commands).
 
+### Disk space
+
+A full main disk stops everything quietly: agents can't write, the bot can't
+log or save its heartbeat, and the logs stop. So:
+
+- The **watchdog** checks the root disk and the harness data's disk each minute
+  (`harness/disk.py`; more with `DISK_PATHS`). It alerts in Discord when a disk
+  rises to warn (`DISK_WARN_PCT`, 90% used), critical (`DISK_CRIT_PCT`, 95%) or
+  full (under `DISK_FULL_MB`, 500 MB free), with the biggest folders in the home
+  folder, and says when it is back under `DISK_OK_PCT` (85%). Its "harness is
+  down" alert names a full disk as the likely cause.
+- The **bot** posts "disk full" in Discord (at most every 30 min) when it can't
+  save its heartbeat because the disk is full, instead of going silent.
+- The **uptime monitor** keeps running on a full disk: events wait in memory
+  and are written when there is space again; GPU and memory samples are skipped.
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU
