@@ -375,8 +375,23 @@ def _para(el: dict, doc: dict, images: dict[str, str]) -> Para:
         lst = doc.get("lists", {}).get(p["bullet"]["listId"], {})
         glyph = lst.get("listProperties", {}).get("nestingLevels", [{}] * (level + 1))[level]
         bullet = (level, bool(glyph.get("glyphType")) and glyph.get("glyphType") != "GLYPH_TYPE_UNSPECIFIED")
-    return Para(el["startIndex"], el["endIndex"], text, _merge(runs), _style(p.get("paragraphStyle", {}), PARA_KEYS),
-                bullet, imgs, atomic)
+    return Para(el["startIndex"], el["endIndex"], text, _merge(_breaks_unstyled(runs, text)),
+                _style(p.get("paragraphStyle", {}), PARA_KEYS), bullet, imgs, atomic)
+
+
+def _breaks_unstyled(runs: list[tuple[int, int, str]], text: str) -> list[tuple[int, int, str]]:
+    # A run of only line breaks (\v) shows nothing, and the Docs API does not keep a style set on it alone (Drive's
+    # HTML import gives one, e.g. after a table in a list item): it takes the style of the run after it (or before),
+    # so the sync does not try to set that style again on every pass.
+    units = text.encode("utf-16-le")
+    blank = [units[2 * a:2 * b].decode("utf-16-le").strip("\v") == "" and b > a for a, b, _ in runs]
+    out = list(runs)
+    for i, (a, b, _) in enumerate(runs):
+        if blank[i]:
+            near = [j for j in range(i + 1, len(runs)) if not blank[j]] or [j for j in range(i - 1, -1, -1) if not blank[j]]
+            if near:
+                out[i] = (a, b, runs[near[0]][2])
+    return out
 
 
 def _merge(runs: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:

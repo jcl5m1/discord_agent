@@ -173,6 +173,14 @@ class MarkdownTests(unittest.TestCase):
         self.assertEqual(gs._style({"bold": True, "link": {"bookmarkId": "id.x"}}, gs.TEXT_KEYS), '{"bold": true}')
         self.assertIn("url", gs._style({"link": {"url": "https://x.org"}}, gs.TEXT_KEYS))
 
+    def test_style_of_a_line_break_alone_is_ignored(self):
+        # Drive's import styles a lone \v (text after a table in a list item); the Docs API does not keep it (#86).
+        from harness import gdoc_sync as gs
+        el = {"startIndex": 1, "endIndex": 6, "paragraph": {"elements": [
+            {"textRun": {"content": "\v", "textStyle": {"bold": False, "fontSize": {"magnitude": 11, "unit": "PT"}}}},
+            {"textRun": {"content": "Text\n", "textStyle": {}}}]}}
+        self.assertEqual(gs._para(el, {}, {}).runs, [(0, 6, "{}")])
+
 
 class PictureIdTests(unittest.TestCase):
     """gdoc_sync: a JPEG that Google re-encodes is still the same picture (the storey report looped, #55)."""
