@@ -84,6 +84,26 @@ class InputTests(unittest.TestCase):
         self.assertEqual(heavy._cg_usage(Path("/sys/fs/cgroup/no-such-group")), {})
 
 
+class SweepTests(unittest.TestCase):
+    def test_sweep_stops_only_scopes_whose_heavy_is_gone(self):
+        listing = ("heavy-video-decode-111.scope loaded active running x\n"
+                   "heavy-gpu-222.scope loaded active running x\nheavy-odd.scope loaded active running x\n")
+        alive = {"111": b"python3 /x/bin/heavy --class video-decode", "222": None}
+
+        def read_bytes(self):
+            pid = self.parts[2]
+            if alive.get(pid) is None:
+                raise OSError("gone")
+            return alive[pid]
+
+        stopped = []
+        with mock.patch.object(heavy.subprocess, "run", return_value=mock.Mock(stdout=listing)), \
+                mock.patch.object(heavy.Path, "read_bytes", read_bytes), \
+                mock.patch.object(heavy, "_stop_unit", side_effect=stopped.append):
+            heavy.sweep()
+        self.assertEqual(stopped, ["heavy-gpu-222"])  # 111's heavy runs; 'odd' isn't heavy's name
+
+
 class IoTests(unittest.TestCase):
     def test_disk_under_an_lvm_volume_is_not_counted_twice(self):
         with tempfile.TemporaryDirectory() as d:
@@ -114,7 +134,8 @@ class RunTests(unittest.TestCase):
             f.write_bytes(b"y" * 5000)
             log = Path(d) / "jobs.jsonl"
             with mock.patch.object(heavy, "LOG", log), mock.patch.object(heavy, "DIR", Path(d)), \
-                    mock.patch.object(heavy, "POLL", 0.2), mock.patch.object(heavy, "gate", return_value=None):
+                    mock.patch.object(heavy, "POLL", 0.2), mock.patch.object(heavy, "gate", return_value=None), \
+                    mock.patch.object(heavy, "sweep", return_value=[]):  # never touch the machine's real jobs
                 rc = heavy.run("test-heavy", [sys.executable, "-c", "import time; time.sleep(1)", str(f)], "100M",
                                "0", None, max_wait=10, force=True, name="t")
             rec = json.loads(log.read_text().splitlines()[-1])

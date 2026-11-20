@@ -161,13 +161,28 @@ def sweep() -> list[str]:
                              timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return stopped
-    held = {h.get("unit") for h in holders()}
     for line in out.splitlines():
         unit = line.split()[0].removesuffix(".scope") if line.split() else ""
-        if unit.startswith("heavy-") and unit not in held:
+        if unit.startswith("heavy-") and not _owner_alive(unit):
             _stop_unit(unit)
             stopped.append(unit)
     return stopped
+
+
+def _owner_alive(unit: str) -> bool:
+    """Is the heavy process that started this scope still running? Its pid ends the unit's name.
+
+    Only the owner's death makes a scope an orphan: slot files can't tell (another data folder,
+    a test, or a scope started before a restart has none here), so they are not used for this.
+    """
+    pid = unit.rsplit("-", 1)[-1]
+    if not pid.isdigit():
+        return True  # not a name heavy makes: leave it alone
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False  # gone
+    return b"heavy" in cmd  # a pid reused by another program: the owner is gone
 
 
 # ------------------------------------------------------------- running
