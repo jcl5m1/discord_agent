@@ -6,7 +6,7 @@ Every agent on the machine shares it, so jobs stop colliding:
     heavy --class ml-cpu --mem 6G --cpus 4 -- python person_masks.py detect /data
     heavy status
 
-- Slots: each class has HEAVY_SLOTS slots on the machine (default video-decode=1, gpu=1, ml-cpu=2,
+- Slots: each class has HEAVY_SLOTS slots on the machine (default video-decode=1, gpu=1, ml-cpu=2, android-emulator=1,
   default=3). A job waits for a free slot of its class and says who holds them.
 - Health gate: a job waits while system health (memory) is warn or critical, or the disk is full
   (data/health.json, data/disk.json). --force skips the gate, not the slot.
@@ -171,6 +171,28 @@ def sweep() -> list[str]:
 
 
 # ------------------------------------------------------------- running
+_DM_SKIP: set[str] | None = None
+
+
+def _under_dm() -> set[str]:
+    """major:minor of the devices under device-mapper (LVM) volumes, and of their whole disks.
+
+    io.stat lists an LVM volume and the disk partition under it with the same bytes, so summing
+    every line counts each byte twice; the volume's line is kept.
+    """
+    global _DM_SKIP
+    if _DM_SKIP is None:
+        skip = set()
+        for slave in Path("/sys/block").glob("dm-*/slaves/*"):
+            for dev in (Path("/sys/class/block") / slave.name, (Path("/sys/class/block") / slave.name).resolve().parent):
+                try:
+                    skip.add((dev / "dev").read_text().strip())
+                except OSError:
+                    pass
+        _DM_SKIP = skip
+    return _DM_SKIP
+
+
 def _usage(pid: int) -> dict:
     """The job's scope totals so far: peak memory, CPU seconds, bytes read and written."""
     try:
@@ -201,7 +223,10 @@ def _cg_usage(cg: Path) -> dict:
         pass
     try:
         rd = wr = 0
+        skip = _under_dm()
         for line in (cg / "io.stat").read_text().splitlines():
+            if not line.split() or line.split()[0] in skip:
+                continue  # the disk under an LVM volume: the volume's line has the same bytes
             fields = dict(f.split("=") for f in line.split()[1:] if "=" in f)
             rd += int(fields.get("rbytes", 0))
             wr += int(fields.get("wbytes", 0))

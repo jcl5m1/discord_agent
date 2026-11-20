@@ -551,7 +551,7 @@ heavy --class video-decode --mem 8G [--swap 1G] [--cpus 4] [--name ...] -- <comm
 heavy status          # who holds which slots; is the gate open
 ```
 
-- **Slots:** `HEAVY_SLOTS` (default `video-decode=1,gpu=1,ml-cpu=2,default=3`)
+- **Slots:** `HEAVY_SLOTS` (default `video-decode=1,gpu=1,ml-cpu=2,android-emulator=1,default=3`)
   machine-wide slots per class; a job waits for a free one and says who holds them.
 - **Gate:** a job waits while memory health is warn/critical or the disk is full
   (`--force` skips the gate, not the slot; `--max-wait`, default 4 h, then exit 75).

@@ -84,6 +84,17 @@ class InputTests(unittest.TestCase):
         self.assertEqual(heavy._cg_usage(Path("/sys/fs/cgroup/no-such-group")), {})
 
 
+class IoTests(unittest.TestCase):
+    def test_disk_under_an_lvm_volume_is_not_counted_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            cg = Path(d)
+            (cg / "io.stat").write_text("252:0 rbytes=1000 wbytes=200 rios=1\n259:5 rbytes=1000 wbytes=200 rios=1\n"
+                                        "8:16 rbytes=50 wbytes=0\n")
+            with mock.patch.object(heavy, "_under_dm", return_value={"259:5"}):
+                use = heavy._cg_usage(cg)
+        self.assertEqual((use["read"], use["written"]), (1050, 200))
+
+
 @unittest.skipUnless(HAS_SYSTEMD, "needs a systemd user session")
 class RunTests(unittest.TestCase):
     def heavy(self, *args, **kw):
