@@ -168,6 +168,10 @@ DISK_OFFLOAD_PCT: float = float(os.environ.get("DISK_OFFLOAD_PCT", "90"))
 DISK_OFFLOAD_TARGET: float = float(os.environ.get("DISK_OFFLOAD_TARGET", "80"))
 DISK_OFFLOAD_TO: str = os.path.expanduser(os.environ.get("DISK_OFFLOAD_TO", ""))
 DISK_PATHS: list[str] = [p for p in os.environ.get("DISK_PATHS", "").split(",") if p]  # more disks to watch
+# GPU watch (harness/gpuguard.py): reboot to bring a lost GPU back, after a warning, at most once per gap.
+GPU_AUTO_REBOOT: bool = os.environ.get("GPU_AUTO_REBOOT", "1").lower() not in ("0", "false", "no", "off")
+GPU_REBOOT_DELAY: float = float(os.environ.get("GPU_REBOOT_DELAY", "300"))
+GPU_REBOOT_MIN_GAP: float = float(os.environ.get("GPU_REBOOT_MIN_GAP", "7200"))
 # GPU flight recorder in the uptime monitor (harness/gpumon.py); on if nvidia-smi exists.
 GPU_MONITOR: bool = os.environ.get("GPU_MONITOR", "1").lower() not in ("0", "false", "no", "off")
 # host:port pairs probed with a TCP connect; the internet is up if any answers.

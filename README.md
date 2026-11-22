@@ -563,6 +563,24 @@ heavy status          # who holds which slots; is the gate open
   hard-killed heavy left.
 - **Log:** `data/heavy/jobs.jsonl` (who, class, command, wait, peak memory, exit code).
 
+### GPU watch (automatic reboot for a lost GPU)
+
+A GPU that falls off the PCIe bus (NVIDIA Xid 79) comes back only after a reboot,
+and until then programs that touch it hang one by one. `harness/gpuguard.py`
+(in the uptime monitor) asks the driver every minute (`nvidia-smi -L`). If the
+GPU is gone for 2 minutes, it posts a Discord alert, tells every agent to save
+(`wl send all`), waits `GPU_REBOOT_DELAY` (5 min), checks again, and reboots
+with `sudo -n /usr/bin/systemctl reboot`. That needs this sudoers rule:
+
+```
+echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl reboot" | sudo tee /etc/sudoers.d/agent-reboot
+sudo chmod 440 /etc/sudoers.d/agent-reboot
+```
+
+At most one automatic reboot per `GPU_REBOOT_MIN_GAP` (2 h); past that, or
+without the rule, it alerts every hour instead. `GPU_AUTO_REBOOT=0` keeps the
+alerts and turns the reboot off. Events: `gpu_lost`, `gpu_back`, `auto_reboot`.
+
 ### GPU recorder
 
 On a machine with an NVIDIA GPU, the uptime monitor also records the GPU

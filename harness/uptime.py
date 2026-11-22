@@ -38,7 +38,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import config, diskcare, gpumon, logfile, memmon
+from . import config, diskcare, gpumon, gpuguard, logfile, memmon
 
 log = logging.getLogger("uptime")
 
@@ -214,6 +214,7 @@ async def run() -> None:
     mem = asyncio.ensure_future(memmon.run(stop, _append))
     care = asyncio.ensure_future(diskcare.run(stop, _append))
     reaper = asyncio.ensure_future(_heavy_sweeps(stop))
+    guard = asyncio.ensure_future(gpuguard.run(stop, _append))
 
     while not stop.is_set():
         t = time.time()
@@ -243,7 +244,7 @@ async def run() -> None:
             pass
 
     try:
-        await asyncio.wait_for(asyncio.gather(gpu, mem, care, reaper), 10)
+        await asyncio.wait_for(asyncio.gather(gpu, mem, care, reaper, guard), 10)
     except (asyncio.TimeoutError, Exception):
         log.exception("gpumon didn't stop cleanly")
     now = time.time()
