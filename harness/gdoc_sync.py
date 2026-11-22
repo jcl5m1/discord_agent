@@ -15,6 +15,7 @@ import difflib
 import hashlib
 import io
 import json
+import time
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,7 +30,9 @@ TEXT_KEYS = ("bold", "italic", "underline", "strikethrough", "smallCaps", "basel
 PARA_KEYS = ("namedStyleType", "alignment", "lineSpacing", "direction", "spaceAbove", "spaceBelow",
              "indentFirstLine", "indentStart", "indentEnd", "keepLinesTogether", "keepWithNext", "avoidWidowAndOrphan")
 INDENTS = ("indentFirstLine", "indentStart", "indentEnd")
-MAX_PASSES = 8
+MAX_PASSES = 40  # hard cap; a sync also stops after STALL_PASSES passes without fewer differences
+STALL_PASSES = 3
+SETTLE_S = 1.0  # wait after an update before reading the Doc again (the API can lag behind its last edit)
 
 Api = Callable[[str, str, dict | None], dict]
 
@@ -72,17 +75,27 @@ class Table:
 def sync(api: Api, target: str, source: str) -> int:
     images: dict[str, str] = {}
     total = 0
-    for _ in range(MAX_PASSES):
+    best, stalled = None, 0
+    for n in range(MAX_PASSES):
+        if n:
+            time.sleep(SETTLE_S)
         tgt, src = api("GET", f"{DOCS}/{target}", None), api("GET", f"{DOCS}/{source}", None)
         reqs = plan(_blocks(tgt, images), _blocks(src, images), src, _body_end(tgt))
         if not reqs:  # text and styles match: now the lists (which paragraphs are list items, at which level)
             reqs = list_plan(tgt, src)
         if not reqs:
             return total
+        # A large update needs many passes; keep going while the differences shrink.
+        if best is None or len(reqs) < best:
+            best, stalled = len(reqs), 0
+        else:
+            stalled += 1
+            if stalled >= STALL_PASSES:
+                break
         api("POST", f"{DOCS}/{target}:batchUpdate", {"requests": reqs})
         total += len(reqs)
-    raise SystemExit(f"the Doc {target} still differs from the new version after {MAX_PASSES} passes; "
-                     "nothing was lost, but check the Doc")
+    raise SystemExit(f"the Doc {target} still differs from the new version after {n + 1} passes "
+                     f"({best} edits left, no progress for {stalled} passes); nothing was lost, but check the Doc")
 
 
 def plan(old: list, new: list, src_doc: dict, seg_end: int) -> list[dict]:

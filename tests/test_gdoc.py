@@ -245,3 +245,29 @@ class ListGroupTests(unittest.TestCase):
         got = gs._list_items(doc, paras)
         self.assertEqual([got[i] for i in range(4)], [(0, 0, True), (0, 1, True), (0, 1, True), (0, 0, True)])
         self.assertEqual(got[5], (1, 0, False))  # a new top-level list after a paragraph
+
+
+class SyncLoopTests(unittest.TestCase):
+    """gdoc_sync.sync: keep going while the differences shrink; stop when they don't."""
+
+    def run_sync(self, plans):
+        from harness import gdoc_sync as gs
+        posts = []
+        seq = iter(plans)
+        api = lambda method, url, body: posts.append(body) or {} if method == "POST" else {}  # noqa: E731
+        with mock.patch.object(gs, "plan", side_effect=lambda *a: next(seq)), \
+                mock.patch.object(gs, "list_plan", return_value=[]), \
+                mock.patch.object(gs, "_blocks", return_value=[]), mock.patch.object(gs, "_body_end", return_value=1), \
+                mock.patch.object(gs, "SETTLE_S", 0):
+            return gs.sync(api, "T", "S"), posts
+
+    def test_converges_after_more_than_eight_passes(self):
+        plans = [[{"x": i}] * (12 - i) for i in range(12)] + [[]]
+        total, posts = self.run_sync(plans)
+        self.assertEqual(len(posts), 12)
+        self.assertEqual(total, sum(range(1, 13)))
+
+    def test_stops_when_no_progress(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_sync([[{"x": 1}] * 5] * 10)
+        self.assertIn("no progress", str(e.exception))
