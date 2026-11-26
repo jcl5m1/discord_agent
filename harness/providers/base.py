@@ -35,6 +35,9 @@ class TurnControl:
         # holds each for a short edit window, so a quick edit or delete in
         # Discord changes or removes it before the agent ever sees it.
         self.held: dict[str, list] = {}
+        # Ordered current text of every live input, including delivered input.
+        # A failover uses this to preserve corrections and retractions.
+        self.messages: dict[str, str] = {}
 
     def send(self, text: str) -> str:
         import time
@@ -43,6 +46,7 @@ class TurnControl:
         message_id = str(uuid.uuid4())
         self.unread.add(message_id)
         self.held[message_id] = [text, time.monotonic()]
+        self.messages[message_id] = text
         return message_id
 
     def edit(self, message_id: str, text: str) -> bool:
@@ -52,6 +56,7 @@ class TurnControl:
         if message_id not in self.held:
             return False
         self.held[message_id] = [text, time.monotonic()]  # a fresh window for the new text
+        self.messages[message_id] = text
         return True
 
     def withdraw(self, message_id: str) -> bool:
@@ -59,6 +64,7 @@ class TurnControl:
         if self.held.pop(message_id, None) is None:
             return False
         self.unread.discard(message_id)
+        self.messages.pop(message_id, None)
         return True
 
     def take_held(self, sent_before: float | None = None) -> list[tuple[str, str]]:
@@ -223,7 +229,11 @@ async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 3.0
                 "taskkill", "/T", "/F", "/PID", str(proc.pid),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await killer.wait()
+            try:
+                await asyncio.wait_for(killer.wait(), grace)
+            except asyncio.TimeoutError:
+                killer.kill()
+                await killer.wait()
         else:
             # Find the tree before killing: once the CLI dies its children are
             # re-parented and the link to them is lost.

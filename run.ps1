@@ -10,7 +10,7 @@ try {
 }
 finally {
     if (-not $watchdog.HasExited) {
-        Stop-Process -Id $watchdog.Id -Force
+        & taskkill.exe /T /F /PID $watchdog.Id | Out-Null
     }
 }
 exit $exitCode

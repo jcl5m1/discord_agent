@@ -9,6 +9,9 @@ Stored in data/instances.json (gitignored):
     "workdir": "/home/user/code/my-project",
     "session_id": "session_xxxx",
     "model": "opus",
+    "secondary_provider": "kimi",
+    "secondary_model": "k3",
+    "secondary_session_id": "session_yyyy",
     "wa_group": "120363000000000000"
   }
 }
@@ -94,6 +97,12 @@ class Instance:
     origin: str | None = None  # "trigger:<name>" when created by an external trigger
     worklog_briefed: bool = False  # the session has been told how to use the shared worklog
     brief_version: int = 0  # the onboarding version this session got (bot.BRIEF_VERSION)
+    secondary_provider: str | None = None  # None = configured default; "" = fallback disabled
+    secondary_model: str | None = None
+    secondary_session_id: str | None = None
+    secondary_worklog_briefed: bool = False
+    secondary_brief_version: int = 0
+    fallback_handoff: str | None = None  # secondary work to tell the primary after its reset
 
     def __post_init__(self) -> None:
         self.workdir = normalize_workdir(self.workdir)

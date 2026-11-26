@@ -42,6 +42,24 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(limits.is_limit_text("You've hit your limit · resets 9pm"))
         self.assertFalse(limits.is_limit_text("the limit of the loop"))
 
+    def test_token_and_credit_limit_phrases(self):
+        phrases = [
+            "You are out of tokens",
+            "You are out of extra tokens",
+            "No tokens remaining",
+            "You ran out of credits",
+            "Token usage limit reached",
+            "Your tokens are exhausted",
+            "Insufficient credits to complete this request",
+            "Insufficient balance",
+            "Your credit balance too low",
+            "Your credit balance is too low",
+        ]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(limits.is_limit_text(phrase))
+        self.assertFalse(limits.is_limit_text("credit balance is healthy"))
+
 
 class RecordTests(unittest.TestCase):
     def setUp(self):
@@ -63,6 +81,24 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(limits.resume_at(now))
         self.assertFalse(limits.pending())
 
+    def test_hit_can_record_only_the_account_gate(self):
+        now = time.time()
+        at = limits.hit(now + 600, 1, "a", "fallback handles this", now=now, record=False)
+        self.assertEqual(limits.resume_at(now), at)
+        self.assertFalse(limits.pending())
+        self.assertEqual(limits.take(1), {})
+        self.assertIsNone(limits.resume_at(now))
+
+    def test_take_can_consume_last_cutoff_without_clearing_gate(self):
+        now = time.time()
+        at = limits.hit(now + 600, 1, "a", "build the map", now=now)
+        records = limits.take(1, clear_gate=False)
+        self.assertEqual(records[1]["prompt"], "build the map")
+        self.assertFalse(limits.pending())
+        self.assertEqual(limits.resume_at(now), at)
+        self.assertEqual(limits.take(1), {})
+        self.assertIsNone(limits.resume_at(now))
+
     def test_resume_time_passed(self):
         limits.hit(time.time() - 120, 1, "a", "x")
         self.assertIsNone(limits.resume_at())
@@ -70,6 +106,12 @@ class RecordTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
+    def test_fable_alias_selects_fable_5_2(self):
+        provider = ClaudeProvider()
+        self.assertEqual(provider.resolve_model("fable"), "claude-fable-5-2")
+        cmd = provider._build_cmd(None, "fable")
+        self.assertEqual(cmd[cmd.index("--model") + 1], "claude-fable-5-2")
+
     async def test_rejected_rate_limit_becomes_a_limit_event(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "claude"
@@ -80,6 +122,24 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         last = events[-1]
         self.assertEqual((last.kind, last.reset_at, last.session_id), ("limit", 1800000000.0, "sess-1"))
         self.assertIn("hit your limit", last.text)
+
+    async def test_limit_error_on_stderr_becomes_a_limit_event(self):
+        script = '''
+import json, sys
+sys.stdin.readline()
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "sess-stderr"}), flush=True)
+sys.stderr.write("You are out of tokens")
+sys.exit(1)
+'''
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "claude"
+            fake.write_text("#!" + sys.executable + "\n" + textwrap.dedent(script))
+            fake.chmod(0o755)
+            with mock.patch.object(config, "CLAUDE_BIN", str(fake)), mock.patch.object(config, "STEER_HOLD", 0):
+                events = [e async for e in ClaudeProvider().run_turn(d, "go", None, "haiku")]
+        self.assertEqual(events[-1].kind, "limit")
+        self.assertEqual(events[-1].session_id, "sess-stderr")
+        self.assertIn("out of tokens", events[-1].text)
 
 
 if __name__ == "__main__":

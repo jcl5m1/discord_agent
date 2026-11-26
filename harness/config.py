@@ -53,8 +53,11 @@ SHARED_CHANNELS: set[str] = {
     c.strip() for c in os.environ.get("DISCORD_SHARED_CHANNELS", "general").split(",") if c.strip()
 }
 
-DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "kimi")
+DEFAULT_PROVIDER: str = os.environ.get("DEFAULT_PROVIDER", "claude")
 DEFAULT_WORKDIR: str = os.path.expanduser(os.environ.get("DEFAULT_WORKDIR", str(Path.home())))
+AUTO_FALLBACK: bool = os.environ.get("AUTO_FALLBACK", "true").lower() not in {"0", "false", "no"}
+SECONDARY_PROVIDER: str = os.environ.get("SECONDARY_PROVIDER", "kimi")
+SECONDARY_MODEL: str | None = os.environ.get("SECONDARY_MODEL") or None
 MAX_CONCURRENT_TURNS: int = int(os.environ.get("MAX_CONCURRENT_TURNS", "4"))
 # Messages sent while a turn runs go straight into it for agents that support
 # that (Claude Code reads them at its next step); false = they wait their turn.
@@ -79,6 +82,9 @@ HEARTBEAT_PATH: Path = DATA_DIR / "heartbeat.json"
 WATCHDOG_CHECK_INTERVAL: int = int(os.environ.get("WATCHDOG_CHECK_INTERVAL", "60"))
 WATCHDOG_STALE_AFTER: int = int(os.environ.get("WATCHDOG_STALE_AFTER", "180"))
 WATCHDOG_STALL_AFTER: int = int(os.environ.get("WATCHDOG_STALL_AFTER", "1800"))
+# Seconds without any provider event before the turn is stopped and continued once.
+# Any text, tool, session, or background event resets the deadline; 0 disables it.
+AGENT_STALL_AFTER: float = float(os.environ.get("AGENT_STALL_AFTER", "1800"))
 
 KIMI_BIN: str = os.path.expanduser(os.environ.get("KIMI_BIN", "~/.kimi-code/bin/kimi"))
 KIMI_MODEL: str | None = os.environ.get("KIMI_MODEL") or None

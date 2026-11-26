@@ -6,8 +6,7 @@ Discord — designed for driving agents from your phone.
 - **One agent instance = one Discord channel.** Create instances with `/new`; each
   channel is a full chat session with an agent.
 - **One Discord message = one agent turn.** The agent's reply streams into a single
-  message in the channel (edited in place), and the channel topic always shows the
-  agent's last message.
+  message in the channel, edited in place.
 - **Sessions survive restarts.** The harness stores each instance's provider session
   ID on disk. If the harness (or the whole machine) goes down, the next message in
   the channel transparently resumes the agent exactly where it left off.
@@ -77,7 +76,7 @@ options through the pipe: `curl -fsSL … | bash -s -- --dir ~/agents --no-servi
 
 ```
 your phone (Discord)  ⇄  harness (this repo, discord.py bot)
-                                │  one subprocess per turn
+                                │  one subprocess per active model
                                 ▼
                         claude CLI (`claude -p`) or kimi CLI (`kimi -p`)
                                 │  sessions persisted by the CLI itself
@@ -85,11 +84,11 @@ your phone (Discord)  ⇄  harness (this repo, discord.py bot)
                         ~/.claude/projects/  ·  ~/.kimi-code/sessions/
 ```
 
-Every message in a managed channel runs one print-mode invocation — e.g.
+Every message in a managed channel starts with one print-mode invocation — e.g.
 `claude --model claude-opus-5-5 -p "<message>"`, plus `--resume <id>` once a session
-exists (`kimi --session <id> -p ...` for Kimi). The CLI's own session store is what
-makes instances durable; the harness just remembers the mapping between Discord
-channels, providers, models and session IDs (`data/instances.json`).
+exists (`kimi --session <id> -p ...` for Kimi). A primary usage limit can start a second
+invocation on the secondary. The CLI's own session store makes instances durable. The
+harness remembers each provider's session ID in `data/instances.json`.
 
 > **Note:** both providers run tools without asking — `claude -p` with
 > `--permission-mode bypassPermissions` (configurable via `CLAUDE_PERMISSION_MODE`),
@@ -232,6 +231,10 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   session (`/session` can switch back to the old one). A turn also ends as soon as
   the CLI exits, even if a program it started in the background still holds its
   output open (that used to leave a session silently "running" forever).
+- A provider with no events for `AGENT_STALL_AFTER` seconds (default 1800) is stopped
+  with its process tree. The harness continues once on the same session. A second stall
+  requests help without another retry. Set it to 0 to disable this recovery. Background-only
+  waits after a reply do not use this timeout.
 - A message that has to wait behind a running turn gets one status note per turn:
   how long the agent has been at it, when it last produced output, and how to stop
   it. The same note appears if a message you send into a running turn finds it
@@ -256,15 +259,29 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   follow-up turn that shows the agent both versions. Deleting a message whose turn
   is running doesn't stop it. Edits to messages from before the harness last
   restarted are ignored.
-- `/new name:x provider:claude model:sonnet` picks the agent CLI and model.
-  `provider` defaults to `DEFAULT_PROVIDER`; Claude's model defaults to
-  `CLAUDE_MODEL` (`claude-opus-5-5`). Aliases `opus`, `sonnet`, `haiku`, `fable`
-  are autocompleted; any full model ID works too.
-- `/model` (inside an agent channel) shows the current provider and model.
+- `/new name:x provider:claude model:sonnet` picks the primary agent CLI and model.
+  New instances default to Claude Opus 5.5. `provider` defaults to
+  `DEFAULT_PROVIDER`; Claude's model defaults to `CLAUDE_MODEL` (`claude-opus-5-5`).
+  Aliases `opus`, `sonnet`, `haiku`, `fable` are autocompleted; any full model ID works too.
+  `/model model:claude:fable` selects Claude Fable 5.2 (`claude-fable-5-2`).
+  Fable may consume subscription usage credits. This non-interactive harness does not
+  show Claude Code's interactive credit-consent prompt.
+- `/model` (inside an agent channel) shows the primary and secondary models.
   The `model` autocomplete lists every provider's models as `provider:alias`
   (e.g. `claude:sonnet`, `kimi:k3`, `muse:spark-1.3`); picking one from another
   provider switches provider too and starts a fresh session. Same-provider
   changes keep the session.
+- `/model secondary:kimi:k3` selects the secondary model. Use `secondary:off` to
+  disable fallback for that channel, or `secondary:on` to restore the configured default.
+  `/new` accepts the same `secondary` argument. The default secondary is Kimi with its
+  configured default model (`SECONDARY_PROVIDER=kimi`, `SECONDARY_MODEL` empty).
+- When Claude reports a usage, token, or credit limit, the request moves to
+  the secondary at once. Corrections sent during that turn move with it. New turns stay
+  on the secondary until one minute after Claude's expected reset. If the reset is unknown,
+  the harness tries Claude again after 30 minutes. Each provider keeps its own session.
+  After the reset, Claude gets a bounded handoff of secondary requests, outcomes, and full
+  or partial replies. It then continues its original session. Set `AUTO_FALLBACK=false`
+  or empty `SECONDARY_PROVIDER` to restore the old wait-and-resume behavior everywhere.
 - `/session` (inside an agent channel) shows the channel's session. Pick one
   from the `session` autocomplete (the CLI's own sessions, newest first, with
   their title and folder) to continue it here — e.g. a Kimi or Claude session
@@ -417,10 +434,11 @@ provides it, so sessions don't each build their own.
 - **Check-ins:** while holding a claim, an agent must run
   `wl checkin <id> "<up to 10 words of progress>"` at least every 30 minutes. Each
   check-in is posted to the agent's own Discord channel; after 25 minutes the
-  harness reminds it, and at 30 minutes it releases the claim. A terminal session's
-  lapsed claim is released too, by the bot that posted its claim or last check-in
-  (or by any bot an hour later, if that one is down), and the session gets a message
-  saying so. `wl status` shows a worker as stale after 30 minutes without activity,
+  harness reminds it, and at 30 minutes it releases the claim. If the provider process
+  is still active, the claim stays assigned until turn cleanup to prevent duplicate work.
+  A terminal session's lapsed claim is released too, by the bot that posted its claim or
+  last check-in (or by any bot an hour later, if that one is down), and the session gets
+  a message saying so. `wl status` shows a worker as stale after 30 minutes without activity,
   or while it holds a lapsed claim.
 - **Open work is pulled, not left waiting.** A task is *ready* when it is open
   and every task it waits on (`--after`, `wl depends N --on 42,43`) is done or

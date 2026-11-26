@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -163,6 +164,68 @@ class SetupWizardTests(unittest.TestCase):
                     timeout=30,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WindowsTaskScriptTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parent.parent
+        self.installer = (root / "install-windows-tasks.ps1").read_text(encoding="utf-8")
+        self.runner = (root / "run.ps1").read_text(encoding="utf-8")
+
+    def test_ownership_requires_repo_python_and_an_agent_module(self):
+        self.assertIn("[IO.Path]::GetFullPath($python)", self.installer)
+        self.assertRegex(
+            self.installer,
+            r"\[IO\.Path\]::GetFullPath\(\$_\.ExecutablePath\)\s+-ieq\s+\$pythonPath",
+        )
+        self.assertIn("$_.CommandLine -match $modulePattern", self.installer)
+        self.assertNotIn("repositoryPattern", self.installer)
+
+        match = re.search(r"\$modulePattern = '([^']+)'", self.installer)
+        self.assertIsNotNone(match)
+        module_pattern = re.compile(match.group(1), re.IGNORECASE)
+        for module in ("bot", "watchdog", "uptime"):
+            self.assertIsNotNone(
+                module_pattern.search(
+                    rf'"C:\repo\.venv\Scripts\python.exe" -m harness.{module}'
+                )
+            )
+        for command in (
+            r'"C:\repo\.venv\Scripts\python.exe" -m harness.botty',
+            r'"C:\repo\.venv\Scripts\python.exe" -m other.harness.bot',
+            r'"C:\repo\.venv\Scripts\python.exe" harness.bot',
+            r'"C:\repo\.venv\Scripts\python.exe" -m harness.uptime.extra',
+        ):
+            self.assertIsNone(module_pattern.search(command), command)
+
+    def test_launcher_ownership_is_scoped_to_the_exact_run_script(self):
+        self.assertIn('$runScript = Join-Path $PSScriptRoot "run.ps1"', self.installer)
+        self.assertIn("[regex]::Escape([IO.Path]::GetFullPath($runScript))", self.installer)
+        self.assertIn('$_.Name -ieq "powershell.exe"', self.installer)
+        self.assertIn('$_.CommandLine -match $launcherPattern', self.installer)
+        self.assertIn('(?:^|\\s)-File\\s+', self.installer)
+
+    def test_restart_kills_owned_trees_and_waits_before_starting(self):
+        kill = self.installer.index("& taskkill.exe /T /F /PID $process.ProcessId")
+        requery = self.installer.index("$remaining = @(Get-OwnedAgentProcess)", kill)
+        timeout = self.installer.index("Timed out waiting for owned Discord Agent processes", requery)
+        bot_start = self.installer.index('Start-ScheduledTask -TaskName "Discord Agent"', timeout)
+        uptime_start = self.installer.index(
+            'Start-ScheduledTask -TaskName "Discord Agent Uptime"', bot_start
+        )
+        self.assertLess(kill, requery)
+        self.assertLess(requery, timeout)
+        self.assertLess(timeout, bot_start)
+        self.assertLess(bot_start, uptime_start)
+        self.assertIn("Start-Sleep -Milliseconds 250", self.installer[requery:bot_start])
+
+    def test_cleanup_has_no_global_process_or_provider_fallback(self):
+        for source in (self.installer, self.runner):
+            self.assertNotIn("Stop-Process", source)
+            self.assertNotIn("taskkill.exe /IM", source)
+        self.assertNotIn("Get-CimInstance", self.runner)
+        self.assertIn("& taskkill.exe /T /F /PID $watchdog.Id", self.runner)
+        self.assertIn("if (-not $watchdog.HasExited)", self.runner)
 
 
 if __name__ == "__main__":

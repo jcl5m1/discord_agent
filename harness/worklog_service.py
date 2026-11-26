@@ -11,7 +11,8 @@
 - Harness duties, for the workers this bot runs: register them, post their
   check-ins to their own Discord channel, deliver messages sent to them (into
   the running turn, or as a new turn), remind them to check in, and release a
-  claim that has gone CHECKIN_EVERY without a check-in.
+  claim that has gone CHECKIN_EVERY without a check-in. A claim stays assigned
+  while its provider process is active, so release never implies process exit.
 """
 
 from __future__ import annotations
@@ -52,12 +53,15 @@ class WorklogService:
         deliver: Callable[[str, str, str], Awaitable[None]],
         notify: Callable[[str, str], Awaitable[None]],
         idle_for: Callable[[str], float | None] | None = None,
+        active: Callable[[str], bool] | None = None,
     ):
         """deliver(worker, sender, text) hands a message to that worker's agent;
         notify(worker, text) posts a line in that worker's Discord channel;
         idle_for(worker) is how long that worker's agent has been idle, in seconds
-        (None: busy, stopped, or not one to offer work to)."""
+        (None: busy, stopped, or not one to offer work to). active(worker) is true
+        while its provider process still exists."""
         self.idle_for = idle_for
+        self.active = active
         self._offers: dict[int, tuple[str, float]] = {}  # task -> (worker, when) it was last offered
         self._offered: dict[str, float] = {}  # worker -> when it was last offered a task
         self.client = client
@@ -72,6 +76,7 @@ class WorklogService:
         self._post_lock = asyncio.Lock()
         self._wakes: dict[str, deque] = {}
         self._reminded: set[tuple[int, float]] = set()
+        self._active_overdue: set[tuple[int, float]] = set()
         self.token = self._load_token()
         self.url = f"http://127.0.0.1:{config.WORKLOG_PORT}"
 
@@ -393,6 +398,25 @@ class WorklogService:
         for worker in self.my_workers():
             for task in self.state.owned_by(worker):
                 age = now - task.checkin_at
+                key = (task.num, task.checkin_at)
+                if age > REMIND_AT and self.active and self.active(worker):
+                    if key not in self._active_overdue or age > CHECKIN_EVERY:
+                        await self.post({
+                            "op": "checkin", "by": worker, "task": task.num,
+                            "text": "provider process active; automatic heartbeat",
+                            "via": self.client.user.id if self.client.user else 0,
+                        })
+                    if key not in self._active_overdue:
+                        self._active_overdue.add(key)
+                        await self.deliver(worker, "harness", (
+                            f"#{task.num} needs a check-in, but its provider process is still active. "
+                            "The harness renewed shared ownership to prevent duplicate work. "
+                            "The claim can be released after the turn is cleaned up."
+                        ))
+                    current = self.state.tasks.get(task.num)
+                    if current:
+                        self._active_overdue.add((current.num, current.checkin_at))
+                    continue
                 if age > CHECKIN_EVERY:
                     await self._release(task, worker, now)
                     await self.notify(worker, f"⌛ #{task.num} released: no check-in for "

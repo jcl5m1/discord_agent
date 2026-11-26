@@ -1,10 +1,9 @@
 """Discord bot: one channel per agent instance, one message per turn.
 
 Messages in a managed channel are forwarded to the instance's provider as a
-turn; the reply streams into a single bot message (edited in place), and the
-channel topic shows the agent's last message. If the harness (or the whole
-machine) restarts, the next message in the channel transparently resumes the
-stored provider session.
+turn; the reply streams into a single bot message edited in place. If the harness
+(or the whole machine) restarts, the next message in the channel transparently
+resumes the stored provider session.
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ logfile.setup("bot")
 log = logging.getLogger("discord_agent")
 
 DISCORD_MSG_LIMIT = 2000
-TOPIC_LIMIT = 1024
 EDIT_INTERVAL = 1.0  # seconds between in-place message edits
 # A running turn silent this long is called out as possibly stuck when you message it.
 STUCK_AFTER = 600
@@ -110,6 +108,13 @@ _last_channel_id: int | None = None
 UPDATE_MARKER = config.DATA_DIR / "update_pending.json"
 
 
+DISCORD_CALL_TIMEOUT = 15.0
+DISCORD_REPLY_TIMEOUT = 30.0
+DISCORD_REPLY_RETRIES = 4
+DISCORD_REPLY_RETRY_DELAY = 2.0
+_reply_retries: set[asyncio.Task] = set()
+
+
 def _fmt_duration(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 120:
@@ -117,6 +122,90 @@ def _fmt_duration(seconds: float) -> str:
     if seconds < 7200:
         return f"{seconds // 60}m"
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+async def _discord_cosmetic(coro, description: str) -> bool:
+    """Run nonessential Discord I/O without holding a turn through rate limits."""
+    try:
+        await asyncio.wait_for(coro, DISCORD_CALL_TIMEOUT)
+        return True
+    except asyncio.TimeoutError:
+        log.warning("Discord %s timed out", description)
+    except Exception as e:
+        log.warning("Discord %s failed: %s", description, e)
+    return False
+
+
+async def _recovery_status(
+    channel: discord.TextChannel, content: str, fallback: discord.Message
+) -> discord.Message:
+    """Get a recovery status message without waiting through a Discord outage."""
+    try:
+        return await asyncio.wait_for(channel.send(content), DISCORD_CALL_TIMEOUT)
+    except Exception as e:
+        log.warning("Discord recovery status failed: %s", e)
+        return fallback
+
+
+async def _retry_reply(
+    status_msg: discord.Message,
+    chunks: list[str],
+    pending: list[int],
+    attachments: dict[int, list[tuple[bytes, str]]] | None = None,
+    source: tuple[bytes, str] | None = None,
+) -> None:
+    """Deliver essential reply content after the provider turn released its locks."""
+    lock = _channel_lock(status_msg.channel.id)
+    while lock.locked():
+        await asyncio.sleep(0.01)
+    attachments = attachments or {}
+    pending = list(pending)
+
+    def files_for(index: int) -> list[discord.File]:
+        return [discord.File(io.BytesIO(data), filename=name) for data, name in attachments.get(index, [])]
+
+    for attempt in range(DISCORD_REPLY_RETRIES):
+        await asyncio.sleep(DISCORD_REPLY_RETRY_DELAY if attempt else 0)
+        try:
+            first = files_for(0)
+            edit = status_msg.edit(
+                content=chunks[0], attachments=first[:10] if first else [], view=None
+            )
+            await asyncio.wait_for(edit, DISCORD_REPLY_TIMEOUT)
+            while pending:
+                index = pending[0]
+                await asyncio.wait_for(
+                    status_msg.channel.send(chunks[index], files=files_for(index)[:10]),
+                    DISCORD_REPLY_TIMEOUT,
+                )
+                pending.pop(0)
+            if source:
+                data, name = source
+                await asyncio.wait_for(
+                    status_msg.channel.send(file=discord.File(io.BytesIO(data), filename=name)),
+                    DISCORD_REPLY_TIMEOUT,
+                )
+                source = None
+            return
+        except asyncio.TimeoutError:
+            log.warning("Discord reply retry %d timed out", attempt + 1)
+        except Exception as e:
+            log.warning("Discord reply retry %d failed: %s", attempt + 1, e)
+    log.error("Discord reply could not be delivered after %d attempts", DISCORD_REPLY_RETRIES)
+
+
+def _schedule_reply_retry(
+    status_msg: discord.Message,
+    chunks: list[str],
+    pending: list[int],
+    attachments: dict[int, list[tuple[bytes, str]]] | None = None,
+    source: tuple[bytes, str] | None = None,
+) -> None:
+    task = asyncio.get_running_loop().create_task(
+        _retry_reply(status_msg, chunks, pending, attachments, source)
+    )
+    _reply_retries.add(task)
+    task.add_done_callback(_reply_retries.discard)
 
 
 @client.event
@@ -222,10 +311,7 @@ async def _progress_updates(inst: Instance, channel: discord.abc.Messageable, tu
         )
         if wa:
             _wa_task(wa.send_text(inst, note))
-        try:
-            await channel.send(note)
-        except discord.HTTPException:
-            log.warning("[%s] progress update failed to send", inst.name)
+        await _discord_cosmetic(channel.send(note), f"progress update for {inst.name}")
 
 
 def _slug(name: str) -> str:
@@ -424,25 +510,57 @@ from now on. It replaces the earlier version.]
 """
 
 
-def _with_brief(inst: Instance, prompt: str) -> str:
-    """Prepend the onboarding when this turn starts a new session, or when the
-    session got an older version of it (then once, marked as updated)."""
+def _secondary_settings(inst: Instance) -> tuple[str, str | None] | None:
+    if not config.AUTO_FALLBACK or inst.provider != "claude":
+        return None
+    configured = inst.secondary_provider is None
+    provider = config.SECONDARY_PROVIDER if configured else inst.secondary_provider
+    if not provider or provider == inst.provider:
+        return None
+    model = config.SECONDARY_MODEL if configured else inst.secondary_model
+    return provider, model
+
+
+def _secondary_label(inst: Instance) -> str:
+    settings = _secondary_settings(inst)
+    if settings is None:
+        return "off"
+    provider, model = settings
+    return f"{provider}/{get_provider(provider).resolve_model(model) or 'CLI default'}"
+
+
+def _turn_settings(inst: Instance, fallback: bool) -> tuple[str, str | None, str | None]:
+    if fallback:
+        settings = _secondary_settings(inst)
+        if settings is None:
+            raise ValueError("secondary fallback is not configured")
+        provider, model = settings
+        return provider, model, inst.secondary_session_id
+    return inst.provider, inst.model, inst.session_id
+
+
+def _with_brief(inst: Instance, prompt: str, fallback: bool = False) -> str:
+    """Prepend onboarding for a new or outdated primary or secondary session."""
     worklog_brief = _WORKLOG_BRIEF.format(worker=_worker(inst)) if worklog else ""
-    current = inst.brief_version >= BRIEF_VERSION
-    if inst.session_id is not None:
+    prefix = "secondary_" if fallback else ""
+    session_id = getattr(inst, f"{prefix}session_id")
+    version_attr = f"{prefix}brief_version"
+    briefed_attr = f"{prefix}worklog_briefed"
+    current = getattr(inst, version_attr) >= BRIEF_VERSION
+    if session_id is not None:
         if not current:
-            inst.brief_version = BRIEF_VERSION
-            inst.worklog_briefed = bool(worklog_brief)
+            setattr(inst, version_attr, BRIEF_VERSION)
+            setattr(inst, briefed_attr, bool(worklog_brief))
             store.put(inst)
             return _BRIEF_UPDATED + _harness_brief(inst) + worklog_brief + "\n" + prompt
-        if worklog_brief and not inst.worklog_briefed:
-            inst.worklog_briefed = True
+        if worklog_brief and not getattr(inst, briefed_attr):
+            setattr(inst, briefed_attr, True)
             store.put(inst)
             return worklog_brief + "\n" + prompt
         return prompt
-    inst.brief_version = BRIEF_VERSION
+    setattr(inst, version_attr, BRIEF_VERSION)
     if worklog_brief:
-        inst.worklog_briefed = True
+        setattr(inst, briefed_attr, True)
     store.put(inst)
     return _harness_brief(inst) + worklog_brief + "\n" + prompt
 
@@ -469,20 +587,41 @@ def _harness_brief(inst: Instance) -> str:
     )
 
 
-async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) -> str:
-    """Run one provider turn for an instance, streaming into status_msg.
+async def _run_turn(
+    inst: Instance,
+    prompt: str,
+    status_msg: discord.Message,
+    use_fallback: bool = False,
+    fallback_context: dict[str, str] | None = None,
+) -> str:
+    """Run one primary or secondary provider turn, streaming into status_msg.
 
-    Returns how it ended: "done", "error", "interrupted", or "crashed" (the CLI
-    failed before writing anything or using a tool; see _run_turn_recovering).
+    Returns how it ended: "done", "error", "interrupted", "limited", "stalled",
+    or "crashed" (the CLI failed before writing anything or using a tool).
     """
-    provider = get_provider(inst.provider)
+    provider_name, model, session_id = _turn_settings(inst, use_fallback)
+    provider = get_provider(provider_name)
     loop = asyncio.get_running_loop()
     started = loop.time()
-    model_label = _model_label(inst)
+    model_label = provider.resolve_model(model) or "CLI default"
+    raw_prompt = prompt
+    handoff = inst.fallback_handoff if not use_fallback else None
+    if handoff:
+        prompt = (
+            "[model fallback] The secondary model handled work while your subscription was limited. "
+            "Its session is separate. Inspect the files, worklog, and background jobs before continuing. "
+            "Do not repeat finished work.\n\n" + handoff + "\n\nThe user's current request:\n" + prompt
+        )
+    elif use_fallback:
+        prompt = (
+            "[automatic model fallback] The primary Claude subscription is unavailable until its reset. "
+            "You are the selected secondary model. Continue this request in the same workdir. "
+            "The primary may have done part of it. Inspect the state and do not repeat finished work. "
+            "The primary session is preserved and will receive a handoff after its reset.\n\n" + prompt
+        )
     log.info(
         "[%s] turn start: provider=%s model=%s session=%s workdir=%s prompt=%.160s",
-        inst.name, inst.provider, model_label,
-        inst.session_id or "new", inst.workdir, prompt,
+        inst.name, provider_name, model_label, session_id or "new", inst.workdir, prompt,
     )
     ports_before = _listening_ports()
 
@@ -510,10 +649,27 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # Set after the reply while only background tasks run: no "still working" notes, idle for restarts.
         "waiting_background": False,
     }
+    previous_fallback_handoff = inst.fallback_handoff if use_fallback else None
+
+    def record_fallback(outcome: str) -> None:
+        if not use_fallback or store.get(inst.channel_id) is not inst:
+            return
+        reply = buf.strip()[:8000]
+        if not reply:
+            reply = "(pending)" if outcome == "started" else "(no reply)"
+        result = outcome + (f"; {turn['tools']} tool events" if turn["tools"] else "")
+        entry = (f"Secondary request:\n{raw_prompt[:4000]}\n\n"
+                 f"Secondary outcome: {result}\n\nSecondary reply:\n{reply}")
+        inst.fallback_handoff = (
+            (previous_fallback_handoff + "\n\n" if previous_fallback_handoff else "") + entry
+        )[-12000:]
+        store.put(inst)
+
+    record_fallback("started")
     _active_turns[inst.channel_id] = turn
     # Kept until the turn ends, so a restart that cuts it off leaves the record (see harness/resume.py).
     running = _running_message.get(inst.channel_id)
-    resume.mark(inst.channel_id, inst.name, prompt, int(running[0]) if running else None,
+    resume.mark(inst.channel_id, inst.name, raw_prompt, int(running[0]) if running else None,
                 resumes=_resume_counts.get(inst.channel_id, 0))
     cut_off = False
     progress = asyncio.get_running_loop().create_task(
@@ -521,9 +677,14 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
     )
     stop_view = StopTurnView(inst, turn)
     try:
-        await status_msg.edit(view=stop_view)
-    except discord.HTTPException:
-        log.warning("[%s] couldn't add the stop button", inst.name)
+        await _discord_cosmetic(status_msg.edit(view=stop_view), f"stop button for {inst.name}")
+    except asyncio.CancelledError:
+        stop_view.stop()
+        progress.cancel()
+        if _active_turns.get(inst.channel_id) is turn:
+            _active_turns.pop(inst.channel_id, None)
+        _turn_ended[inst.channel_id] = time.time()
+        raise
     if wa:
         _wa_task(wa.typing(inst))
 
@@ -534,36 +695,54 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         # First chunk cuts at a line break and closes any open code block.
         return discord_markdown.split_message(text, DISCORD_MSG_LIMIT - 20)[0] + "\n…(truncated)"
 
-    def capture_session(session_id: str | None) -> None:
+    def capture_session(new_session_id: str | None) -> None:
+        attr = "secondary_session_id" if use_fallback else "session_id"
         if (
-            session_id
-            and session_id != inst.session_id
+            new_session_id
+            and new_session_id != getattr(inst, attr)
             and store.get(inst.channel_id) is inst  # not /delete'd mid-turn
         ):
-            inst.session_id = session_id
+            setattr(inst, attr, new_session_id)
             store.put(inst)
-            log.info("[%s] session id captured: %s", inst.name, inst.session_id)
+            log.info("[%s] %s session id captured: %s", inst.name, provider_name, new_session_id)
 
     interrupted = False
+    stalled = False
     limited = None  # the provider's "limit" event, if the usage limit stopped the turn
+    disregard_note = ""
     interrupt_wait = asyncio.ensure_future(turn["interrupt"].wait())
     try:
         try:
-            if note := _disregard_notes.pop(inst.channel_id, None):
-                prompt = f"{note}\n\n{prompt}"
+            if disregard_note := _disregard_notes.pop(inst.channel_id, None):
+                prompt = f"{disregard_note}\n\n{prompt}"
             extra = {"control": turn["control"]} if turn["control"] else {}
             if worklog and worklog.ready.is_set():
                 worker = _worker(inst)
                 extra["env"] = worklog.env_for(worker)
                 asyncio.get_running_loop().create_task(worklog.register(
-                    worker, inst.channel_id, inst.session_id or "", f"{inst.provider} in {inst.workdir}"
+                    worker, inst.channel_id, session_id or "", f"{provider_name} in {inst.workdir}"
                 ))
             agen = provider.run_turn(
-                inst.workdir, _with_brief(inst, prompt), inst.session_id, inst.model, **extra
+                inst.workdir, _with_brief(inst, prompt, use_fallback), session_id, model, **extra
             )
             while True:
                 step = asyncio.ensure_future(agen.__anext__())
-                await asyncio.wait({step, interrupt_wait}, return_when=asyncio.FIRST_COMPLETED)
+                stall_after = config.AGENT_STALL_AFTER
+                timeout = stall_after if stall_after > 0 and not turn["waiting_background"] else None
+                done, _ = await asyncio.wait(
+                    {step, interrupt_wait}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    step.cancel()
+                    try:
+                        await step
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+                    await agen.aclose()
+                    stalled = True
+                    log.warning("[%s] %s stalled after %.0fs without an event",
+                                inst.name, provider_name, stall_after)
+                    break
                 if not step.done():
                     # Cancelling the provider mid-await runs its cleanup, which
                     # kills the CLI and whatever it started.
@@ -621,22 +800,54 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 now = loop.time()
                 if buf and now - last_edit >= EDIT_INTERVAL:
                     last_edit = now
-                    await status_msg.edit(content=display(buf) or "…")
+                    if not turn.get("discord_failed"):
+                        ok = await _discord_cosmetic(
+                            status_msg.edit(content=display(buf) or "…"), f"streaming edit for {inst.name}"
+                        )
+                        turn["discord_failed"] = not ok
         except Exception:
             log.exception("turn failed for %s", inst.name)
             error = "harness error while running the agent (see logs)"
 
+        if stalled:
+            record_fallback("stalled")
+            note = (f"⚠️ `{provider_name}` produced no events for {_fmt_duration(config.AGENT_STALL_AFTER)}. "
+                    "The provider process was stopped; the session is preserved.")
+            await _discord_cosmetic(
+                status_msg.edit(content=note, view=None), f"stall notice for {inst.name}"
+            )
+            return "stalled"
+
         if limited is not None:
             running = _running_message.get(inst.channel_id)
-            at = limits.hit(limited.reset_at, inst.channel_id, inst.name, prompt,
-                            int(running[0]) if running else None)
-            log.warning("[%s] usage limit reached: %s; resumes at %s", inst.name, limited.text[:200],
-                        time.strftime("%H:%M", time.localtime(at)))
+            can_fallback = not use_fallback and _secondary_settings(inst) is not None
+            request_parts = ([disregard_note] if disregard_note else []) + [raw_prompt]
+            if turn["control"] and turn["control"].messages:
+                request_parts.append(
+                    "Additional user messages sent during the primary turn, in order:\n"
+                    + "\n\n".join(turn["control"].messages.values())
+                )
+            continuation = "\n\n".join(request_parts)
+            if fallback_context is not None:
+                fallback_context["prompt"] = continuation
+            turn["steered"].clear()  # the continuation includes both delivered and unread input
+            record_fallback("limited")
+            at = limits.hit(limited.reset_at, inst.channel_id, inst.name, continuation,
+                            int(running[0]) if running else None, record=not can_fallback)
+            log.warning("[%s] usage limit reached: %s; primary resumes at %s; fallback=%s",
+                        inst.name, limited.text[:200], time.strftime("%H:%M", time.localtime(at)), can_fallback)
             when = f"<t:{int(at)}:t>" + ("" if limited.reset_at else " (reset time unknown: tries again then)")
-            note = (f"⏸️ Claude usage limit reached. This agent continues by itself at {when}, "
-                    "1 minute after the limit resets. Messages sent meanwhile wait until then.")
+            if can_fallback:
+                note = (f"🔀 Claude usage limit reached. Switching to `{_secondary_label(inst)}` now. "
+                        f"Claude turns use this secondary until {when}. Both sessions are kept.")
+            else:
+                note = (f"⏸️ Claude usage limit reached. This agent continues by itself at {when}, "
+                        "1 minute after the limit resets. Messages sent meanwhile wait until then.")
             body = display(buf) if buf.strip() else ""
-            await status_msg.edit(content=(f"{body}\n\n{note}" if body else note)[:DISCORD_MSG_LIMIT], view=None)
+            await _discord_cosmetic(
+                status_msg.edit(content=(f"{body}\n\n{note}" if body else note)[:DISCORD_MSG_LIMIT], view=None),
+                f"limit notice for {inst.name}",
+            )
             if wa:
                 _wa_task(wa.send_text(inst, note))
             _start_limit_resumer()
@@ -645,12 +856,13 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
         if interrupted:
             who = turn["interrupted_by"] or "you"
             log.info("[%s] turn interrupted by %s after %.0fs", inst.name, who, loop.time() - started)
+            record_fallback("interrupted")
             note = f"⏹️ Interrupted by {who}. The session is kept, so the agent remembers this work."
             body = display(buf) if buf.strip() else ""
             text = f"{body}\n\n{note}" if body else note
             if len(text) > DISCORD_MSG_LIMIT:
                 text = discord_markdown.split_message(body, DISCORD_MSG_LIMIT - len(note) - 30)[0] + f"\n…\n\n{note}"
-            await status_msg.edit(content=text, view=None)
+            await _discord_cosmetic(status_msg.edit(content=text, view=None), f"interrupt notice for {inst.name}")
             if wa:
                 _wa_task(wa.send_text(inst, note))
             return "interrupted"
@@ -666,27 +878,40 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
                 and not error.startswith("harness error")
                 and not _SESSION_IN_USE_RE.search(error)
             )
+            record_fallback("crashed" if crashed else "error")
             if crashed:
-                await status_msg.edit(
-                    content=display(f"⚠️ The agent's session crashed before replying: {error}"),
-                    view=None,
+                await _discord_cosmetic(
+                    status_msg.edit(
+                        content=display(f"⚠️ The agent's session crashed before replying: {error}"), view=None
+                    ),
+                    f"crash notice for {inst.name}",
                 )
                 return "crashed"
-            if inst.session_id and _SESSION_IN_USE_RE.search(error):
-                await status_msg.edit(
-                    content=display(
-                        f"❌ {error}\n\nAnother `{inst.provider}` process still has this session "
-                        "open, maybe a turn from this instance's old channel or a terminal on "
-                        "this machine. Start a fresh session, or retry once it's closed."
+            if session_id and _SESSION_IN_USE_RE.search(error):
+                recovery = ("Change the secondary with `/model secondary:...`, or retry once it is closed."
+                            if use_fallback else "Start a fresh session, or retry once it's closed.")
+                await _discord_cosmetic(
+                    status_msg.edit(
+                        content=display(
+                            f"❌ {error}\n\nAnother `{provider_name}` process still has this session "
+                            f"open, maybe a turn from this instance's old channel or a terminal on this machine. {recovery}"
+                        ),
+                        view=None if use_fallback else SessionInUseView(inst, raw_prompt),
                     ),
-                    view=SessionInUseView(inst, prompt),
+                    f"session error for {inst.name}",
                 )
             else:
-                await status_msg.edit(content=f"❌ {display(error)}", view=None)
+                await _discord_cosmetic(
+                    status_msg.edit(content=f"❌ {display(error)}", view=None), f"error notice for {inst.name}"
+                )
             if wa:
                 _wa_task(wa.send_text(inst, f"❌ {error}"))
             return "error"
 
+        record_fallback("done")
+        if handoff:
+            inst.fallback_handoff = None
+            store.put(inst)
         log.info(
             "[%s] turn done in %.0fs, %d chars of reply",
             inst.name, loop.time() - started, len(buf.strip()),
@@ -736,50 +961,74 @@ async def _run_turn(inst: Instance, prompt: str, status_msg: discord.Message) ->
 
         # Split over the limit at line breaks, keeping code blocks intact.
         chunks = discord_markdown.split_message(final_text, DISCORD_MSG_LIMIT)
-        # Each table image goes with the part of the reply that mentions it.
-        files: list[list[discord.File]] = [[] for _ in chunks]
+        # Keep raw attachment bytes so a deferred delivery can recreate File objects.
+        attachment_data: dict[int, list[tuple[bytes, str]]] = {}
+        if image:
+            attachment_data[0] = [(png, f"{_slug(inst.name)}-output.png")]
         for n, (t, table_png) in enumerate(zip(tables, table_pngs), 1):
             k = next((i for i, c in enumerate(chunks) if t.marker in c), len(chunks) - 1)
-            files[k].append(discord.File(io.BytesIO(table_png), filename=f"table-{n}.png"))
-        first = ([image] if image else []) + files[0]
-        if first:
-            await status_msg.edit(content=chunks[0], attachments=first[:10], view=None)
-        else:
-            await status_msg.edit(content=chunks[0], view=None)
-        for chunk, chunk_files in zip(chunks[1:], files[1:]):
-            await status_msg.channel.send(chunk, files=chunk_files[:10])
-        if source:
-            await status_msg.channel.send(file=source)
-
-        topic = final_text[:TOPIC_LIMIT]
+            attachment_data.setdefault(k, []).append((table_png, f"table-{n}.png"))
+        files = [
+            [discord.File(io.BytesIO(data), filename=name) for data, name in attachment_data.get(i, [])]
+            for i in range(len(chunks))
+        ]
+        first = files[0]
+        source_data = (html_block.encode(), f"{_slug(inst.name)}-output.html") if source else None
+        sent = 1
+        deferred = False
         try:
-            await status_msg.channel.edit(topic=topic)
-        except discord.Forbidden:
-            log.warning("missing permission to set channel topic for %s", inst.name)
+            if first:
+                await asyncio.wait_for(
+                    status_msg.edit(content=chunks[0], attachments=first[:10], view=None),
+                    DISCORD_REPLY_TIMEOUT,
+                )
+            else:
+                await asyncio.wait_for(
+                    status_msg.edit(content=chunks[0], view=None), DISCORD_REPLY_TIMEOUT
+                )
+            for chunk, chunk_files in zip(chunks[1:], files[1:]):
+                await asyncio.wait_for(
+                    status_msg.channel.send(chunk, files=chunk_files[:10]), DISCORD_REPLY_TIMEOUT
+                )
+                sent += 1
+        except (asyncio.TimeoutError, discord.HTTPException) as e:
+            deferred = True
+            log.warning("[%s] reply delivery deferred after Discord failure: %s", inst.name, e)
+            _schedule_reply_retry(
+                status_msg, chunks, list(range(sent, len(chunks))), attachment_data, source_data
+            )
+        if source and not deferred:
+            await _discord_cosmetic(
+                status_msg.channel.send(file=source), f"HTML source attachment for {inst.name}"
+            )
         return "done"
     except asyncio.CancelledError:
         cut_off = True  # the harness is shutting down: keep the record for the resume
+        record_fallback("interrupted by harness restart")
         raise
     finally:
-        if turn["slot_freed"] and not cut_off:
-            await _global_semaphore.acquire()  # the caller's `async with` gives it back
-        if not cut_off:
-            resume.clear(inst.channel_id)
-        stop_view.stop()
-        interrupt_wait.cancel()
-        _active_turns.pop(inst.channel_id, None)
-        _turn_ended[inst.channel_id] = time.time()
-        progress.cancel()
-        # Messages sent into the turn that the agent never read: after an
-        # interrupt they're dropped like the rest of the queue; otherwise they
-        # get a turn of their own.
-        for msg in turn["steered"].values():
-            if interrupted:
-                log.info("[%s] message %s sent into the turn was dropped by the interrupt",
-                         inst.name, msg.id)
-            elif store.get(inst.channel_id) is inst:
-                log.info("[%s] message %s wasn't read before the turn ended; queued", inst.name, msg.id)
-                asyncio.get_running_loop().create_task(_process_user_message(inst, msg))
+        try:
+            if turn["slot_freed"] and not cut_off:
+                await _global_semaphore.acquire()  # the caller's `async with` gives it back
+        finally:
+            if not cut_off:
+                resume.clear(inst.channel_id)
+            stop_view.stop()
+            interrupt_wait.cancel()
+            if _active_turns.get(inst.channel_id) is turn:
+                _active_turns.pop(inst.channel_id, None)
+            _turn_ended[inst.channel_id] = time.time()
+            progress.cancel()
+            # Messages sent into the turn that the agent never read: after an
+            # interrupt they're dropped like the rest of the queue; otherwise they
+            # get a turn of their own.
+            for msg in turn["steered"].values():
+                if interrupted:
+                    log.info("[%s] message %s sent into the turn was dropped by the interrupt",
+                             inst.name, msg.id)
+                elif store.get(inst.channel_id) is inst:
+                    log.info("[%s] message %s wasn't read before the turn ended; queued", inst.name, msg.id)
+                    asyncio.get_running_loop().create_task(_process_user_message(inst, msg))
 
 
 @client.event
@@ -803,7 +1052,9 @@ async def on_ready() -> None:
         asyncio.get_running_loop().create_task(_catch_up(inst))
     global worklog
     if config.WORKLOG_ENABLED and worklog is None and (g := client.get_guild(config.GUILD_ID)):
-        worklog = WorklogService(client, _worklog_deliver, _worklog_notify, _worklog_idle_for)
+        worklog = WorklogService(
+            client, _worklog_deliver, _worklog_notify, _worklog_idle_for, _worklog_active
+        )
         asyncio.get_running_loop().create_task(_start_worklog(g))
     elif worklog is not None and worklog.ready.is_set():
         asyncio.get_running_loop().create_task(worklog.resync())  # after a reconnect
@@ -1020,6 +1271,11 @@ async def _health_loop() -> None:
             log.exception("health loop failed")
 
 
+def _worklog_active(worker: str) -> bool:
+    inst = _instance_for_worker(worker)
+    return bool(inst and inst.channel_id in _active_turns)
+
+
 def _worklog_idle_for(worker: str) -> float | None:
     """Seconds this worker's agent has been idle; None if it is busy, stopped, or unused lately."""
     inst = _instance_for_worker(worker)
@@ -1031,8 +1287,8 @@ def _worklog_idle_for(worker: str) -> float | None:
         if not turn.get("waiting_background"):
             return None
         return time.time() - turn.get("last_event_at", time.time())
-    if inst.provider == "claude" and limits.resume_at():
-        return None  # waiting for the usage limit to reset
+    if inst.provider == "claude" and limits.resume_at() and _secondary_settings(inst) is None:
+        return None  # no secondary: waiting for the usage limit to reset
     lock = _channel_locks.get(inst.channel_id)
     if lock is not None and lock.locked():
         return None
@@ -1210,10 +1466,7 @@ async def _mirror_reply(
 
 
 async def _react(message: discord.Message, emoji: str) -> None:
-    try:
-        await message.add_reaction(emoji)
-    except discord.NotFound:  # deleted in the meantime
-        pass
+    await _discord_cosmetic(message.add_reaction(emoji), f"reaction {emoji}")
 
 
 async def _process_user_message(
@@ -1248,7 +1501,9 @@ async def _process_user_message(
                 _running_message[message.channel.id] = (message.id, turn.content)
                 try:
                     async with message.channel.typing():
-                        status_msg = await message.channel.send("🤔 …")
+                        status_msg = await asyncio.wait_for(
+                            message.channel.send("🤔 …"), DISCORD_REPLY_TIMEOUT
+                        )
                         await _run_turn_recovering(inst, turn.prompt(), status_msg)
                 finally:
                     if _running_message.get(message.channel.id, (None,))[0] == message.id:
@@ -1400,7 +1655,7 @@ async def _process_whatsapp_message(inst: Instance, text: str, sender: str) -> N
         async with _channel_lock(channel.id):
             async with _global_semaphore:
                 async with channel.typing():
-                    status_msg = await channel.send("🤔 …")
+                    status_msg = await asyncio.wait_for(channel.send("🤔 …"), DISCORD_REPLY_TIMEOUT)
                     await _run_turn_recovering(inst, text, status_msg)
         if mirror:
             await mirror.add_reaction("✅")
@@ -1498,6 +1753,48 @@ def _split_model(provider: str | None, model: str | None) -> tuple[str | None, s
     return provider, model
 
 
+async def _secondary_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[discord.app_commands.Choice[str]]:
+    inst = store.get(interaction.channel_id) if interaction.channel_id else None
+    first = ((inst.secondary_provider or config.SECONDARY_PROVIDER)
+             if inst is not None else config.SECONDARY_PROVIDER)
+    needle = current.lower()
+    choices = [discord.app_commands.Choice(name="off (disable fallback)", value="off")] if "off" in needle else []
+    for pname in sorted(provider_names(), key=lambda p: p != first):
+        for alias, model_id in get_provider(pname).models.items():
+            value = f"{pname}:{alias}"
+            if needle in value.lower() or needle in model_id.lower():
+                choices.append(discord.app_commands.Choice(name=f"{value} ({model_id})", value=value))
+    return choices[:25]
+
+
+def _parse_secondary(primary: str, current: str | None, value: str) -> tuple[str, str | None]:
+    if value.lower() == "off":
+        return "", None
+    if value.lower() == "on":
+        provider, model = config.SECONDARY_PROVIDER, config.SECONDARY_MODEL
+    else:
+        provider, model = _split_model(None, value)
+        provider = provider or current or config.SECONDARY_PROVIDER
+    if not provider:
+        raise ValueError("secondary fallback is not configured")
+    if provider == primary:
+        raise ValueError("primary and secondary providers must differ")
+    return provider, model
+
+
+def _set_secondary(inst: Instance, selection: tuple[str, str | None]) -> None:
+    provider, model = selection
+    old_provider = config.SECONDARY_PROVIDER if inst.secondary_provider is None else inst.secondary_provider
+    if provider != old_provider:
+        inst.secondary_session_id = None
+        inst.secondary_brief_version = 0
+        inst.secondary_worklog_briefed = False
+    inst.secondary_provider = provider
+    inst.secondary_model = model
+
+
 @tree.command(name="new", description="Create a new agent instance channel")
 @discord.app_commands.describe(
     name="Instance name (becomes the channel name)",
@@ -1505,11 +1802,14 @@ def _split_model(provider: str | None, model: str | None) -> tuple[str | None, s
     prompt="Optional first prompt to start the agent with",
     provider="Agent CLI to use (default: DEFAULT_PROVIDER)",
     model="provider:model from the list, or a bare alias/ID (default: the provider's default)",
+    secondary="Fallback provider:model, on for the configured default, or off",
 )
 @discord.app_commands.choices(
     provider=[discord.app_commands.Choice(name=p, value=p) for p in provider_names()]
 )
-@discord.app_commands.autocomplete(model=_model_autocomplete, workdir=_workdir_autocomplete)
+@discord.app_commands.autocomplete(
+    model=_model_autocomplete, secondary=_secondary_autocomplete, workdir=_workdir_autocomplete
+)
 async def cmd_new(
     interaction: discord.Interaction,
     name: str,
@@ -1517,9 +1817,15 @@ async def cmd_new(
     prompt: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    secondary: str | None = None,
 ) -> None:
+    existing = store.by_name(name)
+    primary = provider or (existing.provider if existing else config.DEFAULT_PROVIDER)
     try:
         provider, model = _split_model(provider, model)
+        primary = provider or primary
+        secondary_selection = (_parse_secondary(primary, config.SECONDARY_PROVIDER, secondary)
+                               if secondary is not None else None)
     except ValueError as e:
         await interaction.response.send_message(f"❌ {e}")
         return
@@ -1528,9 +1834,9 @@ async def cmd_new(
     guild = interaction.guild
     assert guild is not None
 
-    existing = store.by_name(name)
     if existing is not None:
-        options = dict(provider=provider, model=model, workdir=workdir, prompt=prompt)
+        options = dict(provider=provider, model=model, secondary=secondary_selection,
+                       workdir=workdir, prompt=prompt)
         switching = provider is not None and provider != existing.provider
         if existing.session_id is None or switching:
             # Nothing to resume (session ids are provider-specific): just reopen.
@@ -1549,17 +1855,20 @@ async def cmd_new(
     inst = Instance(
         channel_id=channel.id,
         name=name,
-        provider=provider or config.DEFAULT_PROVIDER,
+        provider=primary,
         workdir=workdirs.clean(workdir) if workdir else config.DEFAULT_WORKDIR,
         model=model,
     )
+    if secondary_selection is not None:
+        _set_secondary(inst, secondary_selection)
     inst.ensure_web_token()
     store.put(inst)
     if wa:
         await wa.ensure_group(inst)  # before the first prompt, so its reply is mirrored
     await interaction.followup.send(
         f"✅ created {channel.mention} — just chat in it. "
-        f"Provider: `{inst.provider}`, model: `{_model_label(inst)}`, workdir: `{inst.workdir}`"
+        f"Provider: `{inst.provider}`, model: `{_model_label(inst)}`, secondary: `{_secondary_label(inst)}`, "
+        f"workdir: `{inst.workdir}`"
     )
     if prompt:
         await on_message_simple(channel, prompt)
@@ -1577,6 +1886,7 @@ async def _reopen_instance(
     fresh: bool,
     provider: str | None = None,
     model: str | None = None,
+    secondary: tuple[str, str | None] | None = None,
     workdir: str | None = None,
     prompt: str | None = None,
 ) -> tuple[discord.TextChannel, str]:
@@ -1595,10 +1905,14 @@ async def _reopen_instance(
     note = ""
     if fresh:
         inst.session_id = None
+        inst.secondary_session_id = None
+        inst.fallback_handoff = None
         if workdir:
             inst.workdir = normalize_workdir(workdirs.clean(workdir))
     elif workdir:
         note = " The folder is unchanged: a resumed session keeps its own."
+    if secondary is not None:
+        _set_secondary(inst, secondary)
     store.put(inst)
     if wa:
         _wa_task(wa.ensure_group(inst))
@@ -1734,6 +2048,7 @@ class SessionInUseView(discord.ui.View):
         self.stop()
         if fresh and store.get(self.inst.channel_id) is self.inst:
             self.inst.session_id = None
+            self.inst.fallback_handoff = None
             store.put(self.inst)
             log.info("[%s] session in use elsewhere; starting fresh", self.inst.name)
         await interaction.response.edit_message(
@@ -1752,42 +2067,111 @@ class SessionInUseView(discord.ui.View):
 
 
 async def _run_turn_recovering(inst: Instance, prompt: str, status_msg: discord.Message) -> None:
-    """Run a turn; if the agent's CLI crashed before replying, restart and resend.
-
-    First the same session again (a transient failure), then, if it crashes once
-    more, a fresh session: the message isn't lost either way.
-    """
+    """Run a turn with usage-limit failover, stall continuation, and crash recovery."""
+    use_fallback = False
     if inst.provider == "claude" and (at := limits.resume_at()):
-        # The account's usage limit: wait for the reset without holding a turn slot.
-        await status_msg.edit(content=f"⏸️ Waiting for the Claude usage limit to reset; this runs at <t:{int(at)}:t>.")
-        _global_semaphore.release()
-        try:
-            while (at := limits.resume_at()):
-                await asyncio.sleep(min(60.0, max(1.0, at - time.time())))
-        finally:
-            await _global_semaphore.acquire()
-        cut = limits.take(inst.channel_id)  # this message continues the cut-off work too
-        if cut:
-            prompt = limits.prompt(cut[inst.channel_id]) + "\n\nThe user's newer message:\n" + prompt
-        await status_msg.edit(content="🤔 …")
-    if await _run_turn(inst, prompt, status_msg) != "crashed":
-        return
+        if _secondary_settings(inst) is not None:
+            use_fallback = True
+            await _discord_cosmetic(
+                status_msg.edit(
+                    content=f"🔀 Using secondary `{_secondary_label(inst)}` until Claude's expected reset at <t:{int(at)}:t>."
+                ),
+                f"fallback notice for {inst.name}",
+            )
+            cut = limits.take(inst.channel_id, clear_gate=False)
+            if cut:
+                prompt = ("[usage limit] An earlier Claude turn was cut off. Its request was:\n"
+                          + (cut[inst.channel_id].get("prompt") or "")
+                          + "\n\nThe user's newer message:\n" + prompt)
+        else:
+            # Without a secondary, wait for the reset without holding a turn slot.
+            await _discord_cosmetic(
+                status_msg.edit(content=f"⏸️ Waiting for the Claude usage limit to reset; this runs at <t:{int(at)}:t>."),
+                f"limit wait notice for {inst.name}",
+            )
+            _global_semaphore.release()
+            try:
+                while (at := limits.resume_at()):
+                    await asyncio.sleep(min(60.0, max(1.0, at - time.time())))
+            finally:
+                await _global_semaphore.acquire()
+            cut = limits.take(inst.channel_id)  # this message continues the cut-off work too
+            if cut:
+                prompt = limits.prompt(cut[inst.channel_id]) + "\n\nThe user's newer message:\n" + prompt
+            await _discord_cosmetic(status_msg.edit(content="🤔 …"), f"resume status for {inst.name}")
+    elif inst.provider == "claude" and inst.fallback_handoff:
+        await _discord_cosmetic(
+            status_msg.edit(content="🔀 Claude is available again. Returning to the primary session."),
+            f"primary return notice for {inst.name}",
+        )
+    stall_continued = False
+    crash_retries = 0
     channel = status_msg.channel
-    log.warning("[%s] agent crashed before replying; retrying the same session", inst.name)
-    retry = await channel.send("🔄 Restarting the session and resending your message…")
-    if await _run_turn(inst, prompt, retry) != "crashed":
+    while True:
+        fallback_context: dict[str, str] = {}
+        result = await _run_turn(inst, prompt, status_msg, use_fallback, fallback_context)
+        if result == "limited" and not use_fallback and _secondary_settings(inst) is not None:
+            use_fallback = True
+            prompt = fallback_context.get("prompt", prompt)
+            cut = limits.take(inst.channel_id, clear_gate=False)
+            if cut and (old_prompt := cut[inst.channel_id].get("prompt")) and old_prompt != prompt:
+                prompt = ("[usage limit] An earlier Claude turn was also cut off. Its request was:\n"
+                          + old_prompt + "\n\nThe current request:\n" + prompt)
+            continue
+        if result == "stalled":
+            provider_name, _, stalled_session = _turn_settings(inst, use_fallback)
+            if not stall_continued:
+                stall_continued = True
+                prompt = (
+                    f"[provider stall] The previous {provider_name} turn produced no events for "
+                    f"{int(config.AGENT_STALL_AFTER)} seconds and was stopped. The provider process was cleaned up. "
+                    "Inspect the saved session and work state, then continue the request without repeating finished work.\n\n"
+                    + prompt
+                )
+                status_msg = await _recovery_status(
+                    channel, "🔄 The provider stalled. Continuing once on the saved session…", status_msg
+                )
+                continue
+            help_text = (
+                f"🆘 `{provider_name}` stalled twice without producing events. No more automatic retries "
+                f"will run for this request. Session `{stalled_session or 'new'}` is preserved. "
+                "Check the provider login and CLI processes, then retry or send new instructions. "
+                f"Raise `AGENT_STALL_AFTER` (currently {int(config.AGENT_STALL_AFTER)} seconds) for legitimate long tools."
+            )
+            await _discord_cosmetic(
+                status_msg.edit(content=help_text, view=None), f"second stall help for {inst.name}"
+            )
+            return
+        if result != "crashed":
+            return
+        if crash_retries == 0:
+            crash_retries = 1
+            log.warning("[%s] agent crashed before replying; retrying the same session", inst.name)
+            status_msg = await _recovery_status(
+                channel, "🔄 Restarting the session and resending your message…", status_msg
+            )
+            continue
+        if crash_retries == 1:
+            session_attr = "secondary_session_id" if use_fallback else "session_id"
+            old = getattr(inst, session_attr)
+            if not old or store.get(inst.channel_id) is not inst:
+                return
+            crash_retries = 2
+            setattr(inst, session_attr, None)
+            if not use_fallback:
+                inst.fallback_handoff = None
+            store.put(inst)
+            log.warning("[%s] session %s crashed twice; starting a fresh session", inst.name, old)
+            await _discord_cosmetic(
+                channel.send(
+                    f"⚠️ Session `{old}` crashed again, so your message goes to a **fresh session**. "
+                    "The old one isn't deleted."
+                ),
+                f"fresh session notice for {inst.name}",
+            )
+            status_msg = await _recovery_status(channel, "🤔 …", status_msg)
+            continue
         return
-    if not inst.session_id or store.get(inst.channel_id) is not inst:
-        return
-    old = inst.session_id
-    inst.session_id = None
-    store.put(inst)
-    log.warning("[%s] session %s crashed twice; starting a fresh session", inst.name, old)
-    await channel.send(
-        f"⚠️ Session `{old}` crashed again, so your message goes to a **fresh session**. "
-        "The old one isn't deleted: `/session` can switch back to it."
-    )
-    await _run_turn(inst, prompt, await channel.send("🤔 …"))
 
 
 def _busy_notice(inst: Instance, *, steered: bool) -> str | None:
@@ -1822,7 +2206,7 @@ async def on_message_simple(channel: discord.TextChannel, prompt: str) -> None:
     async with _channel_lock(channel.id):
         async with _global_semaphore:
             async with channel.typing():
-                status_msg = await channel.send("🤔 …")
+                status_msg = await asyncio.wait_for(channel.send("🤔 …"), DISCORD_REPLY_TIMEOUT)
                 await _run_turn_recovering(inst, prompt, status_msg)
 
 
@@ -2106,17 +2490,21 @@ async def cmd_interrupt(
         asyncio.get_running_loop().create_task(on_message_simple(interaction.channel, message))
 
 
-@tree.command(name="model", description="Show or change the provider/model for this channel's agent")
+@tree.command(name="model", description="Show or change the primary and secondary models for this channel")
 @discord.app_commands.describe(
-    provider="Switch agent CLI (starts a fresh session; omit to keep the current one)",
-    model="provider:model from the list, or a bare alias/ID (omit to show the current model)",
+    provider="Switch primary agent CLI (starts a fresh session; omit to keep it)",
+    model="Primary provider:model or bare alias/ID (omit to keep it)",
+    secondary="Fallback provider:model, on for the configured default, or off",
 )
 @discord.app_commands.choices(
     provider=[discord.app_commands.Choice(name=p, value=p) for p in provider_names()]
 )
-@discord.app_commands.autocomplete(model=_model_autocomplete)
+@discord.app_commands.autocomplete(model=_model_autocomplete, secondary=_secondary_autocomplete)
 async def cmd_model(
-    interaction: discord.Interaction, provider: str | None = None, model: str | None = None
+    interaction: discord.Interaction,
+    provider: str | None = None,
+    model: str | None = None,
+    secondary: str | None = None,
 ) -> None:
     inst = store.get(interaction.channel_id) if interaction.channel_id else None
     if inst is None:
@@ -2124,31 +2512,44 @@ async def cmd_model(
         return
     try:
         provider, model = _split_model(provider, model)
+        primary = provider or inst.provider
+        current_secondary = config.SECONDARY_PROVIDER if inst.secondary_provider is None else inst.secondary_provider
+        secondary_selection = (_parse_secondary(primary, current_secondary, secondary)
+                               if secondary is not None else None)
     except ValueError as e:
         await interaction.response.send_message(f"❌ {e}")
         return
     log.info(
-        "[%s] /model by %s: current=%s/%s requested=%s/%s",
-        inst.name, interaction.user, inst.provider, _model_label(inst), provider, model,
+        "[%s] /model by %s: current=%s/%s secondary=%s requested=%s/%s secondary=%s",
+        inst.name, interaction.user, inst.provider, _model_label(inst), _secondary_label(inst),
+        provider, model, secondary,
     )
     switching = provider is not None and provider != inst.provider
-    if model is None and not switching:
+    if model is None and not switching and secondary_selection is None:
+        active = (f" Active during the current limit: `{_secondary_label(inst)}`."
+                  if inst.provider == "claude" and limits.resume_at() and _secondary_settings(inst) else "")
         await interaction.response.send_message(
-            f"**{inst.name}**: provider `{inst.provider}`, model `{_model_label(inst)}`"
+            f"**{inst.name}**: primary `{inst.provider}` / `{_model_label(inst)}`, "
+            f"secondary `{_secondary_label(inst)}`.{active}"
         )
         return
-    old = f"{inst.provider}/{_model_label(inst)}"
+    old = f"{inst.provider}/{_model_label(inst)}; secondary {_secondary_label(inst)}"
     if switching:
         # Session ids are provider-specific, so a provider switch starts over.
         inst.provider = provider
         inst.session_id = None
-    inst.model = model
+        inst.fallback_handoff = None
+    if model is not None or switching:
+        inst.model = model
+    if secondary_selection is not None:
+        _set_secondary(inst, secondary_selection)
     store.put(inst)
-    log.info("[%s] model changed: %s -> %s/%s", inst.name, old, inst.provider, _model_label(inst))
+    log.info("[%s] models changed: %s -> %s/%s; secondary %s",
+             inst.name, old, inst.provider, _model_label(inst), _secondary_label(inst))
     await interaction.response.send_message(
-        f"✅ **{inst.name}** now uses `{inst.provider}` / `{_model_label(inst)}` from the next "
-        + ("message (**new session** — previous conversation not carried over)." if switching
-           else "message (same session).")
+        f"✅ **{inst.name}**: primary `{inst.provider}` / `{_model_label(inst)}`, "
+        f"secondary `{_secondary_label(inst)}`. Changes apply from the next message. "
+        + ("The primary starts a **new session**." if switching else "Existing sessions are kept.")
     )
 
 

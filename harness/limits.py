@@ -1,20 +1,13 @@
-"""Claude usage limits: wait for the reset, then resume the agents that were cut off.
+"""Claude usage limits: account reset state and turns that need a resume.
 
-The Claude CLI reports the account's limits in its stream:
+The Claude CLI reports rejected limits in its stream or error result. The provider
+turns them into a "limit" event with any supplied reset time. This module keeps
+the account-wide gate in data/usage_limit.json. With no secondary model, it also
+records cut-off channels and resumes them after the reset. With a secondary, the
+bot records only the gate and runs the request on that secondary instead.
 
-    {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed" | "allowed_warning" | "rejected",
-     "resetsAt": <unix time>, "rateLimitType": "five_hour", ...}}
-
-and, when a turn is refused, says so in the reply ("Claude AI usage limit
-reached|<unix time>", or "You've hit your limit · resets 9pm"). The provider
-turns that into a "limit" event with the reset time. Then the harness:
-
-- records the cut-off turn here (data/usage_limit.json, so it survives a restart),
-- makes every Claude turn wait until RESUME_AFTER seconds after the reset (the
-  limit is per account), and holds back worklog offers meanwhile,
-- gives each cut-off channel a resume turn at that time.
-
-If the reset time is unknown, it tries again after RETRY_UNKNOWN seconds.
+The gate ends RESUME_AFTER seconds after the reported reset. If the reset time is
+unknown, it ends RETRY_UNKNOWN seconds after the failure.
 """
 
 from __future__ import annotations
@@ -34,7 +27,9 @@ PREVIEW = 600
 _EPOCH = re.compile(r"limit reached\s*\|\s*(\d{10})", re.IGNORECASE)
 _CLOCK = re.compile(r"resets\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b", re.IGNORECASE)
 _LIMIT_TEXT = re.compile(r"usage limit reached|hit your (?:usage |session |weekly )?limit|limit reached\s*\|"
-                         r"|out of (?:extra )?usage", re.IGNORECASE)
+                         r"|(?:out of|ran out of) (?:extra )?(?:usage|tokens|credits)|no tokens remaining"
+                         r"|(?:token|credit) (?:usage )?limit reached|tokens? (?:are )?(?:exhausted|depleted)"
+                         r"|insufficient (?:credits|balance)|credit balance (?:is )?too low", re.IGNORECASE)
 
 
 def reset_from_text(text: str, now: float | None = None) -> float | None:
@@ -72,8 +67,8 @@ def _save(data: dict) -> None:
 
 
 def hit(reset_at: float | None, channel_id: int, instance: str, prompt: str,
-        message_id: int | None = None, now: float | None = None) -> float:
-    """Record a turn the limit cut off. Returns when the agents resume."""
+        message_id: int | None = None, now: float | None = None, record: bool = True) -> float:
+    """Record an account gate and, by default, a turn to resume after it."""
     now = now or time.time()
     data = _load()
     current = data.get("resume_at", 0) if data.get("resume_at", 0) > now else 0
@@ -82,8 +77,9 @@ def hit(reset_at: float | None, channel_id: int, instance: str, prompt: str,
         data["known"] = True
     elif not current:
         data["resume_at"], data["known"] = now + RETRY_UNKNOWN, False
-    data.setdefault("channels", {})[str(channel_id)] = {
-        "instance": instance, "started": now, "message_id": message_id, "prompt": prompt[:PREVIEW]}
+    if record:
+        data.setdefault("channels", {})[str(channel_id)] = {
+            "instance": instance, "started": now, "message_id": message_id, "prompt": prompt[:PREVIEW]}
     _save(data)
     return data["resume_at"]
 
@@ -94,7 +90,7 @@ def resume_at(now: float | None = None) -> float | None:
     return at if at and at > (now or time.time()) else None
 
 
-def take(channel_id: int | None = None) -> dict[int, dict]:
+def take(channel_id: int | None = None, clear_gate: bool = True) -> dict[int, dict]:
     """The cut-off turns to resume (all, or one channel's), and forget them."""
     data = _load()
     chans = data.get("channels", {})
@@ -103,7 +99,7 @@ def take(channel_id: int | None = None) -> dict[int, dict]:
     else:
         rec = chans.pop(str(channel_id), None)
         out = {str(channel_id): rec} if rec else {}
-    if not data.get("channels"):
+    if clear_gate and not data.get("channels"):
         data.pop("resume_at", None)
         data.pop("known", None)
     _save(data)

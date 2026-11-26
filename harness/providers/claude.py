@@ -82,7 +82,7 @@ class ClaudeProvider(AgentProvider):
         "opus": "claude-opus-5-5",
         "sonnet": "claude-sonnet-5-5",
         "haiku": "claude-haiku-5-5",
-        "fable": "claude-fable-5-1",
+        "fable": "claude-fable-5-2",
     }
     default_model = config.CLAUDE_MODEL
 
@@ -319,11 +319,11 @@ class ClaudeProvider(AgentProvider):
                 log.debug("claude pid=%d stderr: %s", proc.pid, stderr_data.decode("utf-8", "replace")[-2000:])
 
             final_text = "".join(final_text_parts).strip()
-            # The stream's rate_limit_event, or an error result that says so (not the agent's own text:
-            # a reply that talks about limits is not one).
-            said = result_error or ""
+            # Check provider errors, not ordinary assistant text about limits.
+            stderr_text = stderr_data.decode("utf-8", "replace").strip()
+            said = result_error or stderr_text
             if not interrupted and (limit_hit or limits.is_limit_text(said)):
-                yield StreamEvent(kind="limit", text=(result_error or final_text or "usage limit reached")[-500:],
+                yield StreamEvent(kind="limit", text=(said or final_text or "usage limit reached")[-500:],
                                   session_id=captured_session,
                                   reset_at=limit_reset or limits.reset_from_text(said))
             elif interrupted:

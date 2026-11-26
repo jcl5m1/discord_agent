@@ -143,6 +143,64 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(mail), 1)
         self.assertIn("released", mail[0].text)
 
+    async def test_active_overdue_claim_is_kept_without_notice_spam(self):
+        await self.a.run(["add", "Keep active turn", "--area", "x"], "alice@m1")
+        await self.a.run(["claim", "1"], "alice@m1")
+        await asyncio.sleep(0.3)
+        self.a.active = lambda worker: worker == "alice@m1"
+        claimed_at = self.a.state.tasks[1].checkin_at
+        later = claimed_at + svc.CHECKIN_EVERY + 1
+        with mock.patch.object(svc.time, "time", return_value=later):
+            await self.a._check_claims()
+            await self.a._check_claims()
+
+        task = self.a.state.tasks[1]
+        self.assertGreater(task.checkin_at, claimed_at)
+        self.assertFalse(task.lapsed(time.time()))
+        self.assertEqual((task.status, task.owner), ("claimed", "alice@m1"))
+        notices = [d for d in self.delivered if d[:3] == (1, "alice@m1", "harness")]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("#1", notices[0][3])
+        self.assertIn("provider process is still active", notices[0][3])
+        self.assertIn("renewed shared ownership", notices[0][3])
+
+        self.a.idle_for = lambda worker: 20 * 60
+        self.assertEqual(self.a._offer_plan(later), [])
+        ok, outcome = await self.b.run(["claim", "1"], "bob@m2")
+        self.assertFalse(ok)
+        self.assertIn("held by alice@m1", outcome)
+        self.assertEqual(self.a.state.tasks[1].owner, "alice@m1")
+
+    async def test_active_overdue_claim_releases_and_offers_after_cleanup(self):
+        await self.a.run(["add", "Finish active turn", "--area", "x"], "alice@m1")
+        await self.a.run(["claim", "1"], "alice@m1")
+        await asyncio.sleep(0.3)
+        self.a.active = lambda worker: True
+        later = self.a.state.tasks[1].checkin_at + svc.CHECKIN_EVERY + 1
+        with mock.patch.object(svc.time, "time", return_value=later):
+            await self.a._check_claims()
+            await self.a._check_claims()
+            await self.a._check_claims()
+        notices = [d for d in self.delivered if d[:3] == (1, "alice@m1", "harness")
+                   and "provider process is still active" in d[3]]
+        self.assertEqual(len(notices), 1)
+
+        self.a.active = lambda worker: False
+        later = self.a.state.tasks[1].checkin_at + svc.CHECKIN_EVERY + 1
+        with mock.patch.object(svc.time, "time", return_value=later):
+            await self.a._check_claims()
+            await self.a._check_claims()
+        task = self.a.state.tasks[1]
+        self.assertEqual((task.status, task.owner), ("open", ""))
+        releases = [n for n in self.notified if n[:2] == (1, "alice@m1") and "released" in n[2]]
+        self.assertEqual(len(releases), 1)
+        self.assertIn("no check-in", releases[0][2])
+
+        self.a.idle_for = lambda worker: svc.OFFER_AFTER
+        self.assertEqual([(w, t.num) for w, t in self.a._offer_plan(later)], [("alice@m1", 1)])
+        self.a.idle_for = lambda worker: svc.OFFER_AFTER - 1
+        self.assertEqual(self.a._offer_plan(later), [])
+
     async def test_idle_agents_are_offered_open_tasks_once(self):
         await self.a.run(["add", "Fix lists", "--prio", "1", "--area", "x"], "alice@m1")
         await self.a.run(["add", "Port tool", "--prio", "1"], "alice@m1")  # no area: offered to nobody
