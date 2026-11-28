@@ -20,7 +20,7 @@ from typing import AsyncIterator
 
 from .. import config, limits
 from .base import (
-    SPAWN_KWARGS, AgentProvider, SessionInfo, StreamEvent, TurnControl, finish_process,
+    STREAM_LIMIT, SPAWN_KWARGS, AgentProvider, SessionInfo, StreamEvent, TurnControl, finish_process,
     kill_process_tree, read_line, register, run_text,
 )
 
@@ -134,7 +134,7 @@ class ClaudeProvider(AgentProvider):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=16 * 1024 * 1024,  # stream-json lines (tool results) can be large
+            limit=STREAM_LIMIT,
             env={**os.environ, **env} if env else None,
             **SPAWN_KWARGS,
         )

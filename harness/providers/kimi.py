@@ -20,7 +20,7 @@ from typing import AsyncIterator
 
 from .. import config
 from .base import (
-    SPAWN_KWARGS, AgentProvider, finish_process, kill_process_tree, read_line, register,
+    STREAM_LIMIT, SPAWN_KWARGS, AgentProvider, finish_process, kill_process_tree, read_line, register,
     relay_interrupts, SessionInfo, StreamEvent, TurnControl,
 )
 
@@ -184,6 +184,7 @@ class KimiProvider(AgentProvider):
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STREAM_LIMIT,
             env={**os.environ, **env} if env else None,
             **SPAWN_KWARGS,
         )

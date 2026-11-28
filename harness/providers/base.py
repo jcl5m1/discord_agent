@@ -264,6 +264,11 @@ async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 3.0
 EXIT_CHECK = 5.0
 
 
+# The stdout line limit for agent CLIs. One stream-json event (e.g. a large tool
+# result) can be many MB; asyncio's 64 KiB default stops the turn with
+# LimitOverrunError.
+STREAM_LIMIT = 16 * 1024 * 1024
+
 async def read_line(proc: asyncio.subprocess.Process, timeout: float) -> bytes | None:
     """The CLI's next output line: b"" once it's done, None after `timeout` of silence.
 
