@@ -147,6 +147,13 @@ UPTIME_INTERVAL: float = float(os.environ.get("UPTIME_INTERVAL", "10"))
 GDOC_REMOTE: str = os.environ.get("GDOC_REMOTE", "gdrive")
 GDOC_FOLDER: str = os.environ.get("GDOC_FOLDER", "agent-reports")
 GDOC_REGISTRY: Path = Path(os.path.expanduser(os.environ.get("GDOC_REGISTRY", "") or str(DATA_DIR / "gdocs.json")))
+# Every gdoc registry the worklog dashboard looks in to link a .md file to its Google
+# Doc: this one, plus DASHBOARD_GDOC_REGISTRIES (paths, separated by os.pathsep).
+DASHBOARD_GDOC_REGISTRIES: list[Path] = [GDOC_REGISTRY] + [
+    Path(os.path.expanduser(x)) for x in os.environ.get("DASHBOARD_GDOC_REGISTRIES", "").split(os.pathsep) if x]
+# Folders the dashboard may open files from (read-only): the home folder and these.
+DASHBOARD_FILE_ROOTS: list[Path] = [Path.home()] + [
+    Path(os.path.expanduser(x)) for x in os.environ.get("DASHBOARD_FILE_ROOTS", "/mnt/hdd12t/shared").split(os.pathsep) if x]
 GDOC_SHARE_FILE: Path = Path(os.path.expanduser(
     os.environ.get("GDOC_SHARE_FILE", "") or "~/.config/discord-agent/gdoc_share"))
 GDOC_WEB_REGISTRY: Path | None = (Path(os.path.expanduser(os.environ["GDOC_WEB_REGISTRY"]))

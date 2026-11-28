@@ -5,6 +5,7 @@
 
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from harness.worklog import Lease, Message, Task, Worker, Worklog
@@ -186,7 +187,7 @@ class PageTests(unittest.TestCase):
         self.assertIn("latestStatus", self.html)
         self.assertIn("'Activity · '", self.html)
         self.assertIn("'Status report'", self.html)
-        self.assertIn("richText(task.result, 'description')", self.html)
+        self.assertIn("richText(task.result, 'description', task.num)", self.html)
         self.assertIn("'Log · ' + kind", self.html)
         self.assertIn(".sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))", self.html)
         self.assertIn("section(task, 'information', 'Information', false, fields)", self.html)
@@ -337,6 +338,65 @@ class AnsweredTests(unittest.TestCase):
         self.assertIn("'✔ You answered '", html)
         self.assertIn("'Waiting for ' + (item.owner || 'the agent') + ' to answer.'", html)
         self.assertIn("} else if (QUICK[item.answer]) {", html)
+
+
+class FileLinkTests(unittest.TestCase):
+    def setUp(self):
+        import json as _json
+        import tempfile
+        from harness import config
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        repo = self.root / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "plan.md").write_text("# Plan")
+        (repo / "docs" / "shot.png").write_bytes(b"png")
+        (repo / "notes.md").write_text("notes")
+        (repo / ".hidden").mkdir()
+        (repo / ".hidden" / "x.md").write_text("no")
+        (repo / "api_token.json").write_text("{}")
+        (repo / "code.py").write_text("print()")
+        registry = self.root / "gdocs.json"
+        registry.write_text(_json.dumps({str(repo / "docs" / "plan.md"): {
+            "url": "https://docs.google.com/document/d/abc/edit"}}))
+        for name, value in (("DASHBOARD_FILE_ROOTS", [self.root]), ("DASHBOARD_GDOC_REGISTRIES", [registry])):
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.state = Worklog()
+        self.state.workers["a@m1"] = Worker("a@m1", machine="m1", desc=f"claude in {repo}")
+        self.state.tasks[1] = Task(1, "T", owner="a@m1")
+        self.repo = repo
+
+    def test_resolve(self):
+        from harness.worklog_dashboard import resolve_file
+        self.assertEqual(resolve_file(self.state, "m1", "docs/plan.md", 1),
+                         (self.repo / "docs" / "plan.md", "https://docs.google.com/document/d/abc/edit"))
+        self.assertEqual(resolve_file(self.state, "m1", "`notes.md`", 1), (self.repo / "notes.md", None))
+        self.assertEqual(resolve_file(self.state, "m1", str(self.repo / "docs" / "shot.png")),
+                         (self.repo / "docs" / "shot.png", None))
+        for ref in (".hidden/x.md", "api_token.json", "code.py", "docs/../../etc/passwd", "missing.md",
+                    "/etc/hostname"):
+            self.assertEqual(resolve_file(self.state, "m1", ref, 1), (None, None), ref)
+        self.assertEqual(resolve_file(self.state, "other-machine", "notes.md", 1), (None, None))
+
+    def test_file_response(self):
+        from harness.worklog_dashboard import file_response
+        status, headers, body = file_response(self.state, "m1", {"path": "docs/plan.md", "task": "1"})
+        self.assertEqual((status, headers["Location"]), (302, "https://docs.google.com/document/d/abc/edit"))
+        status, headers, body = file_response(self.state, "m1", {"path": "docs/plan.md", "task": "1", "raw": "1"})
+        self.assertEqual((status, body), (200, self.repo / "docs" / "plan.md"))
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(headers["Content-Security-Policy"], "sandbox")
+        self.assertEqual(file_response(self.state, "m1", {"path": "code.py", "task": "x"})[0], 404)
+
+    def test_page_links_urls_and_files(self):
+        html = page()
+        self.assertIn("function linkify(parent, text, task)", html)
+        self.assertIn("link.rel = 'noopener noreferrer';", html)
+        self.assertIn("return 'file?' + query.toString();", html)
+        self.assertIn("richText(task.result, 'description', task.num)", html)
 
 
 class AreaTests(unittest.TestCase):

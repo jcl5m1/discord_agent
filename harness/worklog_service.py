@@ -27,6 +27,7 @@ import secrets
 import socket
 import sqlite3
 import time
+from pathlib import Path
 from collections import deque
 from typing import Awaitable, Callable
 
@@ -608,6 +609,16 @@ class WorklogService:
         return web.json_response({"ok": ok, "text": outcome}, status=200 if ok else 400,
                                  headers={"Cache-Control": "no-store"})
 
+    async def _dashboard_file(self, request: web.Request) -> web.StreamResponse:
+        """A file a work item links to (read-only), or a redirect to its Google Doc."""
+        if not self._dashboard_authorized(request):
+            return web.Response(status=403, text="bad worklog token")
+        status, headers, body = worklog_dashboard.file_response(self.state, self.machine, request.query)
+        if isinstance(body, Path):
+            response = web.FileResponse(body, headers=headers)
+            return response
+        return web.Response(status=status, headers=headers, text=body if status != 302 else None)
+
     async def _dashboard_events(self, request: web.Request) -> web.StreamResponse:
         """Server-sent events: one `data:` line after each worklog change, so open
         dashboards fetch the new state at once instead of on a timer."""
@@ -637,6 +648,7 @@ class WorklogService:
         app.router.add_get("/", self._dashboard_page)
         app.router.add_get("/state", self._dashboard_state)
         app.router.add_get("/events", self._dashboard_events)
+        app.router.add_get("/file", self._dashboard_file)
         app.router.add_post("/reply", self._dashboard_reply)
         app.router.add_post("/drop", self._dashboard_drop)
         app.router.add_post("/area", self._dashboard_area)

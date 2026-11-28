@@ -24,6 +24,8 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append((request.path, token, request.query_string))
             if token != "good-token":
                 return web.Response(status=403, text="bad token")
+            if request.path == "/file":
+                return web.Response(status=302, headers={"Location": "https://docs.google.com/document/d/x/edit"})
             if request.path == "/":
                 return web.Response(text="<html>worklog</html>", content_type="text/html")
             if request.path in ("/reply", "/drop", "/area"):
@@ -43,6 +45,7 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
         self.upstream.app.router.add_get("/", upstream)
         self.upstream.app.router.add_get("/state", upstream)
         self.upstream.app.router.add_get("/events", events)
+        self.upstream.app.router.add_get("/file", upstream)
         self.upstream.app.router.add_post("/reply", upstream)
         self.upstream.app.router.add_post("/drop", upstream)
         self.upstream.app.router.add_post("/area", upstream)
@@ -94,6 +97,12 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["Content-Type"], "text/event-stream")
         self.assertEqual(await response.text(), "retry: 3000\n\ndata: 7\n\n")
         self.assertEqual(self.requests, [("/events", "good-token", "")])
+
+    async def test_file_redirect_is_passed_on_not_followed(self):
+        response = await self.client.get("/agents/_worklog/good-token/file?path=a.md", allow_redirects=False)
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers["Location"], "https://docs.google.com/document/d/x/edit")
+        self.assertEqual(self.requests, [("/file", "good-token", "path=a.md")])
 
     async def test_area_forwards_json_body(self):
         response = await self.client.post("/agents/_worklog/good-token/area", json={"area": "x", "note": "hi"})

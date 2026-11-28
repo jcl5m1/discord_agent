@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from pathlib import Path
 
+from . import config
 from .worklog import Worklog
 
 HISTORY_LIMIT = 100
@@ -145,6 +148,90 @@ def todo(state: Worklog) -> list[dict]:
                 "items": sorted(items[key], key=lambda item: (item["prio"], item["num"])),
             })
     return groups
+
+
+# Files a work item may link to, by suffix: the dashboard opens these (read-only).
+# Text types are sent as plain text, so no file runs scripts in the dashboard.
+FILE_TYPES = {
+    ".md": "text/plain", ".txt": "text/plain", ".log": "text/plain", ".csv": "text/plain",
+    ".json": "text/plain", ".yaml": "text/plain", ".yml": "text/plain", ".html": "text/plain",
+    ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".mp4": "video/mp4",
+    ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+}
+# Names that may hold secrets: never opened.
+_SECRET_RE = re.compile(r"(^|[._-])(env|token|secret|credential|password|private|key|stored_tokens)s?($|[._-])", re.I)
+_WORKDIR_RE = re.compile(r"\bin (/\S+)")
+
+
+def _workdirs(state: Worklog, machine: str, first: list[str]) -> list[Path]:
+    """Folders to look for a relative path in: those of the given workers first, then
+    of every other agent on this machine (from the "<cli> in <folder>" description)."""
+    names = [n for n in first if n] + [n.split("/")[0] for n in first if n]
+    ordered = [state.workers[n] for n in dict.fromkeys(names) if n in state.workers]
+    ordered += [w for w in state.workers.values() if w.machine == machine]
+    dirs: list[Path] = []
+    for w in ordered:
+        m = _WORKDIR_RE.search(w.desc or "")
+        if m and w.machine in ("", machine) and Path(m.group(1)) not in dirs:
+            dirs.append(Path(m.group(1)))
+    return dirs
+
+
+def _gdoc_url(path: Path) -> str | None:
+    for registry in config.DASHBOARD_GDOC_REGISTRIES:
+        try:
+            entry = json.loads(registry.read_text()).get(str(path))
+        except (OSError, ValueError):
+            continue
+        if entry and str(entry.get("url", "")).startswith("https://docs.google.com/"):
+            return entry["url"]
+    return None
+
+
+def resolve_file(state: Worklog, machine: str, ref: str, task: int | None = None) -> tuple[Path | None, str | None]:
+    """A file a work item names, as (path on this machine, Google Doc link of a
+    published .md). (None, None) when it is not found or not allowed."""
+    ref = ref.strip().strip("`'\"")
+    if not ref or len(ref) > 500 or "\0" in ref:
+        return None, None
+    t = state.tasks.get(task) if task is not None else None
+    raw = Path(ref).expanduser()
+    tries = [raw] if raw.is_absolute() else [
+        d / raw for d in _workdirs(state, machine, [t.owner, t.created_by] if t else [])]
+    for candidate in tries:
+        try:
+            path = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not path.is_file() or path.suffix.lower() not in FILE_TYPES or _SECRET_RE.search(path.name):
+            continue
+        root = next((r for r in config.DASHBOARD_FILE_ROOTS if path.is_relative_to(r.resolve())), None)
+        if root is None or any(part.startswith(".") for part in path.relative_to(root.resolve()).parts):
+            continue
+        return path, (_gdoc_url(path) if path.suffix.lower() == ".md" else None)
+    return None, None
+
+
+def file_response(state: Worklog, machine: str, query) -> tuple[int, dict, object]:
+    """The answer to GET file?path=..&task=N[&raw=1], as (status, headers, body), where body
+    is a Path to send or a text. A published .md goes to its Google Doc unless raw=1."""
+    try:
+        task = int(query.get("task")) if query.get("task") else None
+    except ValueError:
+        task = None
+    path, doc = resolve_file(state, machine, str(query.get("path", "")), task)
+    if path is None:
+        return 404, {"Content-Type": "text/plain; charset=utf-8"}, (
+            f"Not found on {machine}, or not a file the dashboard may open: {query.get('path', '')}")
+    if doc and not query.get("raw"):
+        return 302, {"Location": doc}, ""
+    mime = FILE_TYPES[path.suffix.lower()]
+    return 200, {
+        "Content-Type": mime + ("; charset=utf-8" if mime == "text/plain" else ""),
+        "Content-Security-Policy": "sandbox", "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "no-store",
+    }, path
 
 
 def snapshot(state: Worklog, machine: str, now: float | None = None) -> dict:
@@ -323,6 +410,8 @@ h1 { margin: 0; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spa
 .todo-answered { margin-top: 6px; padding: 6px 9px; border-left: 2px solid var(--accent); border-radius: 0 7px 7px 0; background: rgba(47, 119, 98, .12); font-size: 12px; overflow-wrap: anywhere; }
 .todo-ack { margin-top: 3px; color: var(--accent-strong); }
 .todo-wait { margin-top: 3px; color: var(--muted); }
+.doc-link { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+.doc-link:hover { color: #b3d4ff; }
 .copy-block { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0; }
 .copy-block code { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rich-text { margin: 0 0 4px; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -654,22 +743,22 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
   // Text from agents, as DOM nodes (never HTML). Copy blocks for: ``` fences,
   // the command after "run:" / "run this one line:" / "command:", and lines that
   // start with "$ ". `inline code` shows as code; tap it to copy.
-  function richText(text, className) {
+  function richText(text, className, task) {
     const box = node('div', 'rich ' + (className || ''));
     const source = String(text || '');
     const fence = /```[\w-]*\n?([\s\S]*?)```/g;
     let last = 0;
     let match;
     while ((match = fence.exec(source)) !== null) {
-      plainText(box, source.slice(last, match.index));
+      plainText(box, source.slice(last, match.index), task);
       if (match[1].trim()) box.append(copyBlock(match[1].replace(/\n$/, '')));
       last = fence.lastIndex;
     }
-    plainText(box, source.slice(last));
+    plainText(box, source.slice(last), task);
     return box;
   }
 
-  function plainText(box, text) {
+  function plainText(box, text, task) {
     if (!text.trim()) return;
     const run = /\b(?:run(?: this)?(?: one)?(?: line)?|command):\s*(\S[\s\S]*)$/i.exec(text);
     let body = text;
@@ -681,7 +770,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     const lines = body.split('\n');
     let para = [];
     const flush = () => {
-      if (para.join('').trim()) box.append(inlineCode(para.join('\n').replace(/^\n+|\n+$/g, '')));
+      if (para.join('').trim()) box.append(inlineCode(para.join('\n').replace(/^\n+|\n+$/g, ''), task));
       para = [];
     };
     lines.forEach(line => {
@@ -692,19 +781,66 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     if (command) box.append(copyBlock(command));
   }
 
-  function inlineCode(text) {
+  function inlineCode(text, task) {
     const p = node('p', 'rich-text');
     text.split(/(`[^`\n]+`)/).forEach(part => {
       if (/^`[^`]+`$/.test(part)) {
-        const code = node('code', 'inline-code', part.slice(1, -1));
+        const inner = part.slice(1, -1);
+        const code = node('code', 'inline-code', inner);
         code.title = 'Tap to copy';
-        code.addEventListener('click', () => { void navigator.clipboard.writeText(part.slice(1, -1)).catch(() => {}); });
+        code.addEventListener('click', () => { void navigator.clipboard.writeText(inner).catch(() => {}); });
         p.append(code);
+        const whole = new RegExp('^(?:' + URL_PART + '|' + PATH_PART + ')$', 'i').exec(inner.trim());
+        if (whole) p.append(docLink('↗', inner.trim(), task));  // a URL or file in code: link it too
       } else if (part) {
-        p.append(document.createTextNode(part));
+        linkify(p, part, task);
       }
     });
     return p;
+  }
+
+  // Links in text from agents: [label](target), web addresses, and file names with a
+  // document, image or video suffix. A file opens through this dashboard (file?path=..),
+  // which finds it on this machine and sends a published .md to its Google Doc.
+  const URL_PART = 'https?:\\/\\/[^\\s<>"\'`]+';
+  const PATH_PART = '(?:~|\\.{0,2}\\/)?(?:[\\w.@+-]+\\/)*[\\w@+-][\\w.@+-]*\\.' +
+    '(?:md|txt|log|csv|json|ya?ml|html|pdf|png|jpe?g|gif|webp|svg|mp4|webm|mov|mkv)(?![\\w\\/])';
+
+  function fileHref(path, task) {
+    const query = new URLSearchParams(window.location.search);
+    query.set('path', path);
+    if (task !== undefined && task !== null) query.set('task', String(task));
+    return 'file?' + query.toString();
+  }
+
+  function docLink(label, target, task) {
+    const link = node('a', 'doc-link', label);
+    link.href = /^https?:\/\//i.test(target) ? target : fileHref(target, task);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.title = target;
+    link.addEventListener('click', event => event.stopPropagation());
+    return link;
+  }
+
+  function linkify(parent, text, task) {
+    const pattern = new RegExp('\\[([^\\]\\n]+)\\]\\(([^)\\s]+)\\)|(' + URL_PART + ')|(' + PATH_PART + ')', 'gi');
+    let last = 0;
+    for (const match of text.matchAll(pattern)) {
+      let [whole, label, target, url, path] = match;
+      let tail = '';
+      if (url) {  // a sentence's closing punctuation is not part of the address
+        const cut = /[.,;:!?)\]]+$/.exec(url);
+        if (cut) { tail = cut[0]; url = url.slice(0, -tail.length); }
+      }
+      if (match.index > last) parent.append(document.createTextNode(text.slice(last, match.index)));
+      if (label) parent.append(docLink(label, target, task));
+      else if (url) parent.append(docLink(url, url, task));
+      else parent.append(docLink(path, path, task));
+      if (tail) parent.append(document.createTextNode(tail));
+      last = match.index + whole.length;
+    }
+    if (last < text.length) parent.append(document.createTextNode(text.slice(last)));
   }
 
   // Note prefixes the worklog adds, as a label for each activity entry.
@@ -969,11 +1105,11 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
 
     const sections = [];
     sections.push(section(task, 'description', 'Description', true,
-      richText(task.desc || 'No description.', 'description')));
+      richText(task.desc || 'No description.', 'description', task.num)));
     if (task.result) {
       sections.push(section(task, 'result', 'Status report', true,
         node('p', 'section-hint', 'What the owner wrote when it last finished or blocked this task.'),
-        richText(task.result, 'description')));
+        richText(task.result, 'description', task.num)));
     }
     sections.push(section(task, 'reply', ['done', 'dropped'].includes(task.status) ? 'Reply' : 'Reply or drop',
       true, replyForm(task)));
@@ -994,7 +1130,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
           const meta = node('div', 'note-meta');
           meta.append(node('span', 'entry-kind log', 'Log · ' + kind),
             document.createTextNode(' ' + (entry.note.by || 'Unknown worker') + ' · ' + formatTime(entry.note.at)));
-          item.append(meta, richText(text, 'note-text'));
+          item.append(meta, richText(text, 'note-text', task.num));
           list.append(item);
         } else {
           const item = node('li', 'note thread-message');
@@ -1002,7 +1138,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
           meta.append(node('span', 'entry-kind message', 'Message'),
             document.createTextNode(' ' + (entry.message.sender || 'Unknown sender') + ' → ' +
               (entry.message.to || 'Unknown recipient') + ' · ' + formatTime(entry.message.at)));
-          item.append(meta, richText(entry.message.text));
+          item.append(meta, richText(entry.message.text, '', task.num));
           list.append(item);
         }
       });
@@ -1103,7 +1239,8 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         link.href = '#task-' + item.num;
         link.title = 'Open the task with its full status, notes and messages';
         link.addEventListener('click', event => { event.preventDefault(); showTask(item.num); });
-        line.append(link, document.createTextNode(' ' + item.action));
+        line.append(link);
+        linkify(line, ' ' + item.action, item.num);
         li.title = item.reason;
         li.append(line, node('div', 'todo-meta', (item.title || '') + ' · ' + (item.owner || 'no owner')));
         if (item.command) li.append(copyBlock(item.command));

@@ -26,6 +26,7 @@ The project-agnostic worklog dashboard uses its own token and fixed upstream:
     GET /agents/_worklog/<token>/
     GET /agents/_worklog/<token>/state
     GET /agents/_worklog/<token>/events   (server-sent events, streamed)
+    GET /agents/_worklog/<token>/file?path=..  (a linked file, or a redirect to its Doc)
     POST /agents/_worklog/<token>/reply
     POST /agents/_worklog/<token>/drop
     POST /agents/_worklog/<token>/area
@@ -190,9 +191,9 @@ async def _files_root_redirect(request: web.Request) -> web.Response:
 
 async def _worklog(request: web.Request) -> web.Response:
     path = request.match_info["path"]
-    if path not in ("", "state", "events", "reply", "drop", "area"):
+    if path not in ("", "state", "events", "file", "reply", "drop", "area"):
         return web.Response(status=404, text="not found")
-    read = request.method in ("GET", "HEAD") and path in ("", "state", "events")
+    read = request.method in ("GET", "HEAD") and path in ("", "state", "events", "file")
     post = request.method == "POST" and path in ("reply", "drop", "area")
     if not read and not post:
         return web.Response(status=405, text="method not allowed")
@@ -217,14 +218,19 @@ async def _worklog(request: web.Request) -> web.Response:
                     await stream.write(chunk)
                 return stream
         async with session.request(
-            request.method, url, headers=headers, data=body or None
+            request.method, url, headers=headers, data=body or None, allow_redirects=False
         ) as upstream:
             response_body = await upstream.read()
+            passed = {"Cache-Control": "no-store"}
+            for name in ("Location", "Content-Security-Policy", "X-Content-Type-Options"):
+                if name in upstream.headers:
+                    passed[name] = upstream.headers[name]
             return web.Response(
                 status=upstream.status,
                 body=response_body,
                 content_type=upstream.content_type,
-                headers={"Cache-Control": "no-store"},
+                charset=upstream.charset,
+                headers=passed,
             )
     except Exception:
         log.exception("worklog dashboard proxy failed")

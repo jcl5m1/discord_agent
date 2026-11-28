@@ -447,7 +447,13 @@ provides it, so sessions don't each build their own.
   change, gets the new state and changes only the parts that changed. It never moves
   the text box that has the focus, and it keeps the view in place. A reply or note
   draft is saved in the browser every 5 seconds when it changed ("Draft saved at
-  YYYY-MM-DD HH:MM:SS") and comes back after a reload. It uses the public proxy when configured, otherwise a loopback URL. Use
+  YYYY-MM-DD HH:MM:SS") and comes back after a reload. **Links:** web addresses,
+  `[label](target)` links and file names (.md, images, videos, PDF, logs) in work items
+  are links. A file opens through `file?path=..&task=N`: the dashboard finds it in the
+  owner's or creator's folder (or another agent's folder on this machine), sends a
+  published .md to its Google Doc (`DASHBOARD_GDOC_REGISTRIES`), and sends other files
+  read-only and sandboxed. Only files under the home folder or `DASHBOARD_FILE_ROOTS`
+  open; dot-folders, secret-like names and other suffixes do not. It uses the public proxy when configured, otherwise a loopback URL. Use
   `/worklog command:"status"` or another explicit command for text output.
 - **Transport:** a `#worklog` channel (created on first start). Every change is one
   message there: a readable line, plus the event as small JSON. Each bot keeps the
