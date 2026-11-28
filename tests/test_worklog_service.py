@@ -308,6 +308,16 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
                 line = await asyncio.wait_for(response.content.readline(), 5)
                 self.assertTrue(line.startswith(b"data: "), line)
 
+    async def test_message_to_a_subagent_reaches_its_parent(self):
+        await self.b.run(["add", "Sub work", "--area", "harness"], "bob@m2/sub-1")
+        self.delivered.clear()
+        ok, _ = await self.a.run(["send", "bob@m2/sub-1", "Is this still blocked?", "--task", "1"], "jo@example.com")
+        self.assertTrue(ok)
+        await asyncio.sleep(0.4)
+        self.assertEqual(self.delivered, [
+            (2, "bob@m2", "jo@example.com", "(re #1) (to bob@m2/sub-1) Is this still blocked?"),
+        ])
+
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")
         await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl

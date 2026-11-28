@@ -302,8 +302,41 @@ class AnswerTests(unittest.TestCase):
         html = page()
         self.assertIn("label: 'Send OK', text: 'OK, go ahead.'", html)
         self.assertIn("label: 'Done', text: 'Done: I ran the command.", html)
-        self.assertIn("if (quick && QUICK[quick.answer]) buttons.push(quickButton(", html)
+        self.assertIn("} else if (quick && QUICK[quick.answer]) {\n      buttons.push(quickButton(", html)
         self.assertIn("if (QUICK[item.answer]) {", html)
+
+
+class AnsweredTests(unittest.TestCase):
+    def test_user_answer_moves_item_and_agent_reply_is_its_ack(self):
+        from harness.worklog_dashboard import is_person
+        st = Worklog()
+        st.tasks[1] = Task(1, "Key", status="blocked", owner="a@m1/sub-1", result="On host, run: echo k",
+                           notes=[(100.0, "a@m1/sub-1", "[blocked] On host, run: echo k")])
+        st.tasks[2] = Task(2, "Push", status="blocked", owner="b@m2", result="Needs user OK: push",
+                           notes=[(100.0, "b@m2", "[blocked] Needs user OK: push")])
+        st.messages = [
+            Message(1, "jo@example.com", "a@m1/sub-1", 1, 50.0, "old answer, before the block"),
+            Message(2, "c@m3", "b@m2", 2, 150.0, "an agent's message is not the user's answer"),
+            Message(3, "jo@example.com", "a@m1/sub-1", 1, 200.0, "Done: I ran the command."),
+            Message(4, "a@m1", "jo@example.com", 1, 300.0, "Thanks, SSH works now."),
+        ]
+        groups = {g["key"]: g for g in todo(st)}
+        item = groups["answered"]["items"][0]
+        self.assertEqual(item["num"], 1)
+        self.assertEqual(item["answered"]["text"], "Done: I ran the command.")
+        self.assertEqual(item["ack"]["text"], "Thanks, SSH works now.")
+        self.assertNotIn("run", groups)
+        self.assertEqual([i["num"] for i in groups["approve"]["items"]], [2])
+        self.assertIsNone(groups["approve"]["items"][0]["answered"])
+        self.assertEqual([g["key"] for g in todo(st)][-1], "answered")
+        self.assertTrue(is_person("human:dashboard") and is_person("jo@example.com"))
+        self.assertFalse(is_person("harness-2@28palomas-rtx3090") or is_person("a@m1/sub-1"))
+
+    def test_page_shows_answers_instead_of_buttons(self):
+        html = page()
+        self.assertIn("'✔ You answered '", html)
+        self.assertIn("'Waiting for ' + (item.owner || 'the agent') + ' to answer.'", html)
+        self.assertIn("} else if (QUICK[item.answer]) {", html)
 
 
 class AreaTests(unittest.TestCase):

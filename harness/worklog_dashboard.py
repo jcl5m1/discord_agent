@@ -27,6 +27,8 @@ TODO_GROUPS: list[tuple[str, str, str]] = [
     ("later", "Parked: revisit later", r"revisit|waits for (a|real)|\bfuture\b|low priority"),
     ("other", "Check why it is blocked", r""),
 ]
+# Tasks the user has answered since they were blocked: shown last, without the one-tap buttons.
+ANSWERED_GROUP = ("answered", "You answered: waiting for the agent")
 _TODO_RES = [(key, title, re.compile(pattern, re.I)) for key, title, pattern in TODO_GROUPS]
 # The command a block reason gives to run: the text after the last "run:" or "run this one line:".
 _COMMAND_RE = re.compile(r"\brun(?: this(?: one)?(?: line)?)?:\s*(.+)$", re.I | re.S)
@@ -65,6 +67,37 @@ def _summary(text: str) -> str:
     return first
 
 
+def _blocked_at(task) -> float:
+    """When the task was last blocked: its last [blocked] note, else its last change."""
+    return next((at for at, _, text in reversed(task.notes) if text.startswith("[blocked]")), task.updated)
+
+
+# A person, not an agent: a dashboard name (human:...) or a login with a domain
+# (the Tailscale login, e.g. jo@example.com). Agent names end in a machine name, with no dot.
+_PERSON_RE = re.compile(r"^(human:.+|[^@/\s]+@[^@/\s]+\.[^@/\s]+)$")
+
+
+def is_person(sender: str) -> bool:
+    return bool(_PERSON_RE.match(sender or ""))
+
+
+def _exchange(state: Worklog, task) -> tuple[dict | None, dict | None]:
+    """The user's latest message on a task since it was blocked, and the owner's
+    latest message after it (its acknowledgement), as {"at", "by", "text"}.
+    Messages between agents do not count."""
+    agents = {task.owner, task.owner.split("/")[0]} - {""}
+    since = _blocked_at(task)
+    answered = ack = None
+    for m in state.messages:
+        if m.task != task.num or m.at < since:
+            continue
+        if is_person(m.sender):
+            answered, ack = {"at": m.at, "by": m.sender, "text": m.text}, None
+        elif answered and m.sender in agents:
+            ack = {"at": m.at, "by": m.sender, "text": m.text}
+    return answered, ack
+
+
 def todo(state: Worklog) -> list[dict]:
     """Blocked tasks that wait for the user, grouped by the kind of action.
 
@@ -73,6 +106,7 @@ def todo(state: Worklog) -> list[dict]:
     """
     finished = {"done", "dropped"}
     items: dict[str, list[dict]] = {key: [] for key, _, _ in TODO_GROUPS}
+    items[ANSWERED_GROUP[0]] = []
     for task in state.tasks.values():
         if task.status != "blocked":
             continue
@@ -88,7 +122,8 @@ def todo(state: Worklog) -> list[dict]:
             action = _summary(reason[: match.start()]) or "Run the command"
         else:
             action = _summary(reason) or "No block reason given"
-        items[key].append({
+        answered, ack = _exchange(state, task)
+        items[ANSWERED_GROUP[0] if answered else key].append({
             "num": task.num,
             "title": task.title,
             "area": task.area,
@@ -98,9 +133,11 @@ def todo(state: Worklog) -> list[dict]:
             "command": command,
             "reason": reason,
             "answer": _answer(key, reason),
+            "answered": answered,
+            "ack": ack,
         })
     groups = []
-    for key, title, _ in TODO_GROUPS:
+    for key, title in [(key, title) for key, title, _ in TODO_GROUPS] + [ANSWERED_GROUP]:
         if items[key]:
             groups.append({
                 "key": key,
@@ -283,6 +320,9 @@ h1 { margin: 0; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spa
 .live-status.on { color: var(--accent-strong); }
 .live-status.off { color: var(--amber); }
 .draft-saved { min-height: 14px; color: var(--muted); font-size: 11px; }
+.todo-answered { margin-top: 6px; padding: 6px 9px; border-left: 2px solid var(--accent); border-radius: 0 7px 7px 0; background: rgba(47, 119, 98, .12); font-size: 12px; overflow-wrap: anywhere; }
+.todo-ack { margin-top: 3px; color: var(--accent-strong); }
+.todo-wait { margin-top: 3px; color: var(--muted); }
 .copy-block { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0; }
 .copy-block code { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rich-text { margin: 0 0 4px; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -792,7 +832,12 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       (feedback ? feedback.text : (task.owner ? 'The assigned agent is notified immediately.' : 'Assign an agent before sending a reply.'));
     const buttons = [submit];
     const quick = todoItem(task.num);
-    if (quick && QUICK[quick.answer]) buttons.push(quickButton(task.num, task.owner, quick.answer));
+    if (quick && quick.answered && !feedback && !replyPending.has(task.num)) {
+      status.textContent = 'You answered ' + formatTime(quick.answered.at) + '. ' +
+        (quick.ack ? quick.ack.by + ' replied ' + formatTime(quick.ack.at) + '.' : 'Waiting for the agent.');
+    } else if (quick && QUICK[quick.answer]) {
+      buttons.push(quickButton(task.num, task.owner, quick.answer));
+    }
     buttons.push(status);
     if (!['done', 'dropped'].includes(task.status)) buttons.push(dropButton(task, status));
     f.actions.replaceChildren(...buttons);
@@ -1038,8 +1083,11 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     const container = document.getElementById('todo-groups');
     container.replaceChildren();
     const total = groups.reduce((sum, group) => sum + group.items.length, 0);
+    const answered = groups.filter(group => group.key === 'answered').reduce((sum, group) => sum + group.items.length, 0);
+    const waiting = total - answered;
     section.hidden = !total;
-    document.getElementById('todo-count').textContent = total + (total === 1 ? ' task waits' : ' tasks wait') + ' for you';
+    document.getElementById('todo-count').textContent = waiting + (waiting === 1 ? ' task waits' : ' tasks wait') +
+      ' for you' + (answered ? ' · ' + answered + ' answered' : '');
     groups.forEach(group => {
       const details = node('details', 'todo-group');
       details.open = openTodoGroups.has(group.key) ? openTodoGroups.get(group.key) : group.key !== 'later';
@@ -1059,7 +1107,16 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         li.title = item.reason;
         li.append(line, node('div', 'todo-meta', (item.title || '') + ' · ' + (item.owner || 'no owner')));
         if (item.command) li.append(copyBlock(item.command));
-        if (QUICK[item.answer]) {
+        if (item.answered) {
+          // The user acted: show that (and the agent's answer) instead of the buttons again.
+          const done = node('div', 'todo-answered');
+          done.append(node('div', '', '✔ You answered ' + formatTime(item.answered.at) + ': “' +
+            String(item.answered.text).slice(0, 160) + '”'));
+          done.append(item.ack
+            ? node('div', 'todo-ack', '↩ ' + item.ack.by + ' ' + formatTime(item.ack.at) + ': ' + String(item.ack.text).slice(0, 200))
+            : node('div', 'todo-wait', 'Waiting for ' + (item.owner || 'the agent') + ' to answer.'));
+          li.append(done);
+        } else if (QUICK[item.answer]) {
           const row = node('div', 'todo-answer');
           const feedback = replyFeedback.get(item.num);
           const note = node('span', 'reply-status' + (feedback ? ' ' + feedback.kind : ''), feedback ? feedback.text : '');

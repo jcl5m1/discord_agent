@@ -278,12 +278,18 @@ class WorklogService:
     async def _side_effects(self, ev: dict, new_messages: list) -> None:
         mine = self.my_workers()
         for m in new_messages:
-            if m.to in mine:
-                if self._may_wake(m.to):
-                    await self.deliver(m.to, m.sender, (f"(re #{m.task}) " if m.task else "") + m.text)
+            # A subagent runs inside its parent's session: a message to "<agent>/sub-N"
+            # goes to the parent (else nobody gets it once the subagent has ended).
+            to, parent = m.to, m.to.split("/")[0]
+            if to not in mine and parent in mine:
+                to = parent
+            if to in mine:
+                prefix = (f"(re #{m.task}) " if m.task else "") + (f"(to {m.to}) " if to != m.to else "")
+                if self._may_wake(to):
+                    await self.deliver(to, m.sender, prefix + m.text)
                 else:
                     log.info("worklog: %s has had %d deliveries this hour; message left in inbox",
-                             m.to, WAKE_LIMIT)
+                             to, WAKE_LIMIT)
 
     def _may_wake(self, worker: str) -> bool:
         now = time.time()
