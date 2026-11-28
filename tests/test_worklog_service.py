@@ -296,6 +296,18 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(info["links"], {"Worklog": "https://h.ts.net/"})
             self.assertEqual(info["notes"][0][1:], ("jo@example.com", "Use /update all"))
 
+    async def test_dashboard_events_stream_a_notice_after_each_change(self):
+        async with ClientSession() as client:
+            async with client.get(f"{self.b.url}/events") as response:
+                self.assertEqual(response.status, 403)
+            async with client.get(f"{self.b.url}/events", headers={"X-Worklog-Token": self.b.token}) as response:
+                self.assertEqual(response.headers["Content-Type"], "text/event-stream")
+                self.assertEqual(await response.content.readline(), b"retry: 3000\n")
+                await response.content.readline()
+                await self.a.run(["add", "Live task", "--area", "harness"], "alice@m1")
+                line = await asyncio.wait_for(response.content.readline(), 5)
+                self.assertTrue(line.startswith(b"data: "), line)
+
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")
         await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl

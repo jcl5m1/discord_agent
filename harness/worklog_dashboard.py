@@ -280,6 +280,9 @@ h1 { margin: 0; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spa
 .area-link-form input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: #0e1623; }
 .todo-answer { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
 .quick-answer { padding: 5px 12px; }
+.live-status.on { color: var(--accent-strong); }
+.live-status.off { color: var(--amber); }
+.draft-saved { min-height: 14px; color: var(--muted); font-size: 11px; }
 .copy-block { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0; }
 .copy-block code { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rich-text { margin: 0 0 4px; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -413,7 +416,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     <input id="search" type="search" placeholder="Title, description, file, owner, note…" autocomplete="off">
   </label>
   <button id="refresh" class="refresh" type="button">Refresh</button>
-  <label class="auto"><input id="auto-refresh" type="checkbox" checked> Auto-refresh every 10s</label>
+  <span id="live-status" class="auto live-status off" title="The page updates in place when the worklog changes">Connecting…</span>
 </section>
 <p id="error" class="notice" role="alert" hidden></p>
 <p id="loading" class="loading">Loading worklog…</p>
@@ -449,17 +452,15 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
   const DEFAULT_STATUSES = ['open', 'blocked'];
   const shownStatuses = new Set(DEFAULT_STATUSES);
   const refreshButton = document.getElementById('refresh');
-  const autoRefresh = document.getElementById('auto-refresh');
+  const liveStatus = document.getElementById('live-status');
   const errorBox = document.getElementById('error');
   const loading = document.getElementById('loading');
-  const replyDrafts = new Map();
   const replyPending = new Set();
   const replyFeedback = new Map();
   const dropPending = new Set();
   const openTasks = new Set();
   const openAreas = new Map();
   let currentState = null;
-  let timer = null;
   let inFlight = false;
   let hashHandled = false;
 
@@ -472,6 +473,126 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
 
   function empty(text) {
     return node('p', 'empty', text);
+  }
+
+  // Make parent's children equal list. The child that holds the focus never moves
+  // (moving an element takes the focus and the cursor away); the others are put
+  // around it. Nothing moves when the order is already right.
+  function reconcile(parent, list) {
+    const current = Array.from(parent.childNodes);
+    if (current.length === list.length && current.every((child, i) => child === list[i])) return;
+    const keep = new Set(list);
+    current.forEach(child => { if (!keep.has(child)) parent.removeChild(child); });
+    const active = document.activeElement;
+    const pinned = active && active !== document.body &&
+      list.find(item => item.parentNode === parent && item.contains(active));
+    if (!pinned) {
+      list.forEach((item, i) => { if (parent.childNodes[i] !== item) parent.insertBefore(item, parent.childNodes[i] || null); });
+      return;
+    }
+    const at = list.indexOf(pinned);
+    for (let i = at - 1, next = pinned; i >= 0; next = list[i], i--) {
+      if (list[i].nextSibling !== next || list[i].parentNode !== parent) parent.insertBefore(list[i], next);
+    }
+    for (let i = at + 1, prev = pinned; i < list.length; prev = list[i], i++) {
+      if (prev.nextSibling !== list[i]) parent.insertBefore(list[i], prev.nextSibling);
+    }
+  }
+
+  // Run fn (which changes the page) without moving the view or the focus: the
+  // element at the top of the view (or the focused one) stays where it is.
+  function keepView(fn) {
+    const active = document.activeElement;
+    const focused = active && active !== document.body && active !== search ? active : null;
+    const anchor = focused || Array.from(document.querySelectorAll('.todo-item, .stat, .area > summary, .task, .side-section'))
+      .find(el => el.getBoundingClientRect().bottom > 0);
+    const top = anchor ? anchor.getBoundingClientRect().top : 0;
+    const selection = focused && 'selectionStart' in focused ? [focused.selectionStart, focused.selectionEnd] : null;
+    fn();
+    if (anchor && anchor.isConnected) {
+      const moved = anchor.getBoundingClientRect().top - top;
+      if (Math.abs(moved) >= 1) window.scrollBy(0, moved);
+    }
+    if (focused && focused.isConnected && document.activeElement !== focused) {
+      focused.focus({preventScroll: true});
+      if (selection) { try { focused.setSelectionRange(selection[0], selection[1]); } catch (err) {} }
+    }
+  }
+
+  // Drafts: the text in a reply or note box. Every 5 s a draft that changed is
+  // saved in this browser (localStorage), so a reload or a crash does not lose
+  // a long message. A draft with no change is not saved again.
+  const DRAFT_PREFIX = 'worklog-draft:';
+  const DRAFT_EVERY = 5000;
+  const drafts = new Map();       // 'task:N' or 'area:NAME' -> the text in the box
+  const savedDrafts = new Map();  // the same keys -> {text, at} as last saved
+
+  function loadDrafts() {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const name = localStorage.key(i);
+        if (!name || !name.startsWith(DRAFT_PREFIX)) continue;
+        const value = JSON.parse(localStorage.getItem(name) || 'null');
+        if (value && typeof value.text === 'string' && value.text) {
+          const key = name.slice(DRAFT_PREFIX.length);
+          drafts.set(key, value.text);
+          savedDrafts.set(key, {text: value.text, at: Number(value.at) || 0});
+        }
+      }
+    } catch (err) { /* no localStorage: drafts stay in memory only */ }
+  }
+
+  function two(n) { return String(n).padStart(2, '0'); }
+
+  function stamp(ms) {
+    const d = new Date(ms);
+    return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' +
+      two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+
+  function draftLabel(key) {
+    const saved = savedDrafts.get(key);
+    return saved && saved.text ? 'Draft saved at ' + stamp(saved.at) : '';
+  }
+
+  function showDraftLabel(key) {
+    document.querySelectorAll('.draft-saved').forEach(label => {
+      if (label.dataset.draft === key) label.textContent = draftLabel(key);
+    });
+  }
+
+  function saveDrafts() {
+    drafts.forEach((text, key) => {
+      const saved = savedDrafts.get(key);
+      if (saved ? saved.text === text : !text) return;  // no change since the last save
+      try {
+        if (text) {
+          const at = Date.now();
+          localStorage.setItem(DRAFT_PREFIX + key, JSON.stringify({text: text, at: at}));
+          savedDrafts.set(key, {text: text, at: at});
+        } else {
+          localStorage.removeItem(DRAFT_PREFIX + key);
+          savedDrafts.delete(key);
+        }
+      } catch (err) { return; }
+      showDraftLabel(key);
+    });
+  }
+
+  function clearDraft(key) {
+    drafts.delete(key);
+    savedDrafts.delete(key);
+    try { localStorage.removeItem(DRAFT_PREFIX + key); } catch (err) { /* nothing saved */ }
+    showDraftLabel(key);
+  }
+
+  // Connect a text box to its draft; returns the "Draft saved at" label.
+  function draftBox(key, textarea) {
+    textarea.value = drafts.get(key) || '';
+    textarea.addEventListener('input', () => drafts.set(key, textarea.value));
+    const label = node('span', 'draft-saved', draftLabel(key));
+    label.dataset.draft = key;
+    return label;
   }
 
   async function copyText(text, button) {
@@ -634,41 +755,50 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     return button;
   }
 
+  const replyForms = new Map();  // task num -> the reply form, made once and then updated in place
+
   function replyForm(task) {
-    const form = node('form', 'reply-form');
-    const textarea = node('textarea');
-    textarea.name = 'reply';
-    textarea.required = true;
-    textarea.maxLength = 2000;
-    textarea.placeholder = task.owner ? 'Write a reply for ' + task.owner + '…' : 'No agent is assigned to this task.';
-    textarea.value = replyDrafts.get(task.num) || '';
-    textarea.disabled = !task.owner || replyPending.has(task.num);
-    textarea.setAttribute('aria-label', 'Reply about task #' + task.num);
-    textarea.addEventListener('input', () => {
-      if (textarea.value) replyDrafts.set(task.num, textarea.value);
-      else replyDrafts.delete(task.num);
-      replyFeedback.delete(task.num);
-    });
+    let f = replyForms.get(task.num);
+    if (!f) {
+      const form = node('form', 'reply-form');
+      const textarea = node('textarea');
+      textarea.name = 'reply';
+      textarea.required = true;
+      textarea.maxLength = 2000;
+      textarea.setAttribute('aria-label', 'Reply about task #' + task.num);
+      const label = draftBox('task:' + task.num, textarea);
+      textarea.addEventListener('input', () => replyFeedback.delete(task.num));
+      const actions = node('div', 'reply-actions');
+      form.append(textarea, label, actions);
+      f = {form: form, textarea: textarea, actions: actions, submit: null, status: null};
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        void sendReply(task.num, f);
+      });
+      replyForms.set(task.num, f);
+    }
+    // Only attributes and the buttons change: the text box keeps its text, focus and cursor.
+    const placeholder = task.owner ? 'Write a reply for ' + task.owner + '…' : 'No agent is assigned to this task.';
+    if (f.textarea.placeholder !== placeholder) f.textarea.placeholder = placeholder;
+    const disabled = !task.owner || replyPending.has(task.num);
+    if (f.textarea.disabled !== disabled) f.textarea.disabled = disabled;
     const submit = node('button', 'reply-submit', replyPending.has(task.num) ? 'Sending…' : 'Send reply');
     submit.type = 'submit';
-    submit.disabled = textarea.disabled;
+    submit.disabled = disabled;
     const feedback = replyFeedback.get(task.num);
     const status = node('p', 'reply-status' + (feedback ? ' ' + feedback.kind : ''));
     status.setAttribute('aria-live', 'polite');
     status.textContent = replyPending.has(task.num) ? 'Sending to the assigned agent…' :
       (feedback ? feedback.text : (task.owner ? 'The assigned agent is notified immediately.' : 'Assign an agent before sending a reply.'));
-    const actions = node('div', 'reply-actions');
-    actions.append(submit);
+    const buttons = [submit];
     const quick = todoItem(task.num);
-    if (quick && QUICK[quick.answer]) actions.append(quickButton(task.num, task.owner, quick.answer));
-    actions.append(status);
-    if (!['done', 'dropped'].includes(task.status)) actions.append(dropButton(task, status));
-    form.append(textarea, actions);
-    form.addEventListener('submit', event => {
-      event.preventDefault();
-      void sendReply(task.num, textarea, submit, status);
-    });
-    return form;
+    if (quick && QUICK[quick.answer]) buttons.push(quickButton(task.num, task.owner, quick.answer));
+    buttons.push(status);
+    if (!['done', 'dropped'].includes(task.status)) buttons.push(dropButton(task, status));
+    f.actions.replaceChildren(...buttons);
+    f.submit = submit;
+    f.status = status;
+    return f.form;
   }
 
   function dropButton(task, status) {
@@ -712,20 +842,19 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     }
   }
 
-  async function sendReply(num, textarea, submit, status) {
-    const text = textarea.value.trim();
+  async function sendReply(num, f) {
+    const text = f.textarea.value.trim();
     if (!text) {
-      status.textContent = 'Write a reply before sending.';
-      status.className = 'reply-status error';
+      f.status.textContent = 'Write a reply before sending.';
+      f.status.className = 'reply-status error';
       return;
     }
     replyPending.add(num);
     replyFeedback.delete(num);
-    textarea.disabled = true;
-    submit.disabled = true;
-    submit.textContent = 'Sending…';
-    status.textContent = 'Sending to the assigned agent…';
-    status.className = 'reply-status';
+    f.submit.disabled = true;
+    f.submit.textContent = 'Sending…';
+    f.status.textContent = 'Sending to the assigned agent…';
+    f.status.className = 'reply-status';
     try {
       const response = await fetch('reply' + window.location.search, {
         method: 'POST',
@@ -734,47 +863,55 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       });
       const data = await response.json();
       if (!response.ok || !data.ok) throw new Error(data.text || ('Reply request returned HTTP ' + response.status));
-      replyDrafts.delete(num);
-      textarea.value = '';
+      f.textarea.value = '';
+      clearDraft('task:' + num);
       replyFeedback.set(num, {kind: 'success', text: 'Reply sent to the assigned agent.'});
-      replyPending.delete(num);
-      await refresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      replyFeedback.set(num, {kind: 'error', text: 'Reply failed: ' + message});
-      status.textContent = 'Reply failed: ' + message;
-      status.className = 'reply-status error';
+      replyFeedback.set(num, {kind: 'error', text: 'Reply failed: ' + message + ' (your text is kept)'});
     } finally {
       replyPending.delete(num);
-      const task = currentState && (currentState.tasks || []).find(item => item.num === num);
-      textarea.disabled = !task || !task.owner;
-      submit.disabled = textarea.disabled;
-      submit.textContent = 'Send reply';
+      await refresh();
     }
   }
 
-  const openSections = new Map();  // 'num:key' -> open, kept across auto-refresh
+  const openSections = new Map();  // 'num:key' -> open
+  const sectionEls = new Map();   // 'num:key' -> the section element, made once
 
   function section(task, key, title, openByDefault, ...content) {
     const id = task.num + ':' + key;
-    const details = node('details', 'section');
-    details.dataset.section = key;
-    details.open = openSections.has(id) ? openSections.get(id) : openByDefault;
-    details.addEventListener('toggle', () => openSections.set(id, details.open));
+    let details = sectionEls.get(id);
+    if (!details) {
+      details = node('details', 'section');
+      details.dataset.section = key;
+      details.open = openSections.has(id) ? openSections.get(id) : openByDefault;
+      details.addEventListener('toggle', () => openSections.set(id, details.open));
+      sectionEls.set(id, details);
+    }
     const summary = node('summary', 'section-title');
     summary.append(node('span', 'disclosure', '▶'), node('span', '', title));
-    details.append(summary, ...content);
+    reconcile(details, [summary, ...content]);
     return details;
   }
 
+  const taskEls = new Map();  // task num -> {el, body, sig}: made once, changed only when the task changes
+
   function taskNode(task) {
-    const details = node('details', 'task');
-    details.id = 'task-' + task.num;
-    details.open = openTasks.has(task.num);
-    details.addEventListener('toggle', () => {
-      if (details.open) openTasks.add(task.num);
-      else openTasks.delete(task.num);
-    });
+    const sig = JSON.stringify([task, todoItem(task.num), replyFeedback.get(task.num) || null,
+      replyPending.has(task.num), dropPending.has(task.num)]);
+    let t = taskEls.get(task.num);
+    if (t && t.sig === sig) return t.el;
+    if (!t) {
+      const details = node('details', 'task');
+      details.id = 'task-' + task.num;
+      details.open = openTasks.has(task.num);
+      details.addEventListener('toggle', () => {
+        if (details.open) openTasks.add(task.num);
+        else openTasks.delete(task.num);
+      });
+      t = {el: details, body: node('div', 'task-body'), sig: ''};
+      taskEls.set(task.num, t);
+    }
     const summary = node('summary');
     const heading = node('div', 'task-heading');
     const knownStatus = ['open', 'claimed', 'blocked', 'done', 'dropped'].includes(task.status) ? task.status : 'other';
@@ -784,17 +921,16 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     );
     summary.append(heading, node('span', 'priority', 'Priority ' + task.prio));
     summary.append(node('p', 'latest', latestStatus(task)));
-    details.append(summary);
 
-    const body = node('div', 'task-body');
-    body.append(section(task, 'description', 'Description', true,
+    const sections = [];
+    sections.push(section(task, 'description', 'Description', true,
       richText(task.desc || 'No description.', 'description')));
     if (task.result) {
-      body.append(section(task, 'result', 'Status report', true,
+      sections.push(section(task, 'result', 'Status report', true,
         node('p', 'section-hint', 'What the owner wrote when it last finished or blocked this task.'),
         richText(task.result, 'description')));
     }
-    body.append(section(task, 'reply', ['done', 'dropped'].includes(task.status) ? 'Reply' : 'Reply or drop',
+    sections.push(section(task, 'reply', ['done', 'dropped'].includes(task.status) ? 'Reply' : 'Reply or drop',
       true, replyForm(task)));
 
     // Notes and task messages in one timeline, the most recent on top.
@@ -827,7 +963,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       });
       entries.push(list);
     }
-    body.append(section(task, 'timeline', 'Activity · ' + timeline.length, true,
+    sections.push(section(task, 'timeline', 'Activity · ' + timeline.length, true,
       node('p', 'section-hint', 'Newest first. Log: what agents recorded on the task (check-ins, notes, ' +
         'status changes). Message: sent between you and the agents; use Reply to add one.'),
       ...entries));
@@ -843,9 +979,11 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       field('Updated', formatTime(task.updated)),
       field('Last check-in', formatTime(task.checkin_at))
     );
-    body.append(section(task, 'information', 'Information', false, fields));
-    details.append(body);
-    return details;
+    sections.push(section(task, 'information', 'Information', false, fields));
+    reconcile(t.body, sections);
+    reconcile(t.el, [summary, t.body]);
+    t.sig = sig;
+    return t.el;
   }
 
   function searchText(task) {
@@ -857,7 +995,18 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     ].flat(3).join(' ').toLowerCase();
   }
 
+  const panelSigs = new Map();  // panel -> the data it shows now
+
+  // True when the panel's data changed since it was drawn (then it is drawn again).
+  function changed(panel, data) {
+    const sig = JSON.stringify(data);
+    if (panelSigs.get(panel) === sig) return false;
+    panelSigs.set(panel, sig);
+    return true;
+  }
+
   function renderStats(tasks) {
+    if (!changed('stats', [tasks.map(task => task.status), [...shownStatuses].sort()])) return;
     const stats = document.getElementById('stats');
     const labels = [['total', 'Total'], ['open', 'Open'], ['claimed', 'Claimed'], ['blocked', 'Blocked'], ['done', 'Done'], ['dropped', 'Dropped']];
     stats.replaceChildren();
@@ -882,6 +1031,9 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
   const openTodoGroups = new Map();
 
   function renderTodo(groups) {
+    const nums = groups.flatMap(group => (group.items || []).map(item => item.num));
+    if (!changed('todo', [groups, nums.map(num => replyFeedback.get(num) || null),
+      nums.map(num => replyPending.has(num))])) return;
     const section = document.getElementById('todo');
     const container = document.getElementById('todo-groups');
     container.replaceChildren();
@@ -932,6 +1084,11 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     openAreas.set(task.area || '', true);
     renderStats(currentState.tasks);
     renderTasks();
+    // The elements are made once: open the existing ones, too.
+    const group = areaGroups.get(task.area || '');
+    if (group) group.el.open = true;
+    const made = taskEls.get(num);
+    if (made) made.el.open = true;
     if (window.location.hash !== '#task-' + num) history.replaceState(null, '', window.location.pathname + window.location.search + '#task-' + num);
     const el = document.getElementById('task-' + num);
     if (!el) return;
@@ -988,74 +1145,84 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     return link;
   }
 
-  const areaDrafts = new Map();  // area -> note being written
   const areaFeedback = new Map();
+  const areaEls = new Map();  // area -> {el, linkForm, url, label, noteForm, textarea, actions, sig}
 
   function areaDetails(area, info) {
-    const box = node('details', 'section area-details');
-    const id = 'area:' + area;
-    box.open = openSections.has(id) ? openSections.get(id) : false;
-    box.addEventListener('toggle', () => openSections.set(id, box.open));
+    let a = areaEls.get(area);
+    if (!a) {
+      const el = node('details', 'section area-details');
+      const id = 'area:' + area;
+      el.open = openSections.has(id) ? openSections.get(id) : false;
+      el.addEventListener('toggle', () => openSections.set(id, el.open));
+      const linkForm = node('form', 'area-link-form');
+      const label = node('input');
+      label.placeholder = 'Label (e.g. Dashboard)';
+      label.maxLength = 60;
+      const url = node('input');
+      url.type = 'url';
+      url.placeholder = 'https://…';
+      url.required = true;
+      const addLink = node('button', 'reply-submit', 'Add link');
+      addLink.type = 'submit';
+      linkForm.append(label, url, addLink);
+      linkForm.addEventListener('submit', event => {
+        event.preventDefault();
+        void areaPost(area, {link: url.value.trim(), label: label.value.trim()}, () => {
+          url.value = '';
+          label.value = '';
+        });
+      });
+      const noteForm = node('form', 'reply-form');
+      const textarea = node('textarea');
+      textarea.maxLength = 4000;
+      textarea.placeholder = 'Add a note for the ' + area + ' area…';
+      const saved = draftBox('area:' + area, textarea);
+      const actions = node('div', 'reply-actions');
+      noteForm.append(textarea, saved, actions);
+      noteForm.addEventListener('submit', event => {
+        event.preventDefault();
+        if (!textarea.value.trim()) return;
+        void areaPost(area, {note: textarea.value.trim()}, () => {
+          textarea.value = '';
+          clearDraft('area:' + area);
+        });
+      });
+      a = {el: el, linkForm: linkForm, noteForm: noteForm, actions: actions, sig: ''};
+      areaEls.set(area, a);
+    }
+    const sig = JSON.stringify([info, areaFeedback.get(area) || null]);
+    if (a.sig === sig) return a.el;
+    a.sig = sig;
     const summary = node('summary', 'section-title');
     summary.append(node('span', 'disclosure', '▶'),
       node('span', '', 'Area details · ' + Object.keys(info.links).length + ' links · ' + info.notes.length + ' notes'));
-    box.append(summary, node('p', 'section-hint',
+    const parts = [summary, node('p', 'section-hint',
       'Web pages and notes for the whole area, shared with every agent. Agents add links with: wl area ' +
-      area + ' --link URL --label NAME'));
-
-    const links = node('ul', 'area-links');
-    Object.entries(info.links).forEach(([label, url]) => {
-      const li = node('li');
-      const href = safeUrl(url);
-      const link = node('a', '', label);
-      if (href) { link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
-      const remove = node('button', 'link-remove', 'Remove');
-      remove.type = 'button';
-      remove.addEventListener('click', () => {
-        if (window.confirm('Remove the link "' + label + '" from ' + area + '?')) void areaPost(area, {unlink: label});
+      area + ' --link URL --label NAME')];
+    if (Object.keys(info.links).length) {
+      const links = node('ul', 'area-links');
+      Object.entries(info.links).forEach(([label, url]) => {
+        const li = node('li');
+        const href = safeUrl(url);
+        const link = node('a', '', label);
+        if (href) { link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
+        const remove = node('button', 'link-remove', 'Remove');
+        remove.type = 'button';
+        remove.addEventListener('click', () => {
+          if (window.confirm('Remove the link "' + label + '" from ' + area + '?')) void areaPost(area, {unlink: label});
+        });
+        li.append(link, node('span', 'note-meta', ' ' + url + ' '), remove);
+        links.append(li);
       });
-      li.append(link, node('span', 'note-meta', ' ' + url + ' '), remove);
-      links.append(li);
-    });
-    if (Object.keys(info.links).length) box.append(links);
-
-    const linkForm = node('form', 'area-link-form');
-    const label = node('input');
-    label.placeholder = 'Label (e.g. Dashboard)';
-    label.maxLength = 60;
-    const url = node('input');
-    url.type = 'url';
-    url.placeholder = 'https://…';
-    url.required = true;
-    const addLink = node('button', 'reply-submit', 'Add link');
-    addLink.type = 'submit';
-    linkForm.append(label, url, addLink);
-    linkForm.addEventListener('submit', event => {
-      event.preventDefault();
-      void areaPost(area, {link: url.value.trim(), label: label.value.trim()});
-    });
-    box.append(linkForm);
-
-    const noteForm = node('form', 'reply-form');
-    const textarea = node('textarea');
-    textarea.maxLength = 4000;
-    textarea.placeholder = 'Add a note for the ' + area + ' area…';
-    textarea.value = areaDrafts.get(area) || '';
-    textarea.addEventListener('input', () => areaDrafts.set(area, textarea.value));
+      parts.push(links);
+    }
+    parts.push(a.linkForm, a.noteForm);
     const addNote = node('button', 'reply-submit', 'Add note');
     addNote.type = 'submit';
     const feedback = areaFeedback.get(area);
-    const status = node('p', 'reply-status' + (feedback ? ' ' + feedback.kind : ''), feedback ? feedback.text : '');
-    const actions = node('div', 'reply-actions');
-    actions.append(addNote, status);
-    noteForm.append(textarea, actions);
-    noteForm.addEventListener('submit', event => {
-      event.preventDefault();
-      if (!textarea.value.trim()) return;
-      void areaPost(area, {note: textarea.value.trim()}, () => areaDrafts.delete(area));
-    });
-    box.append(noteForm);
-
+    a.actions.replaceChildren(addNote,
+      node('p', 'reply-status' + (feedback ? ' ' + feedback.kind : ''), feedback ? feedback.text : ''));
     if (info.notes.length) {
       const list = node('ol', 'notes');
       info.notes.slice().reverse().forEach(note => {
@@ -1066,9 +1233,10 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         item.append(meta, richText(note.text, 'note-text'));
         list.append(item);
       });
-      box.append(list);
+      parts.push(list);
     }
-    return box;
+    reconcile(a.el, parts);
+    return a.el;
   }
 
   async function areaPost(area, fields, onSuccess) {
@@ -1083,24 +1251,29 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       if (onSuccess) onSuccess();
       areaFeedback.set(area, {kind: 'success', text: 'Saved.'});
     } catch (error) {
-      areaFeedback.set(area, {kind: 'error', text: 'Failed: ' + (error instanceof Error ? error.message : String(error))});
+      areaFeedback.set(area, {kind: 'error', text: 'Failed: ' + (error instanceof Error ? error.message : String(error)) +
+        ' (your text is kept)'});
     }
-    openSections.set('area:' + area, true);
     await refresh();
   }
+
+  const areaGroups = new Map();  // area -> {el, list, sig}: the area's box in the task list
 
   function renderTasks() {
     if (!currentState) return;
     const tasks = Array.isArray(currentState.tasks) ? currentState.tasks : [];
     const query = search.value.trim().toLowerCase();
-    const visible = tasks.filter(task => statusShown(task) && (!query || searchText(task).includes(query)));
+    // A task whose box holds the focus stays shown, so a status change does not take the box away.
+    const active = document.activeElement;
+    const holding = num => { const t = taskEls.get(num); return !!(t && active && t.el.contains(active)); };
+    const visible = tasks.filter(task => holding(task.num) ||
+      (statusShown(task) && (!query || searchText(task).includes(query))));
     const areas = document.getElementById('areas');
     const noMatches = document.getElementById('no-matches');
-    areas.replaceChildren();
     document.getElementById('visible-count').textContent = visible.length + ' of ' + tasks.length + ' shown';
     noMatches.hidden = !(tasks.length && !visible.length);
     if (!tasks.length) {
-      areas.append(empty('No tasks in this worklog.'));
+      areas.replaceChildren(empty('No tasks in this worklog.'));
       return;
     }
     const groups = new Map();
@@ -1109,26 +1282,37 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       if (!groups.has(area)) groups.set(area, []);
       groups.get(area).push(task);
     });
-    [...groups.keys()].sort((a, b) => a.localeCompare(b)).forEach(area => {
+    const names = [...groups.keys()].sort((a, b) => a.localeCompare(b));
+    const boxes = names.map(area => {
       const groupTasks = groups.get(area).sort((a, b) => Number(a.num) - Number(b.num));
-      const details = node('details', 'area');
-      details.open = openAreas.has(area) ? openAreas.get(area) :
-        area === [...groups.keys()].sort((a, b) => a.localeCompare(b))[0];
-      details.addEventListener('toggle', () => openAreas.set(area, details.open));
-      const summary = node('summary');
+      let g = areaGroups.get(area);
+      if (!g) {
+        const details = node('details', 'area');
+        details.open = openAreas.has(area) ? openAreas.get(area) : area === names[0];
+        details.addEventListener('toggle', () => openAreas.set(area, details.open));
+        g = {el: details, list: node('div', 'area-tasks'), sig: ''};
+        areaGroups.set(area, g);
+      }
       const info = areaInfo(area);
-      summary.append(node('span', 'disclosure', '▶'), node('span', 'area-name', area || 'Unassigned'));
-      Object.entries(info.links).forEach(([label, url]) => summary.append(linkChip(label, url)));
-      summary.append(node('span', 'area-total', groupTasks.length + (groupTasks.length === 1 ? ' task' : ' tasks')));
-      const list = node('div', 'area-tasks');
-      if (area) list.append(areaDetails(area, info));
-      groupTasks.forEach(task => list.append(taskNode(task)));
-      details.append(summary, list);
-      areas.append(details);
+      const sig = JSON.stringify([info.links, groupTasks.length]);
+      let summary = g.el.firstChild && g.el.firstChild.tagName === 'SUMMARY' ? g.el.firstChild : null;
+      if (!summary || g.sig !== sig) {
+        summary = node('summary');
+        summary.append(node('span', 'disclosure', '▶'), node('span', 'area-name', area || 'Unassigned'));
+        Object.entries(info.links).forEach(([label, url]) => summary.append(linkChip(label, url)));
+        summary.append(node('span', 'area-total', groupTasks.length + (groupTasks.length === 1 ? ' task' : ' tasks')));
+        g.sig = sig;
+      }
+      const children = (area ? [areaDetails(area, info)] : []).concat(groupTasks.map(taskNode));
+      reconcile(g.list, children);
+      reconcile(g.el, [summary, g.list]);
+      return g.el;
     });
+    reconcile(areas, boxes);
   }
 
   function renderWorkers(workers) {
+    if (!changed('workers', workers)) return;
     const container = document.getElementById('workers');
     container.replaceChildren();
     document.getElementById('worker-count').textContent = String(workers.length);
@@ -1151,6 +1335,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
   }
 
   function renderLeases(leases) {
+    if (!changed('leases', leases)) return;
     const container = document.getElementById('leases');
     container.replaceChildren();
     document.getElementById('lease-count').textContent = String(leases.length);
@@ -1169,6 +1354,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
   }
 
   function renderHistory(history) {
+    if (!changed('history', history)) return;
     const container = document.getElementById('history');
     container.replaceChildren();
     document.getElementById('history-count').textContent = String(history.length);
@@ -1188,33 +1374,32 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     currentState = data;
     document.getElementById('machine').textContent = 'Machine: ' + (data.machine || 'unknown');
     document.getElementById('generated').textContent = 'Updated ' + formatTime(data.generated_at);
-    renderTodo(Array.isArray(data.todo) ? data.todo : []);
-    renderStats(Array.isArray(data.tasks) ? data.tasks : []);
-    renderTasks();
+    keepView(() => {
+      renderTodo(Array.isArray(data.todo) ? data.todo : []);
+      renderStats(Array.isArray(data.tasks) ? data.tasks : []);
+      renderTasks();
+      renderWorkers(Array.isArray(data.workers) ? data.workers : []);
+      renderLeases(Array.isArray(data.leases) ? data.leases : []);
+      renderHistory(Array.isArray(data.history) ? data.history : []);
+    });
     if (!hashHandled) {
       hashHandled = true;
       const num = hashTask();
       if (num !== null) showTask(num);
     }
-    renderWorkers(Array.isArray(data.workers) ? data.workers : []);
-    renderLeases(Array.isArray(data.leases) ? data.leases : []);
-    renderHistory(Array.isArray(data.history) ? data.history : []);
   }
 
-  function typing() {
-    const el = document.activeElement;
-    return !!el && el !== search && ['TEXTAREA', 'INPUT'].includes(el.tagName) && !!el.closest('#areas');
-  }
+  let again = false;  // a change came in while a refresh was running
 
-  async function refresh(auto) {
-    if (inFlight || (auto === true && typing())) return;
+  async function refresh() {
+    if (inFlight) { again = true; return; }
     inFlight = true;
     refreshButton.disabled = true;
-    errorBox.hidden = true;
     try {
       const response = await fetch('state' + window.location.search, {headers: {'Accept': 'application/json'}});
       if (!response.ok) throw new Error('State request returned HTTP ' + response.status);
       const data = await response.json();
+      errorBox.hidden = true;
       render(data);
     } catch (error) {
       errorBox.textContent = 'Refresh failed: ' + (error instanceof Error ? error.message : String(error));
@@ -1223,19 +1408,41 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       loading.hidden = true;
       refreshButton.disabled = false;
       inFlight = false;
+      if (again) { again = false; void refresh(); }
     }
   }
 
-  function schedule() {
-    if (timer !== null) window.clearInterval(timer);
-    timer = autoRefresh.checked ? window.setInterval(() => refresh(true), 10000) : null;
+  // Live updates: the server sends one line on the event stream after each
+  // worklog change; the page then gets the new state and changes only what changed.
+  let live = null;
+
+  function connectLive() {
+    if (!window.EventSource) {
+      liveStatus.textContent = 'No live updates in this browser: use Refresh';
+      return;
+    }
+    live = new EventSource('events' + window.location.search);
+    live.onopen = () => {
+      liveStatus.textContent = '● Live';
+      liveStatus.className = 'auto live-status on';
+      void refresh();  // catch up on changes made while the stream was down
+    };
+    live.onmessage = () => { void refresh(); };
+    live.onerror = () => {
+      liveStatus.textContent = 'Reconnecting…';
+      liveStatus.className = 'auto live-status off';
+    };
   }
 
-  search.addEventListener('input', renderTasks);
+  loadDrafts();
+  window.setInterval(saveDrafts, DRAFT_EVERY);
+  window.addEventListener('beforeunload', saveDrafts);
+  search.addEventListener('input', () => keepView(renderTasks));
   window.addEventListener('hashchange', () => { const num = hashTask(); if (num !== null) showTask(num); });
-  refreshButton.addEventListener('click', refresh);
-  autoRefresh.addEventListener('change', schedule);
-  schedule();
+  refreshButton.addEventListener('click', () => { void refresh(); });
+  // Only while the live stream is down: get the state each minute.
+  window.setInterval(() => { if (!live || live.readyState !== 1) void refresh(); }, 60000);
+  connectLive();
   refresh();
 })();
 </script>

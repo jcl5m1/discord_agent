@@ -43,6 +43,8 @@ log = logging.getLogger("discord_agent.worklog")
 DASHBOARD_WORKER = "human:dashboard"
 
 UPDATE_CATCH_UP = 6 * 3600  # a machine that was offline still runs an `/update all` this recent
+EVENTS_PING = 25  # seconds between keep-alive lines on the dashboard's live-update stream
+EVENTS_GATHER = 0.3  # wait this long after a change, so a burst of events sends one notice
 SETTLE = 2.5  # seconds after posting before a change is confirmed
 REMIND_AT = CHECKIN_EVERY - 5 * 60  # remind this long after the last check-in
 WAKE_LIMIT = 12  # deliveries that start a turn, per worker per hour
@@ -87,6 +89,8 @@ class WorklogService:
         self._reminded: set[tuple[int, float]] = set()
         self._active_overdue: set[tuple[int, float]] = set()
         self.token = self._load_token()
+        self._version = 0  # counts state changes, for the dashboard's live updates
+        self._changed = asyncio.Event()
         self.url = f"http://127.0.0.1:{config.WORKLOG_PORT}"
 
     # ------------------------------------------------------------- storage
@@ -113,6 +117,13 @@ class WorklogService:
         for eid, payload in self._db.execute("select id, json from events order by id"):
             state.apply(eid, json.loads(payload))
         self.state = state
+        self._mark_changed()
+
+    def _mark_changed(self) -> None:
+        """Wake the dashboards' live-update streams."""
+        self._version += 1
+        changed, self._changed = self._changed, asyncio.Event()
+        changed.set()
 
     def reads(self, worker: str) -> set[int]:
         return {r[0] for r in self._db.execute("select msg from reads where worker=?", (worker,))}
@@ -220,6 +231,7 @@ class WorklogService:
             return
         before = len(self.state.messages)
         ok, _ = self.state.apply(msg.id, ev)
+        self._mark_changed()
         if ok and msg.id > self.live_from:
             await self._side_effects(ev, self.state.messages[before:])
             if ev.get("op") == "update":
@@ -590,10 +602,35 @@ class WorklogService:
         return web.json_response({"ok": ok, "text": outcome}, status=200 if ok else 400,
                                  headers={"Cache-Control": "no-store"})
 
+    async def _dashboard_events(self, request: web.Request) -> web.StreamResponse:
+        """Server-sent events: one `data:` line after each worklog change, so open
+        dashboards fetch the new state at once instead of on a timer."""
+        if not self._dashboard_authorized(request):
+            return web.Response(status=403, text="bad worklog token")
+        response = web.StreamResponse(headers={
+            "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no",
+        })
+        await response.prepare(request)
+        try:
+            await response.write(b"retry: 3000\n\n")
+            while True:
+                changed = self._changed
+                try:
+                    await asyncio.wait_for(changed.wait(), EVENTS_PING)
+                except asyncio.TimeoutError:
+                    await response.write(b": ping\n\n")
+                    continue
+                await asyncio.sleep(EVENTS_GATHER)
+                await response.write(f"data: {self._version}\n\n".encode())
+        except (ConnectionResetError, ConnectionError):
+            pass
+        return response
+
     async def _serve(self) -> None:
         app = web.Application()
         app.router.add_get("/", self._dashboard_page)
         app.router.add_get("/state", self._dashboard_state)
+        app.router.add_get("/events", self._dashboard_events)
         app.router.add_post("/reply", self._dashboard_reply)
         app.router.add_post("/drop", self._dashboard_drop)
         app.router.add_post("/area", self._dashboard_area)

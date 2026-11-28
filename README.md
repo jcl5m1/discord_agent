@@ -442,8 +442,12 @@ provides it, so sessions don't each build their own.
   title row) and notes, shared through the worklog. Agents set links with
   `wl area <name> --link URL --label NAME`; the user adds notes and links in the page.
   The status chips filter the list (default: open and blocked; tap to toggle,
-  tap Total for all). Search, worker/lease summaries, and a 10-second auto-refresh are
-  included. It uses the public proxy when configured, otherwise a loopback URL. Use
+  tap Total for all). Search and worker/lease summaries are included. **Live updates:**
+  the page listens on a server-sent event stream (`events`) and, after each worklog
+  change, gets the new state and changes only the parts that changed. It never moves
+  the text box that has the focus, and it keeps the view in place. A reply or note
+  draft is saved in the browser every 5 seconds when it changed ("Draft saved at
+  YYYY-MM-DD HH:MM:SS") and comes back after a reload. It uses the public proxy when configured, otherwise a loopback URL. Use
   `/worklog command:"status"` or another explicit command for text output.
 - **Transport:** a `#worklog` channel (created on first start). Every change is one
   message there: a readable line, plus the event as small JSON. Each bot keeps the

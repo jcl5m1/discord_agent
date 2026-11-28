@@ -31,9 +31,18 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
                 return web.json_response({"ok": True, "text": "sent"})
             return web.json_response({"tasks": [], "echo": request.query.get("echo")})
 
+        async def events(request):
+            self.requests.append((request.path, request.headers.get("X-Worklog-Token", ""), request.query_string))
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b"retry: 3000\n\n")
+            await response.write(b"data: 7\n\n")
+            return response
+
         self.upstream = TestServer(web.Application())
         self.upstream.app.router.add_get("/", upstream)
         self.upstream.app.router.add_get("/state", upstream)
+        self.upstream.app.router.add_get("/events", events)
         self.upstream.app.router.add_post("/reply", upstream)
         self.upstream.app.router.add_post("/drop", upstream)
         self.upstream.app.router.add_post("/area", upstream)
@@ -78,6 +87,13 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests, [("/drop", "good-token", "")])
         response = await self.client.get("/agents/_worklog/good-token/drop")
         self.assertEqual(response.status, 405)
+
+    async def test_events_stream_through_the_proxy(self):
+        response = await self.client.get("/agents/_worklog/good-token/events")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Content-Type"], "text/event-stream")
+        self.assertEqual(await response.text(), "retry: 3000\n\ndata: 7\n\n")
+        self.assertEqual(self.requests, [("/events", "good-token", "")])
 
     async def test_area_forwards_json_body(self):
         response = await self.client.post("/agents/_worklog/good-token/area", json={"area": "x", "note": "hi"})

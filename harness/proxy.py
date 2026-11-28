@@ -25,6 +25,7 @@ The project-agnostic worklog dashboard uses its own token and fixed upstream:
 
     GET /agents/_worklog/<token>/
     GET /agents/_worklog/<token>/state
+    GET /agents/_worklog/<token>/events   (server-sent events, streamed)
     POST /agents/_worklog/<token>/reply
     POST /agents/_worklog/<token>/drop
     POST /agents/_worklog/<token>/area
@@ -189,9 +190,9 @@ async def _files_root_redirect(request: web.Request) -> web.Response:
 
 async def _worklog(request: web.Request) -> web.Response:
     path = request.match_info["path"]
-    if path not in ("", "state", "reply", "drop", "area"):
+    if path not in ("", "state", "events", "reply", "drop", "area"):
         return web.Response(status=404, text="not found")
-    read = request.method in ("GET", "HEAD") and path in ("", "state")
+    read = request.method in ("GET", "HEAD") and path in ("", "state", "events")
     post = request.method == "POST" and path in ("reply", "drop", "area")
     if not read and not post:
         return web.Response(status=405, text="method not allowed")
@@ -205,6 +206,16 @@ async def _worklog(request: web.Request) -> web.Response:
         headers["Content-Type"] = content_type
     try:
         session: ClientSession = request.app["session"]
+        if path == "events":  # a live-update stream: pass each chunk on as it comes
+            async with session.get(url, headers=headers) as upstream:
+                stream = web.StreamResponse(status=upstream.status, headers={
+                    "Content-Type": upstream.headers.get("Content-Type", "text/event-stream"),
+                    "Cache-Control": "no-store",
+                })
+                await stream.prepare(request)
+                async for chunk in upstream.content.iter_any():
+                    await stream.write(chunk)
+                return stream
         async with session.request(
             request.method, url, headers=headers, data=body or None
         ) as upstream:

@@ -148,7 +148,7 @@ class PageTests(unittest.TestCase):
 
     def test_page_has_filters_counts_refresh_and_auto_refresh(self):
         for element_id in (
-            "search", "stats", "refresh", "auto-refresh", "areas", "workers",
+            "search", "stats", "refresh", "live-status", "areas", "workers",
             "leases", "history", "error", "no-matches",
         ):
             self.assertIn(f'id="{element_id}"', self.html)
@@ -157,9 +157,13 @@ class PageTests(unittest.TestCase):
         self.assertIn("const DEFAULT_STATUSES = ['open', 'blocked'];", self.html)
         self.assertIn("node('button', 'stat'", self.html)
         self.assertIn("card.setAttribute('aria-pressed'", self.html)
-        self.assertIn("Auto-refresh every 10s", self.html)
-        self.assertIn("window.setInterval(() => refresh(true), 10000)", self.html)
-        self.assertIn("if (inFlight || (auto === true && typing())) return;", self.html)
+        self.assertNotIn("Auto-refresh", self.html)
+        self.assertIn("new EventSource('events' + window.location.search)", self.html)
+        self.assertIn("window.setInterval(saveDrafts, DRAFT_EVERY)", self.html)
+        self.assertIn("const DRAFT_EVERY = 5000;", self.html)
+        self.assertIn("'Draft saved at ' + stamp(saved.at)", self.html)
+        self.assertIn("if (saved ? saved.text === text : !text) return;", self.html)
+        self.assertIn("function reconcile(parent, list)", self.html)
         self.assertIn("fetch('state' + window.location.search", self.html)
         self.assertIn("if (!response.ok)", self.html)
         self.assertIn('role="alert"', self.html)
@@ -270,7 +274,7 @@ class TodoTests(unittest.TestCase):
 
     def test_page_has_drop_button_next_to_reply(self):
         html = page()
-        self.assertIn("if (!['done', 'dropped'].includes(task.status)) actions.append(dropButton(task, status));", html)
+        self.assertIn("if (!['done', 'dropped'].includes(task.status)) buttons.push(dropButton(task, status));", html)
         self.assertIn("fetch('drop' + window.location.search", html)
         self.assertIn("window.prompt(", html)
         self.assertIn("if (reason === null) return;", html)
@@ -298,7 +302,7 @@ class AnswerTests(unittest.TestCase):
         html = page()
         self.assertIn("label: 'Send OK', text: 'OK, go ahead.'", html)
         self.assertIn("label: 'Done', text: 'Done: I ran the command.", html)
-        self.assertIn("if (quick && QUICK[quick.answer]) actions.append(quickButton(", html)
+        self.assertIn("if (quick && QUICK[quick.answer]) buttons.push(quickButton(", html)
         self.assertIn("if (QUICK[item.answer]) {", html)
 
 
@@ -327,7 +331,7 @@ class AreaTests(unittest.TestCase):
 
     def test_page_has_area_details_with_safe_links(self):
         html = page()
-        self.assertIn("if (area) list.append(areaDetails(area, info));", html)
+        self.assertIn("const children = (area ? [areaDetails(area, info)] : []).concat(groupTasks.map(taskNode));", html)
         self.assertIn("return /^https?:\\/\\//i.test(String(url || ''))", html)
         self.assertIn("link.rel = 'noopener noreferrer';", html)
         self.assertIn("fetch('area' + window.location.search", html)
