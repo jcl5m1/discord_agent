@@ -469,11 +469,18 @@ shared worklog with the `wl` command (on your PATH; you are worker {worker}).
   starting, up to 10 words>"`. If it isn't listed, `wl add "<title>" --files
   a.py,b.py` first. A claim held by someone else is refused: message them.
 - While you hold a claim, check in at least every 30 minutes:
-  `wl checkin <id> "<up to 10 words of progress>"`. It's posted to your Discord
-  channel. A claim with no check-in for 30 minutes is released, however long
-  the task, and you show as stale; claim it again if you're still on it.
+  `wl checkin <id> "<up to 10 words of progress>"`. It updates the shared
+  dashboard, not your Discord channel. A claim with no check-in for 30 minutes
+  is released, however long the task, and you show as stale; claim it again if
+  you're still on it.
 - Finish with `wl done <id> "<result, commits>"`, `wl block <id> "<what you need>"`
   or `wl release <id>`. Use `wl note <id> "..."` for longer progress notes.
+- If a task waits for the user to run a command that needs sudo or admin
+  rights, put the command in the `wl block` message, so the latest status
+  holds it. Give one line that the user can copy and run. If the command needs
+  more than one line, write a script in your repo and give the one-line
+  command that runs it (e.g. `sudo bash /full/path/fix.sh`). Say on which
+  machine to run it.
 - Open tasks in your project are your work. When you finish a task and hold no
   claim, run `wl next` and take the task it shows (or give it to a subagent).
   When you are idle, the harness also offers you the best open task in your
@@ -502,7 +509,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 6
+BRIEF_VERSION = 8
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it
@@ -2845,13 +2852,16 @@ async def cmd_logs(interaction: discord.Interaction, lines: int = 3000) -> None:
     )
 
 
-@tree.command(name="worklog", description="The agents' shared worklog: status, tasks, or any wl command")
+@tree.command(name="worklog", description="Open the agents' shared worklog dashboard, or run a wl command")
 @discord.app_commands.describe(
-    command='A wl command, e.g. "list --all", "show 8", "log", \'send harness-2@host "hi"\' (default: status)'
+    command='A wl command, e.g. "list --all", "show 8", "log" (default: dashboard link)'
 )
-async def cmd_worklog(interaction: discord.Interaction, command: str = "status") -> None:
+async def cmd_worklog(interaction: discord.Interaction, command: str | None = None) -> None:
     if worklog is None or not worklog.ready.is_set():
         await interaction.response.send_message("The worklog isn't running on this machine.", ephemeral=True)
+        return
+    if command is None:
+        await interaction.response.send_message(f"[Open the worklog dashboard]({worklog.dashboard_url()})")
         return
     await interaction.response.defer()
     try:

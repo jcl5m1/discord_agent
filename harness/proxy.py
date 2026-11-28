@@ -20,6 +20,13 @@ the same tunnel path:
 and each instance's shared files folder (see harness/files.py), read-only:
 
     GET /agents/<instance-slug>/<token>/files/<path>
+
+The project-agnostic worklog dashboard uses its own token and fixed upstream:
+
+    GET /agents/_worklog/<token>/
+    GET /agents/_worklog/<token>/state
+    POST /agents/_worklog/<token>/reply
+    POST /agents/_worklog/<token>/drop
 """
 
 from __future__ import annotations
@@ -179,6 +186,39 @@ async def _files_root_redirect(request: web.Request) -> web.Response:
     raise web.HTTPFound(request.path + "/")
 
 
+async def _worklog(request: web.Request) -> web.Response:
+    path = request.match_info["path"]
+    if path not in ("", "state", "reply", "drop"):
+        return web.Response(status=404, text="not found")
+    read = request.method in ("GET", "HEAD") and path in ("", "state")
+    post = request.method == "POST" and path in ("reply", "drop")
+    if not read and not post:
+        return web.Response(status=405, text="method not allowed")
+    upstream_path = "/" if path == "" else f"/{path}"
+    url = f"http://127.0.0.1:{config.WORKLOG_PORT}{upstream_path}"
+    if request.query_string:
+        url += "?" + request.query_string
+    body = await request.read()
+    headers = {"X-Worklog-Token": request.match_info["token"]}
+    if content_type := request.headers.get("Content-Type"):
+        headers["Content-Type"] = content_type
+    try:
+        session: ClientSession = request.app["session"]
+        async with session.request(
+            request.method, url, headers=headers, data=body or None
+        ) as upstream:
+            response_body = await upstream.read()
+            return web.Response(
+                status=upstream.status,
+                body=response_body,
+                content_type=upstream.content_type,
+                headers={"Cache-Control": "no-store"},
+            )
+    except Exception:
+        log.exception("worklog dashboard proxy failed")
+        return web.Response(status=502, text="worklog dashboard not reachable")
+
+
 def build_app(store: InstanceManager, on_trigger: OnTrigger | None = None) -> web.Application:
     app = web.Application()
     app["store"] = store
@@ -236,6 +276,7 @@ def build_app(store: InstanceManager, on_trigger: OnTrigger | None = None) -> we
             return web.Response(status=502, text="agent server not reachable")
 
     app.router.add_route("*", "/agents/_triggers/{name}", _trigger)
+    app.router.add_route("*", "/agents/_worklog/{token}/{path:.*}", _worklog)
     app.router.add_route("*", "/agents/{slug}/{token}/__annotate_blob", _annotate_blob)
     app.router.add_route("*", "/agents/{slug}/{token}/files/{path:.*}", _files)
     app.router.add_route("*", "/agents/{slug}/{token}/files", _files_root_redirect)

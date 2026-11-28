@@ -51,7 +51,7 @@ class Worker:
     name: str
     machine: str = ""
     bot: int = 0  # Discord user id of the harness bot running this worker (0: none)
-    channel: int = 0  # its Discord channel, where its check-ins are posted
+    channel: int = 0  # its Discord channel for harness notifications
     desc: str = ""
     session: str = ""
     seen: float = 0.0

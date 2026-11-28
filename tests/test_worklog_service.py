@@ -15,6 +15,8 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest import mock
 
+from aiohttp import ClientSession
+
 from harness import config
 from harness import worklog_service as svc
 from harness.worklog import encode, summary
@@ -118,15 +120,116 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.state.tasks[1].owner, winner)
         self.assertTrue(any(m.content.startswith("❌ refused") for m in self.channel.msgs))
 
-    async def test_checkin_posted_by_the_owners_bot_and_mail_delivered(self):
-        await self.b.run(["add", "Rebase", "--files", "x.py"], "bob@m2")
+    async def test_checkin_updates_dashboard_without_chat_repost_and_mail_delivered(self):
+        await self.b.run(["add", "Rebase", "--area", "harness", "--files", "x.py"], "bob@m2")
         await self.b.run(["claim", "1"], "bob@m2")
         ok, _ = await self.b.run(["checkin", "1", "rebased onto main, tests running"], "bob@m2")
         self.assertTrue(ok)
         await self.a.run(["send", "bob@m2", "ping me when done", "--task", "1"], "alice@m1")
         await asyncio.sleep(0.3)
-        self.assertEqual(self.notified, [(2, "bob@m2", "📋 #1 · rebased onto main, tests running")])
+        self.assertEqual(self.notified, [])
         self.assertEqual(self.delivered, [(2, "bob@m2", "alice@m1", "(re #1) ping me when done")])
+
+        async with ClientSession() as client:
+            async with client.get(f"{self.b.url}/state") as response:
+                self.assertEqual(response.status, 403)
+            async with client.get(
+                f"{self.b.url}/state", headers={"X-Worklog-Token": self.b.token}
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                data = await response.json()
+            async with client.get(f"{self.b.url}/?token={self.b.token}") as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("text/html", response.content_type)
+                self.assertIn("Cache-Control", response.headers)
+                html = await response.text()
+        self.assertEqual(data["tasks"][0]["progress"], "rebased onto main, tests running")
+        self.assertEqual(data["tasks"][0]["area"], "harness")
+        self.assertIn("WORKLOG", html.upper())
+        with mock.patch.object(config, "PUBLIC_BASE_URL", "https://agents.example.com"):
+            self.assertEqual(
+                self.b.dashboard_url(), f"https://agents.example.com/agents/_worklog/{self.b.token}/"
+            )
+
+    async def test_dashboard_reply_persists_and_immediately_notifies_owner(self):
+        await self.b.run(["add", "Review blocked work", "--area", "harness"], "bob@m2")
+        await self.b.run(["claim", "1"], "bob@m2")
+        await self.b.run(["add", "No owner", "--area", "harness"], "bob@m2")
+
+        async with ClientSession() as client:
+            async with client.post(
+                f"{self.b.url}/reply", json={"task": 1, "text": "Is this still blocked?"}
+            ) as response:
+                self.assertEqual(response.status, 403)
+            for body in (
+                {"task": 1, "text": " "}, {"task": True, "text": "invalid"},
+                {"task": "1", "text": "invalid"}, {"task": 999, "text": "missing"},
+            ):
+                async with client.post(
+                    f"{self.b.url}/reply", json=body, headers={"X-Worklog-Token": self.b.token}
+                ) as response:
+                    self.assertEqual(response.status, 400)
+            async with client.post(
+                f"{self.b.url}/reply", json={"task": 2, "text": "ping"},
+                headers={"X-Worklog-Token": self.b.token},
+            ) as response:
+                self.assertEqual(response.status, 409)
+            async with client.post(
+                f"{self.b.url}/reply", json={"task": 1, "text": "  Is this still blocked?  "},
+                headers={"X-Worklog-Token": self.b.token},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                reply = await response.json()
+            async with client.get(
+                f"{self.b.url}/state", headers={"X-Worklog-Token": self.b.token}
+            ) as response:
+                data = await response.json()
+
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["thread"]["text"], "Is this still blocked?")
+        message = self.b.state.messages[-1]
+        self.assertEqual((message.task, message.sender, message.to, message.text),
+                         (1, "human:dashboard", "bob@m2", "Is this still blocked?"))
+        self.assertEqual(data["tasks"][0]["thread"][-1], reply["thread"])
+        self.assertEqual(self.delivered, [
+            (2, "bob@m2", "human:dashboard", "(re #1) Is this still blocked?"),
+        ])
+
+    async def test_dashboard_drop_drops_task_and_tells_owner(self):
+        await self.b.run(["add", "Stale work", "--area", "harness"], "bob@m2")
+        await self.b.run(["claim", "1"], "bob@m2")
+        await self.b.run(["add", "No owner", "--area", "harness"], "bob@m2")
+        auth = {"X-Worklog-Token": self.b.token}
+
+        async with ClientSession() as client:
+            async with client.post(f"{self.b.url}/drop", json={"task": 1}) as response:
+                self.assertEqual(response.status, 403)
+            for body in ({"task": "1"}, {"task": True}, {"task": 999}, {"task": 1, "reason": 5},
+                         {"task": 1, "reason": "x" * 2001}):
+                async with client.post(f"{self.b.url}/drop", json=body, headers=auth) as response:
+                    self.assertEqual(response.status, 400, body)
+            self.assertEqual(self.b.state.tasks[1].status, "claimed")
+            async with client.post(f"{self.b.url}/drop", json={"task": 1, "reason": " Not needed now "},
+                                   headers=auth) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                self.assertTrue((await response.json())["ok"])
+            async with client.post(f"{self.b.url}/drop", json={"task": 1}, headers=auth) as response:
+                self.assertEqual(response.status, 409)
+            async with client.post(f"{self.b.url}/drop", json={"task": 2}, headers=auth) as response:
+                self.assertEqual(response.status, 200)
+
+        task = self.b.state.tasks[1]
+        self.assertEqual((task.status, task.owner), ("dropped", "bob@m2"))
+        self.assertEqual(task.notes[-1][1:], ("human:dashboard", "[dropped] Not needed now"))
+        self.assertEqual(self.b.state.tasks[2].status, "dropped")
+        self.assertEqual(self.b.state.tasks[2].notes[-1][2], "[dropped] Dropped from the dashboard")
+        self.assertEqual(self.delivered, [(
+            2, "bob@m2", "human:dashboard",
+            "(re #1) The user dropped #1 from the dashboard. Stop work on it. Reason: Not needed now",
+        )])
 
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")

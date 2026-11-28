@@ -8,11 +8,13 @@
   127.0.0.1, with a token from data/worklog_token, so agents never hold the bot
   token. Changes are posted to #worklog and confirmed after SETTLE seconds, so
   a competing event from another machine has time to arrive first.
-- Harness duties, for the workers this bot runs: register them, post their
-  check-ins to their own Discord channel, deliver messages sent to them (into
-  the running turn, or as a new turn), remind them to check in, and release a
-  claim that has gone CHECKIN_EVERY without a check-in. A claim stays assigned
-  while its provider process is active, so release never implies process exit.
+- Harness duties, for the workers this bot runs: register them, deliver messages
+  sent to them (into the running turn, or as a new turn), remind them to check in,
+  and release a claim that has gone CHECKIN_EVERY without a check-in. A claim stays
+  assigned while its provider process is active, so release never implies process exit.
+- Dashboard: the same local API serves a token-protected web view of every
+  project. Replies use task-linked mail to notify the assigned agent. Check-ins
+  stay in the worklog instead of reposting to agent chat.
 """
 
 from __future__ import annotations
@@ -31,11 +33,14 @@ from typing import Awaitable, Callable
 import discord
 from aiohttp import web
 
-from . import config
+from . import config, worklog_dashboard
 from .worklog import (CHECKIN_EVERY, CommandError, Worklog, area_keys, area_matches, decode, encode, fmt_time,
                       run_command, summary)
 
 log = logging.getLogger("discord_agent.worklog")
+
+# The worker name for actions the user takes in the dashboard (replies and drops).
+DASHBOARD_WORKER = "human:dashboard"
 
 SETTLE = 2.5  # seconds after posting before a change is confirmed
 REMIND_AT = CHECKIN_EVERY - 5 * 60  # remind this long after the last check-in
@@ -229,8 +234,6 @@ class WorklogService:
 
     async def _side_effects(self, ev: dict, new_messages: list) -> None:
         mine = self.my_workers()
-        if ev.get("op") == "checkin" and ev.get("by") in mine:
-            await self.notify(ev["by"], f"📋 #{ev.get('task')} · {ev.get('text', '').strip()}")
         for m in new_messages:
             if m.to in mine:
                 if self._may_wake(m.to):
@@ -438,8 +441,98 @@ class WorklogService:
         }
 
     # ------------------------------------------------------------- local API
+    def dashboard_url(self) -> str:
+        if config.PUBLIC_BASE_URL:
+            return f"{config.PUBLIC_BASE_URL}/agents/_worklog/{self.token}/"
+        return f"{self.url}/?token={self.token}"
+
+    def _dashboard_authorized(self, request: web.Request) -> bool:
+        supplied = request.headers.get("X-Worklog-Token") or request.query.get("token", "")
+        return secrets.compare_digest(supplied, self.token)
+
+    async def _dashboard_page(self, request: web.Request) -> web.Response:
+        if not self._dashboard_authorized(request):
+            return web.Response(status=403, text="bad worklog token")
+        return web.Response(
+            text=worklog_dashboard.page(), content_type="text/html", headers={"Cache-Control": "no-store"}
+        )
+
+    async def _dashboard_state(self, request: web.Request) -> web.Response:
+        if not self._dashboard_authorized(request):
+            return web.json_response({"error": "bad worklog token"}, status=403)
+        return web.json_response(
+            worklog_dashboard.snapshot(self.state, self.machine), headers={"Cache-Control": "no-store"}
+        )
+
+    async def _dashboard_reply(self, request: web.Request) -> web.Response:
+        if not self._dashboard_authorized(request):
+            return web.json_response({"ok": False, "text": "bad worklog token"}, status=403)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        num = body.get("task") if isinstance(body, dict) else None
+        text = body.get("text", "") if isinstance(body, dict) else ""
+        text = text.strip() if isinstance(text, str) else ""
+        if type(num) is not int or not 1 <= len(text) <= 2000:
+            return web.json_response({"ok": False, "text": "task and 1-2000 characters of text required"}, status=400)
+        task = self.state.tasks.get(num)
+        if task is None:
+            return web.json_response({"ok": False, "text": f"no task #{num}"}, status=400)
+        if not task.owner:
+            return web.json_response({"ok": False, "text": f"task #{num} has no assigned agent"}, status=409)
+        ok, outcome = await self.run(["send", task.owner, text, "--task", str(num)], DASHBOARD_WORKER)
+        latest = next((m for m in reversed(self.state.messages)
+                       if m.task == num and m.sender == DASHBOARD_WORKER), None)
+        return web.json_response(
+            {
+                "ok": ok,
+                "text": outcome,
+                "thread": ({"id": latest.id, "sender": latest.sender, "to": latest.to,
+                            "at": latest.at, "text": latest.text} if latest else None),
+            },
+            status=200 if ok else 409,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def _dashboard_drop(self, request: web.Request) -> web.Response:
+        """Drop a task from the dashboard and tell its owner to stop work on it."""
+        if not self._dashboard_authorized(request):
+            return web.json_response({"ok": False, "text": "bad worklog token"}, status=403)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        num = body.get("task") if isinstance(body, dict) else None
+        reason = body.get("reason", "") if isinstance(body, dict) else ""
+        reason = reason.strip() if isinstance(reason, str) else None
+        if type(num) is not int or reason is None or len(reason) > 2000:
+            return web.json_response({"ok": False, "text": "task and at most 2000 characters of reason required"},
+                                     status=400)
+        task = self.state.tasks.get(num)
+        if task is None:
+            return web.json_response({"ok": False, "text": f"no task #{num}"}, status=400)
+        if task.status in ("done", "dropped"):
+            return web.json_response({"ok": False, "text": f"task #{num} is already {task.status}"}, status=409)
+        owner = task.owner
+        ok, outcome = await self.run(
+            ["drop", str(num), reason or "Dropped from the dashboard", "--force"], DASHBOARD_WORKER
+        )
+        if ok and owner and owner != DASHBOARD_WORKER:
+            text = f"The user dropped #{num} from the dashboard. Stop work on it."
+            if reason:
+                text += f" Reason: {reason}"
+            await self.run(["send", owner, text, "--task", str(num)], DASHBOARD_WORKER)
+        return web.json_response(
+            {"ok": ok, "text": outcome}, status=200 if ok else 409, headers={"Cache-Control": "no-store"}
+        )
+
     async def _serve(self) -> None:
         app = web.Application()
+        app.router.add_get("/", self._dashboard_page)
+        app.router.add_get("/state", self._dashboard_state)
+        app.router.add_post("/reply", self._dashboard_reply)
+        app.router.add_post("/drop", self._dashboard_drop)
         app.router.add_post("/wl", self._handle)
         runner = web.AppRunner(app)
         await runner.setup()

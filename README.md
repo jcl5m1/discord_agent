@@ -417,6 +417,18 @@ Agents on every machine coordinate through one shared worklog: a task list with
 claims, progress check-ins, notes, resource leases and messages. The harness
 provides it, so sessions don't each build their own.
 
+- **Dashboard:** `/worklog` opens a token-protected web dashboard. It groups every
+  project by area. Expand a project or task to see its latest status, details,
+  dependencies, check-in/note history, and task thread. You can reply to the assigned
+  agent from the task. The reply persists in worklog state and immediately notifies
+  that agent, or drop the task (it asks for an optional reason and tells the owner to
+  stop). A "To do for you" panel at the top groups the blocked tasks that wait for the
+  user by action (go-ahead, run a command, phone test, accounts, decide, parked); each
+  item links to its task (`#task-<n>`), and a command in the block message gets a Copy
+  button. The status chips filter the list (default: open and blocked; tap to toggle,
+  tap Total for all). Search, worker/lease summaries, and a 10-second auto-refresh are
+  included. It uses the public proxy when configured, otherwise a loopback URL. Use
+  `/worklog command:"status"` or another explicit command for text output.
 - **Transport:** a `#worklog` channel (created on first start). Every change is one
   message there: a readable line, plus the event as small JSON. Each bot keeps the
   events in `data/worklog.db` and applies them in message-id order, which Discord
@@ -433,9 +445,10 @@ provides it, so sessions don't each build their own.
   message. Terminal sessions on the same machine can use `bin/wl --as <name>` too.
 - **Check-ins:** while holding a claim, an agent must run
   `wl checkin <id> "<up to 10 words of progress>"` at least every 30 minutes. Each
-  check-in is posted to the agent's own Discord channel; after 25 minutes the
-  harness reminds it, and at 30 minutes it releases the claim. If the provider process
-  is still active, the claim stays assigned until turn cleanup to prevent duplicate work.
+  check-in updates the dashboard; it is not reposted to the agent's Discord channel.
+  After 25 minutes the harness reminds the agent, and at 30 minutes it releases the claim.
+  If the provider process is still active, the claim stays assigned until turn cleanup
+  to prevent duplicate work.
   A terminal session's lapsed claim is released too, by the bot that posted its claim or
   last check-in (or by any bot an hour later, if that one is down), and the session gets
   a message saying so. `wl status` shows a worker as stale after 30 minutes without activity,
