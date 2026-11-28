@@ -495,6 +495,13 @@ class WorklogService:
             worklog_dashboard.snapshot(self.state, self.machine), headers={"Cache-Control": "no-store"}
         )
 
+    @staticmethod
+    def _dashboard_user(request: web.Request) -> str:
+        """The person using the dashboard: the Tailscale login that Tailscale Serve
+        adds to each request, else DASHBOARD_WORKER."""
+        login = request.headers.get("Tailscale-User-Login", "").strip()
+        return login if login and " " not in login and len(login) <= 100 else DASHBOARD_WORKER
+
     async def _dashboard_reply(self, request: web.Request) -> web.Response:
         if not self._dashboard_authorized(request):
             return web.json_response({"ok": False, "text": "bad worklog token"}, status=403)
@@ -512,9 +519,10 @@ class WorklogService:
             return web.json_response({"ok": False, "text": f"no task #{num}"}, status=400)
         if not task.owner:
             return web.json_response({"ok": False, "text": f"task #{num} has no assigned agent"}, status=409)
-        ok, outcome = await self.run(["send", task.owner, text, "--task", str(num)], DASHBOARD_WORKER)
+        user = self._dashboard_user(request)
+        ok, outcome = await self.run(["send", task.owner, text, "--task", str(num)], user)
         latest = next((m for m in reversed(self.state.messages)
-                       if m.task == num and m.sender == DASHBOARD_WORKER), None)
+                       if m.task == num and m.sender == user), None)
         return web.json_response(
             {
                 "ok": ok,
@@ -545,15 +553,15 @@ class WorklogService:
             return web.json_response({"ok": False, "text": f"no task #{num}"}, status=400)
         if task.status in ("done", "dropped"):
             return web.json_response({"ok": False, "text": f"task #{num} is already {task.status}"}, status=409)
-        owner = task.owner
+        owner, user = task.owner, self._dashboard_user(request)
         ok, outcome = await self.run(
-            ["drop", str(num), reason or "Dropped from the dashboard", "--force"], DASHBOARD_WORKER
+            ["drop", str(num), reason or "Dropped from the dashboard", "--force"], user
         )
-        if ok and owner and owner != DASHBOARD_WORKER:
+        if ok and owner and owner != user:
             text = f"The user dropped #{num} from the dashboard. Stop work on it."
             if reason:
                 text += f" Reason: {reason}"
-            await self.run(["send", owner, text, "--task", str(num)], DASHBOARD_WORKER)
+            await self.run(["send", owner, text, "--task", str(num)], user)
         return web.json_response(
             {"ok": ok, "text": outcome}, status=200 if ok else 409, headers={"Cache-Control": "no-store"}
         )

@@ -221,6 +221,11 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
             async with client.post(f"{self.b.url}/drop", json={"task": 2}, headers=auth) as response:
                 self.assertEqual(response.status, 200)
 
+            async with client.post(f"{self.b.url}/reply", json={"task": 1, "text": "Why dropped?"},
+                                   headers={**auth, "Tailscale-User-Login": "jo@example.com"}) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual((await response.json())["thread"]["sender"], "jo@example.com")
+
         task = self.b.state.tasks[1]
         self.assertEqual((task.status, task.owner), ("dropped", "bob@m2"))
         self.assertEqual(task.notes[-1][1:], ("human:dashboard", "[dropped] Not needed now"))
@@ -229,7 +234,7 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.delivered, [(
             2, "bob@m2", "human:dashboard",
             "(re #1) The user dropped #1 from the dashboard. Stop work on it. Reason: Not needed now",
-        )])
+        ), (2, "bob@m2", "jo@example.com", "(re #1) Why dropped?")])
 
     async def test_update_all_reaches_every_bot_and_collects_results(self):
         calls = []
