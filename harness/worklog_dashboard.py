@@ -286,6 +286,12 @@ details[open] > summary > .disclosure { transform: rotate(90deg); }
 .task-body { padding: 2px 16px 16px; border-top: 1px solid rgba(40, 52, 73, .65); }
 .task-body h3, .side-section h3 { margin: 16px 0 7px; color: var(--muted); font-size: 11px; letter-spacing: .09em; text-transform: uppercase; }
 .description { margin: 0; color: #d5dfec; overflow-wrap: anywhere; white-space: pre-wrap; }
+.section { margin-top: 12px; }
+.section > summary { display: flex; align-items: center; gap: 7px; padding: 4px 0; cursor: pointer; list-style: none; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+.section > summary::-webkit-details-marker { display: none; }
+.section > summary .disclosure { width: 10px; font-size: 9px; }
+.section > .fields { margin-top: 8px; }
+.notes .thread-message { padding: 10px 12px; margin: 6px 0; border-top: 0; }
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; margin: 16px 0 0; }
 .field { min-width: 0; padding: 9px 11px; border-radius: 8px; background: rgba(8, 13, 21, .38); }
 .field.wide { grid-column: 1 / -1; }
@@ -578,6 +584,20 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     }
   }
 
+  const openSections = new Map();  // 'num:key' -> open, kept across auto-refresh
+
+  function section(task, key, title, openByDefault, ...content) {
+    const id = task.num + ':' + key;
+    const details = node('details', 'section');
+    details.dataset.section = key;
+    details.open = openSections.has(id) ? openSections.get(id) : openByDefault;
+    details.addEventListener('toggle', () => openSections.set(id, details.open));
+    const summary = node('summary', 'section-title');
+    summary.append(node('span', 'disclosure', '▶'), node('span', '', title));
+    details.append(summary, ...content);
+    return details;
+  }
+
   function taskNode(task) {
     const details = node('details', 'task');
     details.id = 'task-' + task.num;
@@ -598,12 +618,41 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     details.append(summary);
 
     const body = node('div', 'task-body');
-    body.append(node('h3', '', 'Description'));
-    body.append(node('p', 'description', task.desc || 'No description.'));
+    body.append(section(task, 'description', 'Description', true,
+      node('p', 'description', task.desc || 'No description.')));
     if (task.result) {
-      body.append(node('h3', '', 'Result'));
-      body.append(node('p', 'description', task.result));
+      body.append(section(task, 'result', 'Result', true, node('p', 'description', task.result)));
     }
+    body.append(section(task, 'reply', ['done', 'dropped'].includes(task.status) ? 'Reply' : 'Reply or drop',
+      true, replyForm(task)));
+
+    // Notes and task messages in one timeline, the most recent on top.
+    const timeline = notesFor(task).map(note => ({at: note.at, kind: 'note', note}))
+      .concat(threadFor(task).map(message => ({at: message.at, kind: 'message', message})))
+      .sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0));
+    const entries = [];
+    if (!timeline.length) {
+      entries.push(empty('No notes or messages for this task.'));
+    } else {
+      const list = node('ol', 'notes');
+      timeline.forEach(entry => {
+        if (entry.kind === 'note') {
+          const item = node('li', 'note');
+          item.append(node('p', 'note-text', entry.note.text));
+          item.append(node('div', 'note-meta', (entry.note.by || 'Unknown worker') + ' · ' + formatTime(entry.note.at)));
+          list.append(item);
+        } else {
+          const item = node('li', 'note thread-message');
+          item.append(node('p', '', entry.message.text));
+          item.append(node('div', 'note-meta', (entry.message.sender || 'Unknown sender') + ' → ' +
+            (entry.message.to || 'Unknown recipient') + ' · ' + formatTime(entry.message.at)));
+          list.append(item);
+        }
+      });
+      entries.push(list);
+    }
+    body.append(section(task, 'timeline', 'Notes and messages · ' + timeline.length, true, ...entries));
+
     const fields = node('div', 'fields');
     fields.append(
       field('Area', task.area || 'Unassigned'),
@@ -615,36 +664,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       field('Updated', formatTime(task.updated)),
       field('Last check-in', formatTime(task.checkin_at))
     );
-    body.append(fields);
-    const notes = notesFor(task);
-    body.append(node('h3', '', 'Notes history · ' + notes.length));
-    if (!notes.length) {
-      body.append(empty('No notes for this task.'));
-    } else {
-      const list = node('ol', 'notes');
-      notes.slice().reverse().forEach(note => {
-        const item = node('li', 'note');
-        item.append(node('p', 'note-text', note.text));
-        item.append(node('div', 'note-meta', (note.by || 'Unknown worker') + ' · ' + formatTime(note.at)));
-        list.append(item);
-      });
-      body.append(list);
-    }
-    const thread = threadFor(task);
-    body.append(node('h3', '', 'Thread · ' + thread.length));
-    if (!thread.length) {
-      body.append(empty('No replies for this task.'));
-    } else {
-      thread.forEach(message => {
-        const item = node('div', 'thread-message');
-        item.append(node('p', '', message.text));
-        item.append(node('div', 'note-meta',
-          (message.sender || 'Unknown sender') + ' → ' + (message.to || 'Unknown recipient') + ' · ' + formatTime(message.at)));
-        body.append(item);
-      });
-    }
-    body.append(node('h3', '', 'Reply'));
-    body.append(replyForm(task));
+    body.append(section(task, 'information', 'Information', false, fields));
     details.append(body);
     return details;
   }
