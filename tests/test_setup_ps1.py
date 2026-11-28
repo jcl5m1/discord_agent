@@ -176,9 +176,9 @@ class WindowsTaskScriptTests(unittest.TestCase):
         self.assertIn("[IO.Path]::GetFullPath($python)", self.installer)
         self.assertRegex(
             self.installer,
-            r"\[IO\.Path\]::GetFullPath\(\$_\.ExecutablePath\)\s+-ieq\s+\$pythonPath",
+            r"\[IO\.Path\]::GetFullPath\(\$process\.ExecutablePath\)\s+-ieq\s+\$pythonPath",
         )
-        self.assertIn("$_.CommandLine -match $modulePattern", self.installer)
+        self.assertIn("$process.CommandLine -match $modulePattern", self.installer)
         self.assertNotIn("repositoryPattern", self.installer)
 
         match = re.search(r"\$modulePattern = '([^']+)'", self.installer)
@@ -197,6 +197,16 @@ class WindowsTaskScriptTests(unittest.TestCase):
             r'"C:\repo\.venv\Scripts\python.exe" -m harness.uptime.extra',
         ):
             self.assertIsNone(module_pattern.search(command), command)
+
+    def test_base_python_children_of_the_venv_launcher_are_owned(self):
+        # The Windows venv python.exe is a launcher; the real interpreter is its child
+        # under the base Python named in .venv\pyvenv.cfg (seen on arcade-rtx5070, 11-28).
+        self.assertIn('Join-Path $PSScriptRoot ".venv\\pyvenv.cfg"', self.installer)
+        self.assertIn("$venvHome", self.installer)
+        self.assertNotRegex(self.installer, r"\$home\s*=")  # $HOME is read-only in PowerShell
+        self.assertIn("[IO.Path]::GetFullPath($_.ExecutablePath) -ieq $basePythonPath", self.installer)
+        self.assertIn("$isBaseChild = (-not $parent) -or (Test-VenvAgent $parent)", self.installer)
+        self.assertIn("$isLauncher -or $isAgent -or $isBaseChild", self.installer)
 
     def test_launcher_ownership_is_scoped_to_the_exact_run_script(self):
         self.assertIn('$runScript = Join-Path $PSScriptRoot "run.ps1"', self.installer)
