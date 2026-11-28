@@ -252,8 +252,15 @@ h1 { margin: 0; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spa
 .todo-item a:hover { text-decoration: underline; }
 .todo-action { overflow-wrap: anywhere; }
 .todo-meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
-.todo-command { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; }
-.todo-command code { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.copy-block { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0; }
+.copy-block code { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.rich-text { margin: 0 0 4px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.inline-code { padding: 1px 5px; border-radius: 5px; background: #0a111b; font-size: .92em; cursor: copy; }
+.section-hint { margin: 0 0 6px; color: var(--muted); font-size: 11px; font-style: italic; }
+.entry-kind { display: inline-block; margin-right: 4px; padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.entry-kind.log { border: 1px solid #44516a; color: #bac7da; }
+.entry-kind.message { border: 1px solid #3d7f73; color: var(--accent-strong); }
+.note-meta { margin-bottom: 4px; }
 .copy { flex: none; padding: 4px 9px; cursor: pointer; font-size: 11px; }
 .task.flash { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(112, 215, 189, .35); }
 .content { display: grid; grid-template-columns: minmax(0, 1fr) 330px; align-items: start; gap: 18px; }
@@ -439,6 +446,90 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     return node('p', 'empty', text);
   }
 
+  async function copyText(text, button) {
+    try { await navigator.clipboard.writeText(text); button.textContent = 'Copied'; }
+    catch (err) { button.textContent = 'Select and copy'; }
+    window.setTimeout(() => { button.textContent = 'Copy'; }, 2000);
+  }
+
+  // A command or text to paste, with a Copy button.
+  function copyBlock(text) {
+    const row = node('div', 'copy-block');
+    const copy = node('button', 'copy', 'Copy');
+    copy.type = 'button';
+    copy.addEventListener('click', event => { event.preventDefault(); void copyText(text, copy); });
+    row.append(node('code', '', text), copy);
+    return row;
+  }
+
+  // Text from agents, as DOM nodes (never HTML). Copy blocks for: ``` fences,
+  // the command after "run:" / "run this one line:" / "command:", and lines that
+  // start with "$ ". `inline code` shows as code; tap it to copy.
+  function richText(text, className) {
+    const box = node('div', 'rich ' + (className || ''));
+    const source = String(text || '');
+    const fence = /```[\w-]*\n?([\s\S]*?)```/g;
+    let last = 0;
+    let match;
+    while ((match = fence.exec(source)) !== null) {
+      plainText(box, source.slice(last, match.index));
+      if (match[1].trim()) box.append(copyBlock(match[1].replace(/\n$/, '')));
+      last = fence.lastIndex;
+    }
+    plainText(box, source.slice(last));
+    return box;
+  }
+
+  function plainText(box, text) {
+    if (!text.trim()) return;
+    const run = /\b(?:run(?: this)?(?: one)?(?: line)?|command):\s*(\S[\s\S]*)$/i.exec(text);
+    let body = text;
+    let command = '';
+    if (run) {
+      body = text.slice(0, run.index + run[0].length - run[1].length);
+      command = run[1].trim().replace(/^`([^`]+)`$/, '$1');
+    }
+    const lines = body.split('\n');
+    let para = [];
+    const flush = () => {
+      if (para.join('').trim()) box.append(inlineCode(para.join('\n').replace(/^\n+|\n+$/g, '')));
+      para = [];
+    };
+    lines.forEach(line => {
+      if (/^\s*\$ \S/.test(line)) { flush(); box.append(copyBlock(line.replace(/^\s*\$ /, ''))); }
+      else para.push(line);
+    });
+    flush();
+    if (command) box.append(copyBlock(command));
+  }
+
+  function inlineCode(text) {
+    const p = node('p', 'rich-text');
+    text.split(/(`[^`\n]+`)/).forEach(part => {
+      if (/^`[^`]+`$/.test(part)) {
+        const code = node('code', 'inline-code', part.slice(1, -1));
+        code.title = 'Tap to copy';
+        code.addEventListener('click', () => { void navigator.clipboard.writeText(part.slice(1, -1)).catch(() => {}); });
+        p.append(code);
+      } else if (part) {
+        p.append(document.createTextNode(part));
+      }
+    });
+    return p;
+  }
+
+  // Note prefixes the worklog adds, as a label for each activity entry.
+  const NOTE_KINDS = {'check-in': 'Check-in', 'blocked': 'Blocked', 'done': 'Done', 'dropped': 'Dropped',
+                      'released': 'Released'};
+
+  function noteKind(text) {
+    const match = /^\[([a-z-]+)\]\s*/i.exec(String(text || ''));
+    if (match && NOTE_KINDS[match[1].toLowerCase()]) {
+      return [NOTE_KINDS[match[1].toLowerCase()], String(text).slice(match[0].length)];
+    }
+    return ['Note', String(text || '')];
+  }
+
   function formatTime(value) {
     const seconds = Number(value);
     if (!Number.isFinite(seconds) || seconds <= 0) return '—';
@@ -619,9 +710,11 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
 
     const body = node('div', 'task-body');
     body.append(section(task, 'description', 'Description', true,
-      node('p', 'description', task.desc || 'No description.')));
+      richText(task.desc || 'No description.', 'description')));
     if (task.result) {
-      body.append(section(task, 'result', 'Result', true, node('p', 'description', task.result)));
+      body.append(section(task, 'result', 'Status report', true,
+        node('p', 'section-hint', 'What the owner wrote when it last finished or blocked this task.'),
+        richText(task.result, 'description')));
     }
     body.append(section(task, 'reply', ['done', 'dropped'].includes(task.status) ? 'Reply' : 'Reply or drop',
       true, replyForm(task)));
@@ -637,21 +730,29 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
       const list = node('ol', 'notes');
       timeline.forEach(entry => {
         if (entry.kind === 'note') {
+          const [kind, text] = noteKind(entry.note.text);
           const item = node('li', 'note');
-          item.append(node('p', 'note-text', entry.note.text));
-          item.append(node('div', 'note-meta', (entry.note.by || 'Unknown worker') + ' · ' + formatTime(entry.note.at)));
+          const meta = node('div', 'note-meta');
+          meta.append(node('span', 'entry-kind log', 'Log · ' + kind),
+            document.createTextNode(' ' + (entry.note.by || 'Unknown worker') + ' · ' + formatTime(entry.note.at)));
+          item.append(meta, richText(text, 'note-text'));
           list.append(item);
         } else {
           const item = node('li', 'note thread-message');
-          item.append(node('p', '', entry.message.text));
-          item.append(node('div', 'note-meta', (entry.message.sender || 'Unknown sender') + ' → ' +
-            (entry.message.to || 'Unknown recipient') + ' · ' + formatTime(entry.message.at)));
+          const meta = node('div', 'note-meta');
+          meta.append(node('span', 'entry-kind message', 'Message'),
+            document.createTextNode(' ' + (entry.message.sender || 'Unknown sender') + ' → ' +
+              (entry.message.to || 'Unknown recipient') + ' · ' + formatTime(entry.message.at)));
+          item.append(meta, richText(entry.message.text));
           list.append(item);
         }
       });
       entries.push(list);
     }
-    body.append(section(task, 'timeline', 'Notes and messages · ' + timeline.length, true, ...entries));
+    body.append(section(task, 'timeline', 'Activity · ' + timeline.length, true,
+      node('p', 'section-hint', 'Newest first. Log: what agents recorded on the task (check-ins, notes, ' +
+        'status changes). Message: sent between you and the agents; use Reply to add one.'),
+      ...entries));
 
     const fields = node('div', 'fields');
     fields.append(
@@ -727,17 +828,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         line.append(link, document.createTextNode(' ' + item.action));
         li.title = item.reason;
         li.append(line, node('div', 'todo-meta', (item.title || '') + ' · ' + (item.owner || 'no owner')));
-        if (item.command) {
-          const row = node('div', 'todo-command');
-          const copy = node('button', 'copy', 'Copy');
-          copy.type = 'button';
-          copy.addEventListener('click', async () => {
-            try { await navigator.clipboard.writeText(item.command); copy.textContent = 'Copied'; }
-            catch (err) { copy.textContent = 'Select and copy'; }
-          });
-          row.append(node('code', '', item.command), copy);
-          li.append(row);
-        }
+        if (item.command) li.append(copyBlock(item.command));
         list.append(li);
       });
       details.append(summary, list);

@@ -480,7 +480,8 @@ shared worklog with the `wl` command (on your PATH; you are worker {worker}).
   holds it. Give one line that the user can copy and run. If the command needs
   more than one line, write a script in your repo and give the one-line
   command that runs it (e.g. `sudo bash /full/path/fix.sh`). Say on which
-  machine to run it.
+  machine to run it. Write the command after "run:" or in backticks; the
+  dashboard then shows it with a Copy button.
 - Open tasks in your project are your work. When you finish a task and hold no
   claim, run `wl next` and take the task it shows (or give it to a subagent).
   When you are idle, the harness also offers you the best open task in your
@@ -509,7 +510,7 @@ def _instance_for_worker(worker: str) -> Instance | None:
 
 # Raise this when the onboarding (_HARNESS_BRIEF / _WORKLOG_BRIEF) changes:
 # existing sessions then get the new version once, on their next turn.
-BRIEF_VERSION = 8
+BRIEF_VERSION = 9
 
 _BRIEF_UPDATED = """\
 [the harness onboarding below was updated; read all of it again and follow it

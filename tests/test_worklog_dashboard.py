@@ -179,7 +179,10 @@ class PageTests(unittest.TestCase):
         self.assertIn("node('details', 'area')", self.html)
         self.assertIn("node('details', 'task')", self.html)
         self.assertIn("latestStatus", self.html)
-        self.assertIn("'Notes and messages · '", self.html)
+        self.assertIn("'Activity · '", self.html)
+        self.assertIn("'Status report'", self.html)
+        self.assertIn("richText(task.result, 'description')", self.html)
+        self.assertIn("'Log · ' + kind", self.html)
         self.assertIn(".sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))", self.html)
         self.assertIn("section(task, 'information', 'Information', false, fields)", self.html)
         self.assertIn("node('details', 'section')", self.html)
@@ -261,7 +264,7 @@ class TodoTests(unittest.TestCase):
         self.assertIn("To do for you", html)
         self.assertIn("link.href = '#task-' + item.num", html)
         self.assertIn("details.id = 'task-' + task.num", html)
-        self.assertIn("navigator.clipboard.writeText(item.command)", html)
+        self.assertIn("if (item.command) li.append(copyBlock(item.command));", html)
         self.assertIn("hashchange", html)
 
     def test_page_has_drop_button_next_to_reply(self):
