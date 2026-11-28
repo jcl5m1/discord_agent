@@ -34,7 +34,7 @@ import discord
 from aiohttp import web
 
 from . import config, worklog_dashboard
-from .worklog import (CHECKIN_EVERY, CommandError, Worklog, area_keys, area_matches, decode, encode, fmt_time,
+from .worklog import (CHECKIN_EVERY, GONE_AFTER, CommandError, Worklog, area_keys, area_matches, decode, encode, fmt_time,
                       run_command, summary)
 
 log = logging.getLogger("discord_agent.worklog")
@@ -42,6 +42,7 @@ log = logging.getLogger("discord_agent.worklog")
 # The worker name for actions the user takes in the dashboard (replies and drops).
 DASHBOARD_WORKER = "human:dashboard"
 
+UPDATE_CATCH_UP = 6 * 3600  # a machine that was offline still runs an `/update all` this recent
 SETTLE = 2.5  # seconds after posting before a change is confirmed
 REMIND_AT = CHECKIN_EVERY - 5 * 60  # remind this long after the last check-in
 WAKE_LIMIT = 12  # deliveries that start a turn, per worker per hour
@@ -59,12 +60,15 @@ class WorklogService:
         notify: Callable[[str, str], Awaitable[None]],
         idle_for: Callable[[str], float | None] | None = None,
         active: Callable[[str], bool] | None = None,
+        on_update: Callable[[int, dict], Awaitable[None]] | None = None,
     ):
         """deliver(worker, sender, text) hands a message to that worker's agent;
         notify(worker, text) posts a line in that worker's Discord channel;
         idle_for(worker) is how long that worker's agent has been idle, in seconds
         (None: busy, stopped, or not one to offer work to). active(worker) is true
-        while its provider process still exists."""
+        while its provider process still exists. on_update(request id, request) runs
+        this machine's part of an `/update all` request."""
+        self.on_update = on_update
         self.idle_for = idle_for
         self.active = active
         self._offers: dict[int, tuple[str, float]] = {}  # task -> (worker, when) it was last offered
@@ -135,6 +139,8 @@ class WorklogService:
                  len(self.state.workers))
         asyncio.get_running_loop().create_task(self._duty_loop())
         asyncio.get_running_loop().create_task(self._after_restart())
+        for req in self.missed_updates():
+            self._start_update(req)
         await self._serve()
 
     async def _find_channel(self, guild: discord.Guild) -> discord.TextChannel:
@@ -216,6 +222,31 @@ class WorklogService:
         ok, _ = self.state.apply(msg.id, ev)
         if ok and msg.id > self.live_from:
             await self._side_effects(ev, self.state.messages[before:])
+            if ev.get("op") == "update":
+                self._start_update(msg.id)
+
+    # ------------------------------------------------------------- /update all
+    def _start_update(self, req: int) -> None:
+        if self.on_update is not None and req in self.state.updates:
+            asyncio.get_running_loop().create_task(self.on_update(req, self.state.updates[req]))
+
+    def missed_updates(self, now: float | None = None) -> list[int]:
+        """Recent `/update all` requests this machine has not answered (it was offline)."""
+        now = time.time() if now is None else now
+        return [req for req, u in self.state.updates.items()
+                if now - u["at"] < UPDATE_CATCH_UP and self.machine not in u["results"]]
+
+    def bot_machines(self, now: float | None = None) -> set[str]:
+        """Machines with a harness bot seen recently: the ones an update should reach."""
+        now = time.time() if now is None else now
+        return {w.machine for w in self.state.workers.values()
+                if w.bot and w.machine and now - w.seen < GONE_AFTER}
+
+    async def report_update(self, req: int, ok: bool, text: str, old: str = "", new: str = "") -> None:
+        await self.post({
+            "op": "updated", "by": f"harness@{self.machine}", "req": req, "machine": self.machine,
+            "ok": ok, "text": text, "old": old, "new": new,
+        }, settle=0)
 
     async def post(self, ev: dict, settle: float = SETTLE) -> tuple[bool, str]:
         """Post an event, wait for it to settle, and report its outcome."""

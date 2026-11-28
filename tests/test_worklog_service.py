@@ -231,6 +231,46 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
             "(re #1) The user dropped #1 from the dashboard. Stop work on it. Reason: Not needed now",
         )])
 
+    async def test_update_all_reaches_every_bot_and_collects_results(self):
+        calls = []
+
+        def on_update(service):
+            async def run(req, request):
+                calls.append((service.machine, req, request["force"]))
+                await service.report_update(req, True, "pulled; restarting", "aaa", "bbb")
+            return run
+
+        self.a.on_update, self.b.on_update = on_update(self.a), on_update(self.b)
+        self.assertEqual(self.a.bot_machines(), {"m1", "m2"})
+        ok, _ = await self.a.post({"op": "update", "by": "human:tester", "force": True,
+                                   "machine": "m1", "channel": 55})
+        self.assertTrue(ok)
+        await asyncio.sleep(1.0)
+        req = next(iter(self.a.state.updates))
+        self.assertEqual(sorted(calls), [("m1", req, True), ("m2", req, True)])
+        for service in (self.a, self.b):
+            u = service.state.updates[req]
+            self.assertEqual((u["machine"], u["channel"], u["by"]), ("m1", 55, "human:tester"))
+            self.assertEqual(sorted(u["results"]), ["m1", "m2"])
+            self.assertEqual(u["results"]["m2"]["new"], "bbb")
+        self.assertEqual(self.a.missed_updates(), [])
+
+        # A bot that starts later (it was offline) runs the request it missed, once.
+        late = []
+
+        async def late_update(req, request):
+            late.append(req)
+
+        with mock.patch.object(svc.WorklogService, "_serve", mock.AsyncMock()):
+            c = await self.bot(3)
+        c.machine = "m3"
+        self.assertEqual(c.missed_updates(), [req])
+        c.on_update = late_update
+        c._start_update(req)
+        await asyncio.sleep(0.05)
+        self.assertEqual(late, [req])
+        self.assertEqual(c.missed_updates(now=time.time() + svc.UPDATE_CATCH_UP + 1), [])
+
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")
         await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl

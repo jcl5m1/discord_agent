@@ -30,7 +30,7 @@ GONE_AFTER_TERMINAL = 86400  # ... and a worker no harness bot runs (a terminal 
 STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
-       "reopen", "drop", "lease", "unlease", "send", "depends", "pass"}
+       "reopen", "drop", "lease", "unlease", "send", "depends", "pass", "update", "updated"}
 
 
 def event_time(event_id: int) -> float:
@@ -112,6 +112,9 @@ class Worklog:
         self.messages: list[Message] = []
         self.history: list[tuple[float, str, str]] = []  # (time, who, what)
         self.results: dict[int, tuple[bool, str]] = {}  # event id -> outcome
+        # `/update all` requests, by event id: who asked, when, where to report, and
+        # each machine's result ({machine: {"ok", "text", "old", "new", "at"}}).
+        self.updates: dict[int, dict] = {}
         self.last_id = 0
         self._event_id = 0
 
@@ -310,6 +313,29 @@ class Worklog:
         task = ev.get("task")
         self.messages.append(Message(self._event_id, by, to, int(task) if task else None, t, text))
         return True, f"sent to {to}"
+
+    def _op_update(self, by, t, ev):
+        self.updates[self._event_id] = {
+            "by": by, "at": t, "force": bool(ev.get("force")),
+            "machine": str(ev.get("machine", "")), "channel": int(ev.get("channel") or 0),
+            "results": {},
+        }
+        return True, f"{by} asked every harness to update" + (" (force)" if ev.get("force") else "")
+
+    def _op_updated(self, by, t, ev):
+        try:
+            req = int(ev.get("req"))
+        except (TypeError, ValueError):
+            return False, "no update request id"
+        machine = str(ev.get("machine", "")).strip()
+        if req not in self.updates or not machine:
+            return False, f"no update request {req}"
+        text = str(ev.get("text", "")).strip()
+        self.updates[req]["results"][machine] = {
+            "ok": bool(ev.get("ok")), "text": text, "old": str(ev.get("old", "")),
+            "new": str(ev.get("new", "")), "at": t,
+        }
+        return True, f"{machine} update: {text}"
 
     # ------------------------------------------------------------------ reads
     def inbox(self, worker: str, read: set[int]) -> list[Message]:
@@ -648,6 +674,8 @@ def summary(ev: dict) -> str:
         "pass": f"↪️ {by} passes on #{num}: {text[:300]}",
         "lease": f"🔑 {by} leases {ev.get('res')} ({ev.get('ttl')}s): {ev.get('why', '')}",
         "unlease": f"🔓 {by} released lease {ev.get('res')}",
+        "update": f"⬇️ {by} asks every harness to update" + (" (force)" if ev.get("force") else ""),
+        "updated": ("✅" if ev.get("ok") else "❌") + f" {ev.get('machine')} update: {text[:300]}",
         "send": f"✉️ {by} → {ev.get('to')}" + (f" re #{ev['task']}" if ev.get("task") else "")
                 + f": {text[:300]}",
     }.get(op, f"{op} by {by}")

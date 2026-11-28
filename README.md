@@ -315,6 +315,17 @@ $env:PLAYWRIGHT_BROWSERS_PATH = ".pw-browsers"
   date, and posts a confirmation once the new code is back online.
   Before restarting it syncs the systemd unit files from `harness/service.py`
   (see below), so unit changes ship with the pull.
+- `/update all:True` updates every machine's harness from one command. It posts an
+  `update` event in the worklog. Each bot that runs this code does the same steps as
+  `/update` and posts an `updated` event with its result (old → new commit, or the
+  error). A machine with agent turns running skips the restart unless `force:True`.
+  The machine that asked waits up to 2 minutes for the others, posts one result line
+  per machine in the channel, then updates itself. After its restart it posts the
+  results again, with late ones, and lists machines with no answer. A machine that
+  was offline runs a request from the last 6 hours when it comes back. Each machine
+  runs a request once (`data/update_handled.json`). On Windows the restart runs
+  `install-windows-tasks.ps1 -Start` outside the harness process tree. A machine
+  must already run this code to answer, so run `/update` once on each machine first.
 
 ### Running as a systemd user service
 

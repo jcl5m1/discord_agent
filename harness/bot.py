@@ -1060,7 +1060,8 @@ async def on_ready() -> None:
     global worklog
     if config.WORKLOG_ENABLED and worklog is None and (g := client.get_guild(config.GUILD_ID)):
         worklog = WorklogService(
-            client, _worklog_deliver, _worklog_notify, _worklog_idle_for, _worklog_active
+            client, _worklog_deliver, _worklog_notify, _worklog_idle_for, _worklog_active,
+            on_update=_worklog_update,
         )
         asyncio.get_running_loop().create_task(_start_worklog(g))
     elif worklog is not None and worklog.ready.is_set():
@@ -2932,9 +2933,20 @@ def _restart_harness() -> None:
         )
         # --no-block queues the job and returns before systemd kills this process.
         subprocess.Popen(["systemctl", "--user", "--no-block", "restart", unit])
+    elif os.name == "nt" and (config.BASE_DIR / "install-windows-tasks.ps1").exists():
+        # Task Scheduler runs the harness. install-windows-tasks.ps1 -Start stops every
+        # owned process tree (this one too) and starts the tasks again (#192). `start`
+        # runs it outside this process tree, so the tree kill does not stop it.
+        subprocess.Popen(_windows_restart_cmd(), cwd=config.BASE_DIR)
     else:
         os.chdir(config.BASE_DIR)
         os.execv(sys.executable, [sys.executable, "-m", "harness.bot"])
+
+
+def _windows_restart_cmd() -> list[str]:
+    script = str(config.BASE_DIR / "install-windows-tasks.ps1")
+    return ["cmd.exe", "/c", "start", '""', "/b", "powershell.exe", "-NoProfile", "-ExecutionPolicy",
+            "Bypass", "-WindowStyle", "Hidden", "-File", script, "-Start"]
 
 
 async def _announce_update() -> None:
@@ -2948,36 +2960,33 @@ async def _announce_update() -> None:
         channel = client.get_channel(info["channel_id"])
         if channel is not None:
             await channel.send(f"✅ harness back online on `{head}` (was `{info['old']}`)")
+        if channel is not None and info.get("req"):
+            # An `/update all` this machine asked for: report every machine once more,
+            # with the results that came in while it restarted.
+            for _ in range(60):
+                if worklog is not None and worklog.ready.is_set():
+                    break
+                await asyncio.sleep(2)
+            await asyncio.sleep(30)
+            await channel.send("**/update all results**\n" + _update_report(int(info["req"])))
     except Exception:
         log.exception("could not announce update")
 
 
-@tree.command(name="update", description="Pull the latest harness code from GitHub and restart")
-@discord.app_commands.describe(
-    force="Restart even if already up to date or while agent turns are running"
-)
-@discord.app_commands.default_permissions(administrator=True)
-async def cmd_update(interaction: discord.Interaction, force: bool = False) -> None:
-    working = [t for t in _active_turns.values() if not t.get("waiting_background")]
-    if working and not force:
-        names = ", ".join(t["instance"] for t in working)
-        await interaction.response.send_message(
-            f"⏳ {len(working)} turn(s) running ({names}); a restart would kill them. "
-            "Retry when they finish, or use `force:True`."
-        )
-        return
-    await interaction.response.defer()
-    log.info("/update by %s (force=%s)", interaction.user, force)
+async def _update_steps(force: bool) -> tuple[str, list[str], str, str]:
+    """Pull the latest code and get it ready to run; the caller restarts.
 
+    Returns (outcome, report lines, old commit, new commit). The outcome is
+    "error" (nothing changed that needs a restart), "current" (already up to
+    date, no restart) or "restart".
+    """
     _, old = await _run_cmd("git", "rev-parse", "--short", "HEAD")
     rc, pull_out = await _run_cmd("git", "pull", "--ff-only")
     if rc != 0:
-        await interaction.followup.send(f"❌ `git pull` failed, not restarting:\n```\n{pull_out[-1500:]}\n```")
-        return
+        return "error", [f"❌ `git pull` failed, not restarting:\n```\n{pull_out[-1500:]}\n```"], old, old
     _, new = await _run_cmd("git", "rev-parse", "--short", "HEAD")
     if old == new and not force:
-        await interaction.followup.send(f"✅ already up to date at `{new}` — not restarting.")
-        return
+        return "current", [f"✅ already up to date at `{new}` — not restarting."], old, new
 
     lines = [f"⬇️ `{old}` → `{new}`"]
     if old != new:
@@ -2987,28 +2996,143 @@ async def cmd_update(interaction: discord.Interaction, force: bool = False) -> N
         if "requirements.txt" in changed.split():
             rc, pip_out = await _run_cmd(*service.pip_install_cmd())
             if rc != 0:
-                await interaction.followup.send(
-                    "\n".join(lines)
-                    + f"\n❌ dependency install failed, not restarting:\n```\n{pip_out[-1200:]}\n```"
-                )
-                return
+                lines.append(f"❌ dependency install failed, not restarting:\n```\n{pip_out[-1200:]}\n```")
+                return "error", lines, old, new
             lines.append("📦 dependencies updated")
-    # Unit-file sync runs from the new code, so template changes land with the pull.
-    rc, units_out = await _run_cmd(sys.executable, "-m", "harness.service")
-    if rc != 0:
+    if os.name != "nt":
+        # Unit-file sync runs from the new code, so template changes land with the pull.
+        rc, units_out = await _run_cmd(sys.executable, "-m", "harness.service")
+        if rc != 0:
+            lines.append(f"❌ service file sync failed, not restarting:\n```\n{units_out[-1200:]}\n```")
+            return "error", lines, old, new
+        if units_out.startswith("updated"):
+            lines.append(f"🛠️ systemd units {units_out}")
+    lines.append("🔄 restarting…")
+    return "restart", lines, old, new
+
+
+def _busy_turns() -> list[str]:
+    """Instances with an agent turn that a restart would kill."""
+    return [t["instance"] for t in _active_turns.values() if not t.get("waiting_background")]
+
+
+@tree.command(name="update", description="Pull the latest harness code from GitHub and restart")
+@discord.app_commands.describe(
+    force="Restart even if already up to date or while agent turns are running",
+    all="Update every machine's harness (through the worklog) and report each result here",
+)
+@discord.app_commands.default_permissions(administrator=True)
+async def cmd_update(interaction: discord.Interaction, force: bool = False, all: bool = False) -> None:
+    if all:
+        if worklog is None or not worklog.ready.is_set():
+            await interaction.response.send_message("The worklog isn't running on this machine; "
+                                                    "`all:True` needs it.")
+            return
+        await interaction.response.defer()
+        log.info("/update all by %s (force=%s)", interaction.user, force)
+        ok, text = await worklog.post({
+            "op": "update", "by": f"human:{interaction.user.name}", "force": force,
+            "machine": worklog.machine, "channel": interaction.channel_id,
+        })
+        machines = sorted(worklog.bot_machines())
         await interaction.followup.send(
-            "\n".join(lines)
-            + f"\n❌ service file sync failed, not restarting:\n```\n{units_out[-1200:]}\n```"
+            (f"⬇️ Update requested on {len(machines)} machines: {', '.join(machines)}. "
+             f"Each reports here when it has pulled; this machine updates last."
+             + ("" if force else " A machine with agent turns running skips the restart (use `force:True`)."))
+            if ok else f"❌ The update request was refused: {text}"
         )
         return
-    if units_out.startswith("updated"):
-        lines.append(f"🛠️ systemd units {units_out}")
-    lines.append("🔄 restarting…")
+    working = _busy_turns()
+    if working and not force:
+        await interaction.response.send_message(
+            f"⏳ {len(working)} turn(s) running ({', '.join(working)}); a restart would kill them. "
+            "Retry when they finish, or use `force:True`."
+        )
+        return
+    await interaction.response.defer()
+    log.info("/update by %s (force=%s)", interaction.user, force)
+    outcome, lines, old, _ = await _update_steps(force)
     await interaction.followup.send("\n".join(lines))
-
+    if outcome != "restart":
+        return
     UPDATE_MARKER.write_text(json.dumps({"channel_id": interaction.channel_id, "old": old}))
     await asyncio.sleep(1)  # let the followup flush before the process goes away
     _restart_harness()
+
+
+UPDATE_HANDLED = config.DATA_DIR / "update_handled.json"
+UPDATE_WAIT = 120  # the asking machine waits this long for the others before it updates itself
+
+
+def _update_handled(req: int) -> bool:
+    """Mark an `/update all` request as handled here; True if it already was.
+
+    Kept on disk, so a restart (or a report that failed to post) never runs it twice.
+    """
+    try:
+        done = set(json.loads(UPDATE_HANDLED.read_text()))
+    except (OSError, ValueError):
+        done = set()
+    if req in done:
+        return True
+    UPDATE_HANDLED.write_text(json.dumps(sorted(done | {req})[-50:]))
+    return False
+
+
+def _update_report(req: int) -> str:
+    """One line per machine for an `/update all` request, plus machines with no answer yet."""
+    if worklog is None or req not in worklog.state.updates:
+        return "No results for this update."
+    results = worklog.state.updates[req]["results"]
+    lines = []
+    for machine in sorted(results):
+        r = results[machine]
+        move = f"`{r['old']}` → `{r['new']}`" if r["old"] and r["new"] and r["old"] != r["new"] else ""
+        lines.append(f"{'✅' if r['ok'] else '❌'} **{machine}** {move} {r['text']}".replace("  ", " "))
+    missing = sorted(worklog.bot_machines() - set(results))
+    if missing:
+        lines.append("⏳ no answer yet: " + ", ".join(missing))
+    return "\n".join(lines)
+
+
+async def _worklog_update(req: int, request: dict) -> None:
+    """This machine's part of an `/update all` request (from the worklog)."""
+    if worklog is None or _update_handled(req):
+        return
+    asker = request.get("machine") == worklog.machine
+    force = bool(request.get("force"))
+    if asker:  # update last, so this machine can report the others' results first
+        deadline = time.monotonic() + UPDATE_WAIT
+        while time.monotonic() < deadline:
+            others = worklog.bot_machines() - {worklog.machine}
+            if others <= set(worklog.state.updates[req]["results"]):
+                break
+            await asyncio.sleep(5)
+    working = _busy_turns()
+    if working and not force:
+        await worklog.report_update(
+            req, False, f"skipped: {len(working)} agent turn(s) running ({', '.join(working)}); "
+                        "retry or use force")
+        outcome = "skipped"
+    else:
+        try:
+            outcome, lines, old, new = await _update_steps(force)
+        except Exception as e:
+            log.exception("/update all failed here")
+            outcome, lines, old, new = "error", [f"❌ {e}"], "", ""
+        text = {"restart": "pulled; restarting", "current": "already up to date"}.get(
+            outcome, lines[-1].split("\n")[0].lstrip("❌ ")[:300])
+        await worklog.report_update(req, outcome != "error", text, old, new)
+    channel = client.get_channel(request.get("channel") or 0) if asker else None
+    if channel is not None:
+        await channel.send("**/update all results**\n" + _update_report(req))
+    if outcome == "restart":
+        if asker:
+            UPDATE_MARKER.write_text(json.dumps({
+                "channel_id": request.get("channel"), "old": old, "req": req,
+            }))
+        await asyncio.sleep(1)
+        _restart_harness()
 
 
 @tree.error
