@@ -566,12 +566,37 @@ class WorklogService:
             {"ok": ok, "text": outcome}, status=200 if ok else 409, headers={"Cache-Control": "no-store"}
         )
 
+    async def _dashboard_area(self, request: web.Request) -> web.Response:
+        """Add a note or a web link to an area's details from the dashboard."""
+        if not self._dashboard_authorized(request):
+            return web.json_response({"ok": False, "text": "bad worklog token"}, status=403)
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        fields = {k: body.get(k, "") for k in ("area", "note", "link", "label", "unlink")}
+        if not all(isinstance(v, str) for v in fields.values()) or not fields["area"].strip() \
+                or not any(fields[k].strip() for k in ("note", "link", "unlink")) \
+                or len(fields["note"]) > 4000:
+            return web.json_response({"ok": False, "text": "area, and a note (at most 4000 characters), link or unlink required"},
+                                     status=400)
+        argv = ["area", fields["area"].strip()]
+        for key in ("note", "link", "label", "unlink"):
+            if fields[key].strip():
+                argv += [f"--{key}", fields[key].strip()]
+        ok, outcome = await self.run(argv, self._dashboard_user(request))
+        return web.json_response({"ok": ok, "text": outcome}, status=200 if ok else 400,
+                                 headers={"Cache-Control": "no-store"})
+
     async def _serve(self) -> None:
         app = web.Application()
         app.router.add_get("/", self._dashboard_page)
         app.router.add_get("/state", self._dashboard_state)
         app.router.add_post("/reply", self._dashboard_reply)
         app.router.add_post("/drop", self._dashboard_drop)
+        app.router.add_post("/area", self._dashboard_area)
         app.router.add_post("/wl", self._handle)
         runner = web.AppRunner(app)
         await runner.setup()

@@ -436,7 +436,12 @@ provides it, so sessions don't each build their own.
   stop). A "To do for you" panel at the top groups the blocked tasks that wait for the
   user by action (go-ahead, run a command, phone test, accounts, decide, parked); each
   item links to its task (`#task-<n>`), and a command in the block message gets a Copy
-  button. The status chips filter the list (default: open and blocked; tap to toggle,
+  button. When a task asks only for the user's OK, the item and the task's Reply row get
+  **Send OK** ("OK, go ahead."); when it asks the user to run a command, the item gets
+  **Done**. Each area has **Area details**: web links (shown as chips in the area's
+  title row) and notes, shared through the worklog. Agents set links with
+  `wl area <name> --link URL --label NAME`; the user adds notes and links in the page.
+  The status chips filter the list (default: open and blocked; tap to toggle,
   tap Total for all). Search, worker/lease summaries, and a 10-second auto-refresh are
   included. It uses the public proxy when configured, otherwise a loopback URL. Use
   `/worklog command:"status"` or another explicit command for text output.

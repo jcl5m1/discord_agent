@@ -27,6 +27,7 @@ The project-agnostic worklog dashboard uses its own token and fixed upstream:
     GET /agents/_worklog/<token>/state
     POST /agents/_worklog/<token>/reply
     POST /agents/_worklog/<token>/drop
+    POST /agents/_worklog/<token>/area
 """
 
 from __future__ import annotations
@@ -188,10 +189,10 @@ async def _files_root_redirect(request: web.Request) -> web.Response:
 
 async def _worklog(request: web.Request) -> web.Response:
     path = request.match_info["path"]
-    if path not in ("", "state", "reply", "drop"):
+    if path not in ("", "state", "reply", "drop", "area"):
         return web.Response(status=404, text="not found")
     read = request.method in ("GET", "HEAD") and path in ("", "state")
-    post = request.method == "POST" and path in ("reply", "drop")
+    post = request.method == "POST" and path in ("reply", "drop", "area")
     if not read and not post:
         return web.Response(status=405, text="method not allowed")
     upstream_path = "/" if path == "" else f"/{path}"

@@ -276,6 +276,26 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(late, [req])
         self.assertEqual(c.missed_updates(now=time.time() + svc.UPDATE_CATCH_UP + 1), [])
 
+    async def test_dashboard_area_note_and_link_from_tailscale_user(self):
+        auth = {"X-Worklog-Token": self.b.token, "Tailscale-User-Login": "jo@example.com"}
+        async with ClientSession() as client:
+            for body in ({"note": "x"}, {"area": " ", "note": "x"}, {"area": "a", "note": 5},
+                         {"area": "a", "note": "x" * 4001}, {"area": "a"},
+                         {"area": "a", "link": "ftp://nope"}):
+                async with client.post(f"{self.b.url}/area", json=body, headers=auth) as response:
+                    self.assertEqual(response.status, 400, body)
+            async with client.post(f"{self.b.url}/area", json={"area": "Harness", "note": "Use /update all"},
+                                   headers=auth) as response:
+                self.assertEqual(response.status, 200)
+            async with client.post(f"{self.b.url}/area", json={"area": "harness", "link": "https://h.ts.net/",
+                                                               "label": "Worklog"}, headers=auth) as response:
+                self.assertEqual(response.status, 200)
+        await asyncio.sleep(0.3)
+        for service in (self.a, self.b):
+            info = service.state.areas["harness"]
+            self.assertEqual(info["links"], {"Worklog": "https://h.ts.net/"})
+            self.assertEqual(info["notes"][0][1:], ("jo@example.com", "Use /update all"))
+
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")
         await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl

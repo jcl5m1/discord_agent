@@ -31,6 +31,20 @@ _TODO_RES = [(key, title, re.compile(pattern, re.I)) for key, title, pattern in 
 # The command a block reason gives to run: the text after the last "run:" or "run this one line:".
 _COMMAND_RE = re.compile(r"\brun(?: this(?: one)?(?: line)?)?:\s*(.+)$", re.I | re.S)
 SUMMARY_LIMIT = 140
+# A block reason that asks only for the user's OK (the dashboard offers "Send OK")...
+_CONFIRM_RE = re.compile(r"go-ahead|\bapprov|\bconfirm|\buser'?s? (explicit )?ok\b|\byour ok\b|\bneeds? ok\b|\bok to\b",
+                         re.I)
+# ... unless it asks the user to choose between options.
+_CHOICE_RE = re.compile(r"\b(pick|choose|options?|which one|decisions)\b", re.I)
+
+
+def _answer(key: str, reason: str) -> str:
+    """The one-tap answer the dashboard offers: "ok" (confirm), "done" (ran the command) or ""."""
+    if key == "run":
+        return "done"
+    if key == "approve" or (_CONFIRM_RE.search(reason) and not _CHOICE_RE.search(reason)):
+        return "ok"
+    return ""
 
 
 _NEED_RE = re.compile(r"\b(needs?|wait(s|ing)?|requires?)\b", re.I)
@@ -83,6 +97,7 @@ def todo(state: Worklog) -> list[dict]:
             "action": action,
             "command": command,
             "reason": reason,
+            "answer": _answer(key, reason),
         })
     groups = []
     for key, title, _ in TODO_GROUPS:
@@ -147,6 +162,9 @@ def snapshot(state: Worklog, machine: str, now: float | None = None) -> dict:
         "machine": machine,
         "tasks": tasks,
         "todo": todo(state),
+        "areas": {key: {"name": info["name"], "links": dict(info["links"]),
+                        "notes": [_entry(note) for note in info["notes"]]}
+                  for key, info in sorted(state.areas.items())},
         "workers": workers,
         "leases": leases,
         "history": [_entry(item) for item in state.history[-HISTORY_LIMIT:]],
@@ -252,6 +270,16 @@ h1 { margin: 0; font-size: clamp(27px, 4vw, 38px); line-height: 1.15; letter-spa
 .todo-item a:hover { text-decoration: underline; }
 .todo-action { overflow-wrap: anywhere; }
 .todo-meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.area-link { flex: none; padding: 2px 9px; border: 1px solid #3f6e91; border-radius: 999px; color: var(--blue); font-size: 12px; font-weight: 650; text-decoration: none; }
+.area-link:hover { background: rgba(52, 105, 145, .2); }
+.area-details { margin: 0 4px 12px; padding: 4px 10px 8px; border: 1px dashed #334158; border-radius: 10px; }
+.area-links { margin: 6px 0; padding-left: 18px; }
+.area-links a { color: var(--blue); font-weight: 650; }
+.link-remove { padding: 1px 7px; cursor: pointer; font-size: 11px; }
+.area-link-form { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 2fr) auto; gap: 8px; margin: 8px 0; }
+.area-link-form input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: #0e1623; }
+.todo-answer { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.quick-answer { padding: 5px 12px; }
 .copy-block { display: flex; gap: 6px; align-items: flex-start; margin: 6px 0; }
 .copy-block code { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #0a111b; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rich-text { margin: 0 0 4px; overflow-wrap: anywhere; white-space: pre-wrap; }
@@ -559,6 +587,53 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     return Array.isArray(task.thread) ? task.thread : [];
   }
 
+  // One-tap answers to a task that waits for the user (see "answer" in todo()).
+  const QUICK = {
+    ok: {label: 'Send OK', text: 'OK, go ahead.', title: 'Tell the agent you agree, so it continues'},
+    done: {label: 'Done', text: 'Done: I ran the command. Please check the result and continue.',
+           title: 'Tell the agent you ran the command'}
+  };
+
+  function todoItem(num) {
+    for (const group of (currentState && currentState.todo) || []) {
+      const item = (group.items || []).find(entry => entry.num === num);
+      if (item) return item;
+    }
+    return null;
+  }
+
+  function quickButton(num, owner, answer, onStatus) {
+    const quick = QUICK[answer];
+    const button = node('button', 'reply-submit quick-answer', quick.label);
+    button.type = 'button';
+    button.title = quick.title + ' (sends: "' + quick.text + '")';
+    button.disabled = !owner || replyPending.has(num);
+    button.addEventListener('click', async event => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.disabled = true;
+      replyPending.add(num);
+      try {
+        const response = await fetch('reply' + window.location.search, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({task: num, text: quick.text})
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.text || ('Reply request returned HTTP ' + response.status));
+        replyFeedback.set(num, {kind: 'success', text: '"' + quick.text + '" sent to ' + owner + '.'});
+      } catch (error) {
+        replyFeedback.set(num, {kind: 'error', text: quick.label + ' failed: ' +
+          (error instanceof Error ? error.message : String(error))});
+      } finally {
+        replyPending.delete(num);
+        if (onStatus) onStatus(replyFeedback.get(num));
+        await refresh();
+      }
+    });
+    return button;
+  }
+
   function replyForm(task) {
     const form = node('form', 'reply-form');
     const textarea = node('textarea');
@@ -583,7 +658,10 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     status.textContent = replyPending.has(task.num) ? 'Sending to the assigned agent…' :
       (feedback ? feedback.text : (task.owner ? 'The assigned agent is notified immediately.' : 'Assign an agent before sending a reply.'));
     const actions = node('div', 'reply-actions');
-    actions.append(submit, status);
+    actions.append(submit);
+    const quick = todoItem(task.num);
+    if (quick && QUICK[quick.answer]) actions.append(quickButton(task.num, task.owner, quick.answer));
+    actions.append(status);
     if (!['done', 'dropped'].includes(task.status)) actions.append(dropButton(task, status));
     form.append(textarea, actions);
     form.addEventListener('submit', event => {
@@ -829,6 +907,15 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         li.title = item.reason;
         li.append(line, node('div', 'todo-meta', (item.title || '') + ' · ' + (item.owner || 'no owner')));
         if (item.command) li.append(copyBlock(item.command));
+        if (QUICK[item.answer]) {
+          const row = node('div', 'todo-answer');
+          const feedback = replyFeedback.get(item.num);
+          const note = node('span', 'reply-status' + (feedback ? ' ' + feedback.kind : ''), feedback ? feedback.text : '');
+          row.append(quickButton(item.num, item.owner, item.answer, result => {
+            if (result) { note.textContent = result.text; note.className = 'reply-status ' + result.kind; }
+          }), note);
+          li.append(row);
+        }
         list.append(li);
       });
       details.append(summary, list);
@@ -878,6 +965,130 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     return STATUSES.every(s => shownStatuses.has(s));
   }
 
+  function areaInfo(area) {
+    const areas = (currentState && currentState.areas) || {};
+    const info = areas[String(area || '').trim().toLowerCase()] || {};
+    return {links: info.links || {}, notes: Array.isArray(info.notes) ? info.notes : []};
+  }
+
+  function safeUrl(url) {
+    return /^https?:\/\//i.test(String(url || '')) ? String(url) : null;
+  }
+
+  // A link to an area's web page, shown in the area's title row.
+  function linkChip(label, url) {
+    const href = safeUrl(url);
+    if (!href) return node('span');
+    const link = node('a', 'area-link', '↗ ' + label);
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.title = href;
+    link.addEventListener('click', event => event.stopPropagation());
+    return link;
+  }
+
+  const areaDrafts = new Map();  // area -> note being written
+  const areaFeedback = new Map();
+
+  function areaDetails(area, info) {
+    const box = node('details', 'section area-details');
+    const id = 'area:' + area;
+    box.open = openSections.has(id) ? openSections.get(id) : false;
+    box.addEventListener('toggle', () => openSections.set(id, box.open));
+    const summary = node('summary', 'section-title');
+    summary.append(node('span', 'disclosure', '▶'),
+      node('span', '', 'Area details · ' + Object.keys(info.links).length + ' links · ' + info.notes.length + ' notes'));
+    box.append(summary, node('p', 'section-hint',
+      'Web pages and notes for the whole area, shared with every agent. Agents add links with: wl area ' +
+      area + ' --link URL --label NAME'));
+
+    const links = node('ul', 'area-links');
+    Object.entries(info.links).forEach(([label, url]) => {
+      const li = node('li');
+      const href = safeUrl(url);
+      const link = node('a', '', label);
+      if (href) { link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
+      const remove = node('button', 'link-remove', 'Remove');
+      remove.type = 'button';
+      remove.addEventListener('click', () => {
+        if (window.confirm('Remove the link "' + label + '" from ' + area + '?')) void areaPost(area, {unlink: label});
+      });
+      li.append(link, node('span', 'note-meta', ' ' + url + ' '), remove);
+      links.append(li);
+    });
+    if (Object.keys(info.links).length) box.append(links);
+
+    const linkForm = node('form', 'area-link-form');
+    const label = node('input');
+    label.placeholder = 'Label (e.g. Dashboard)';
+    label.maxLength = 60;
+    const url = node('input');
+    url.type = 'url';
+    url.placeholder = 'https://…';
+    url.required = true;
+    const addLink = node('button', 'reply-submit', 'Add link');
+    addLink.type = 'submit';
+    linkForm.append(label, url, addLink);
+    linkForm.addEventListener('submit', event => {
+      event.preventDefault();
+      void areaPost(area, {link: url.value.trim(), label: label.value.trim()});
+    });
+    box.append(linkForm);
+
+    const noteForm = node('form', 'reply-form');
+    const textarea = node('textarea');
+    textarea.maxLength = 4000;
+    textarea.placeholder = 'Add a note for the ' + area + ' area…';
+    textarea.value = areaDrafts.get(area) || '';
+    textarea.addEventListener('input', () => areaDrafts.set(area, textarea.value));
+    const addNote = node('button', 'reply-submit', 'Add note');
+    addNote.type = 'submit';
+    const feedback = areaFeedback.get(area);
+    const status = node('p', 'reply-status' + (feedback ? ' ' + feedback.kind : ''), feedback ? feedback.text : '');
+    const actions = node('div', 'reply-actions');
+    actions.append(addNote, status);
+    noteForm.append(textarea, actions);
+    noteForm.addEventListener('submit', event => {
+      event.preventDefault();
+      if (!textarea.value.trim()) return;
+      void areaPost(area, {note: textarea.value.trim()}, () => areaDrafts.delete(area));
+    });
+    box.append(noteForm);
+
+    if (info.notes.length) {
+      const list = node('ol', 'notes');
+      info.notes.slice().reverse().forEach(note => {
+        const item = node('li', 'note');
+        const meta = node('div', 'note-meta');
+        meta.append(node('span', 'entry-kind log', 'Area note'),
+          document.createTextNode(' ' + (note.by || 'Unknown') + ' · ' + formatTime(note.at)));
+        item.append(meta, richText(note.text, 'note-text'));
+        list.append(item);
+      });
+      box.append(list);
+    }
+    return box;
+  }
+
+  async function areaPost(area, fields, onSuccess) {
+    try {
+      const response = await fetch('area' + window.location.search, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(Object.assign({area: area}, fields))
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.text || ('Area request returned HTTP ' + response.status));
+      if (onSuccess) onSuccess();
+      areaFeedback.set(area, {kind: 'success', text: 'Saved.'});
+    } catch (error) {
+      areaFeedback.set(area, {kind: 'error', text: 'Failed: ' + (error instanceof Error ? error.message : String(error))});
+    }
+    openSections.set('area:' + area, true);
+    await refresh();
+  }
+
   function renderTasks() {
     if (!currentState) return;
     const tasks = Array.isArray(currentState.tasks) ? currentState.tasks : [];
@@ -905,12 +1116,12 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
         area === [...groups.keys()].sort((a, b) => a.localeCompare(b))[0];
       details.addEventListener('toggle', () => openAreas.set(area, details.open));
       const summary = node('summary');
-      summary.append(
-        node('span', 'disclosure', '▶'),
-        node('span', 'area-name', area || 'Unassigned'),
-        node('span', 'area-total', groupTasks.length + (groupTasks.length === 1 ? ' task' : ' tasks'))
-      );
+      const info = areaInfo(area);
+      summary.append(node('span', 'disclosure', '▶'), node('span', 'area-name', area || 'Unassigned'));
+      Object.entries(info.links).forEach(([label, url]) => summary.append(linkChip(label, url)));
+      summary.append(node('span', 'area-total', groupTasks.length + (groupTasks.length === 1 ? ' task' : ' tasks')));
       const list = node('div', 'area-tasks');
+      if (area) list.append(areaDetails(area, info));
       groupTasks.forEach(task => list.append(taskNode(task)));
       details.append(summary, list);
       areas.append(details);
@@ -990,8 +1201,13 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
     renderHistory(Array.isArray(data.history) ? data.history : []);
   }
 
-  async function refresh() {
-    if (inFlight) return;
+  function typing() {
+    const el = document.activeElement;
+    return !!el && el !== search && ['TEXTAREA', 'INPUT'].includes(el.tagName) && !!el.closest('#areas');
+  }
+
+  async function refresh(auto) {
+    if (inFlight || (auto === true && typing())) return;
     inFlight = true;
     refreshButton.disabled = true;
     errorBox.hidden = true;
@@ -1012,7 +1228,7 @@ footer { margin-top: 22px; color: #718299; font-size: 11px; text-align: center; 
 
   function schedule() {
     if (timer !== null) window.clearInterval(timer);
-    timer = autoRefresh.checked ? window.setInterval(refresh, 10000) : null;
+    timer = autoRefresh.checked ? window.setInterval(() => refresh(true), 10000) : null;
   }
 
   search.addEventListener('input', renderTasks);

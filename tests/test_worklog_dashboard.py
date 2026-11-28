@@ -128,7 +128,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_empty_state_is_json_safe(self):
         self.assertEqual(snapshot(Worklog(), "none", now=0.0), {
-            "generated_at": 0.0, "machine": "none", "tasks": [], "todo": [], "workers": [], "leases": [], "history": [],
+            "generated_at": 0.0, "machine": "none", "tasks": [], "todo": [], "areas": {}, "workers": [], "leases": [], "history": [],
         })
 
 
@@ -158,7 +158,8 @@ class PageTests(unittest.TestCase):
         self.assertIn("node('button', 'stat'", self.html)
         self.assertIn("card.setAttribute('aria-pressed'", self.html)
         self.assertIn("Auto-refresh every 10s", self.html)
-        self.assertIn("window.setInterval(refresh, 10000)", self.html)
+        self.assertIn("window.setInterval(() => refresh(true), 10000)", self.html)
+        self.assertIn("if (inFlight || (auto === true && typing())) return;", self.html)
         self.assertIn("fetch('state' + window.location.search", self.html)
         self.assertIn("if (!response.ok)", self.html)
         self.assertIn('role="alert"', self.html)
@@ -273,6 +274,63 @@ class TodoTests(unittest.TestCase):
         self.assertIn("fetch('drop' + window.location.search", html)
         self.assertIn("window.prompt(", html)
         self.assertIn("if (reason === null) return;", html)
+
+
+
+class AnswerTests(unittest.TestCase):
+    def test_one_tap_answers(self):
+        from harness.worklog_dashboard import _answer
+        self.assertEqual(_answer("run", "On host-a, run: sudo x"), "done")
+        self.assertEqual(_answer("approve", "waits for the user's explicit go-ahead"), "ok")
+        self.assertEqual(_answer("decide", "Needs user OK: push 15266e0 to GitHub"), "ok")
+        self.assertEqual(_answer("decide", "needs user review: options in desc"), "")
+        self.assertEqual(_answer("decide", "Waiting for you to pick dev or dev_hh"), "")
+        self.assertEqual(_answer("device", "device test on the Pixel needs the user"), "")
+
+    def test_todo_items_carry_the_answer(self):
+        st = Worklog()
+        st.tasks[1] = Task(1, "Push", status="blocked", owner="a@b", result="Needs user OK: push to main")
+        st.tasks[2] = Task(2, "Key", status="blocked", owner="a@b", result="On host-a, run: echo k")
+        answers = {i["num"]: i["answer"] for g in todo(st) for i in g["items"]}
+        self.assertEqual(answers, {1: "ok", 2: "done"})
+
+    def test_page_offers_send_ok_and_done(self):
+        html = page()
+        self.assertIn("label: 'Send OK', text: 'OK, go ahead.'", html)
+        self.assertIn("label: 'Done', text: 'Done: I ran the command.", html)
+        self.assertIn("if (quick && QUICK[quick.answer]) actions.append(quickButton(", html)
+        self.assertIn("if (QUICK[item.answer]) {", html)
+
+
+class AreaTests(unittest.TestCase):
+    def test_area_links_and_notes_in_snapshot_and_wl(self):
+        from harness.worklog import run_command
+        st = Worklog()
+        base = (int(1.8e12) - 1420070400000) << 22
+
+        def apply(i, argv, who="a@b"):
+            return st.apply(base + (i << 22), run_command(st, argv, who, set())[1])
+
+        self.assertTrue(apply(1, ["area", "Placeframe", "--link", "https://x.ts.net/m", "--label", "Mapper"])[0])
+        self.assertTrue(apply(2, ["area", "placeframe", "--note", "Restart with `mapper/restart.sh`"], "jo@x")[0])
+        self.assertFalse(apply(3, ["area", "placeframe", "--link", "javascript:alert(1)"])[0])
+        self.assertFalse(apply(4, ["area", "placeframe", "--unlink", "Nope"])[0])
+        self.assertTrue(apply(5, ["area", "placeframe", "--link", "https://x.ts.net/v", "--label", "Viewer"])[0])
+        self.assertTrue(apply(6, ["area", "placeframe", "--unlink", "Viewer"])[0])
+        data = snapshot(st, "m", now=1.0)["areas"]
+        self.assertEqual(list(data), ["placeframe"])
+        self.assertEqual(data["placeframe"]["links"], {"Mapper": "https://x.ts.net/m"})
+        self.assertEqual(data["placeframe"]["notes"][0]["by"], "jo@x")
+        shown = run_command(st, ["area", "placeframe"], "a@b", set())[0]
+        self.assertIn("Mapper: https://x.ts.net/m", shown)
+        self.assertIn("Restart with", shown)
+
+    def test_page_has_area_details_with_safe_links(self):
+        html = page()
+        self.assertIn("if (area) list.append(areaDetails(area, info));", html)
+        self.assertIn("return /^https?:\\/\\//i.test(String(url || ''))", html)
+        self.assertIn("link.rel = 'noopener noreferrer';", html)
+        self.assertIn("fetch('area' + window.location.search", html)
 
 
 if __name__ == "__main__":

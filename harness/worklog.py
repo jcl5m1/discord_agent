@@ -30,7 +30,7 @@ GONE_AFTER_TERMINAL = 86400  # ... and a worker no harness bot runs (a terminal 
 STALE_AFTER = CHECKIN_EVERY  # a worker not seen for this long (or holding a lapsed claim) is stale
 DISCORD_EPOCH_MS = 1420070400000
 OPS = {"register", "add", "claim", "checkin", "note", "done", "block", "release",
-       "reopen", "drop", "lease", "unlease", "send", "depends", "pass", "update", "updated"}
+       "reopen", "drop", "lease", "unlease", "send", "depends", "pass", "update", "updated", "area"}
 
 
 def event_time(event_id: int) -> float:
@@ -115,6 +115,9 @@ class Worklog:
         # `/update all` requests, by event id: who asked, when, where to report, and
         # each machine's result ({machine: {"ok", "text", "old", "new", "at"}}).
         self.updates: dict[int, dict] = {}
+        # Details per task area (the key is area_key(area)): web links (label -> URL)
+        # and notes [(time, by, text)].
+        self.areas: dict[str, dict] = {}
         self.last_id = 0
         self._event_id = 0
 
@@ -314,6 +317,31 @@ class Worklog:
         self.messages.append(Message(self._event_id, by, to, int(task) if task else None, t, text))
         return True, f"sent to {to}"
 
+    def _op_area(self, by, t, ev):
+        key = area_key(ev.get("area", ""))
+        if not key:
+            return False, "an area name is required"
+        info = self.areas.setdefault(key, {"name": str(ev.get("area", "")).strip(), "links": {}, "notes": []})
+        done = []
+        link, label = str(ev.get("link", "")).strip(), str(ev.get("label", "")).strip() or "Dashboard"
+        if link:
+            if not link.startswith(("http://", "https://")) or len(link) > 500 or " " in link:
+                return False, "a link must be an http(s) URL"
+            info["links"][label[:60]] = link
+            done.append(f"link {label[:60]}: {link}")
+        unlink = str(ev.get("unlink", "")).strip()
+        if unlink:
+            if info["links"].pop(unlink, None) is None:
+                return False, f"area {key} has no link {unlink!r}"
+            done.append(f"removed link {unlink}")
+        note = str(ev.get("note", "")).strip()
+        if note:
+            info["notes"].append((t, by, note[:4000]))
+            done.append("note added")
+        if not done:
+            return False, "nothing to change (give a link, unlink or note)"
+        return True, f"area {key}: " + "; ".join(done)
+
     def _op_update(self, by, t, ev):
         self.updates[self._event_id] = {
             "by": by, "at": t, "force": bool(ev.get("force")),
@@ -383,6 +411,11 @@ class _Parser(argparse.ArgumentParser):
         raise CommandError(f"{message}\n{self.format_usage()}")
 
 
+def area_key(area: str) -> str:
+    """The key area details are stored under: the task area, trimmed, in lower case."""
+    return str(area or "").strip().lower()
+
+
 def norm_area(area: str) -> str:
     return "-".join("".join(c if c.isalnum() else " " for c in str(area).lower()).split())
 
@@ -444,6 +477,9 @@ def _parser() -> _Parser:
     sub("pass", num, lambda sp: sp.add_argument("text"))
     sub("next")
     sub("areas", lambda sp: sp.add_argument("list", nargs="?"))
+    sub("area", lambda sp: sp.add_argument("name"), lambda sp: sp.add_argument("--link", default=""),
+        lambda sp: sp.add_argument("--label", default=""), lambda sp: sp.add_argument("--unlink", default=""),
+        lambda sp: sp.add_argument("--note", default=""))
     sub("claim", num, text)
     for name in ("checkin", "ci"):
         sub(name, num, lambda sp: sp.add_argument("text"))
@@ -474,6 +510,7 @@ HELP = f"""wl — the shared worklog for every agent on this Discord server (all
   wl add "title" [--desc ..] [--area ..] [--files a.py,b.py] [--prio 1-3] [--after 42,43]
   wl next                           the best open task in your areas
   wl areas [a,b,c]                  show or set the extra task areas you take work in
+  wl area NAME [--link URL --label L] [--unlink L] [--note ".."]   an area's web links and notes
   wl pass N "why you don't take it"  |  wl depends N --on 42,43  (N waits until they are done)
   wl claim N ["what you're starting, ≤{CHECKIN_WORDS} words"]
   wl checkin N "progress, ≤{CHECKIN_WORDS} words"     at least every {CHECKIN_EVERY // 60} min while you hold N
@@ -541,6 +578,16 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
             keys = sorted(area_keys(w, config.WORKLOG_AREA_ALIASES)) if w else []
             return f"{who} takes tasks in: " + (", ".join(keys) or "(none)"), None, []
         return "", {"op": "register", "by": who, "areas": [x for x in a.list.replace(",", " ").split()]}, []
+    if cmd == "area":
+        if not (a.link or a.unlink or a.note):
+            info = state.areas.get(area_key(a.name))
+            if not info:
+                return f"area {a.name}: no links or notes", None, []
+            lines = [f"area {a.name}:"] + [f"  {label}: {url}" for label, url in info["links"].items()]
+            lines += [f"  [{fmt_time(at)}] {by}: {text}" for at, by, text in info["notes"][-10:]]
+            return "\n".join(lines), None, []
+        return "", {"op": "area", "by": who, "area": a.name, "link": a.link, "label": a.label,
+                    "unlink": a.unlink, "note": a.note}, []
     if cmd == "next":
         w = state.workers.get(who.split("/")[0]) or state.workers.get(who)
         from . import config  # lazy: this module is otherwise free of harness settings
@@ -674,6 +721,10 @@ def summary(ev: dict) -> str:
         "pass": f"↪️ {by} passes on #{num}: {text[:300]}",
         "lease": f"🔑 {by} leases {ev.get('res')} ({ev.get('ttl')}s): {ev.get('why', '')}",
         "unlease": f"🔓 {by} released lease {ev.get('res')}",
+        "area": f"🗂️ {by} on area {ev.get('area')}: " + "; ".join(x for x in (
+            f"{ev.get('label') or 'Dashboard'} {ev['link']}" if ev.get("link") else "",
+            f"removed {ev['unlink']}" if ev.get("unlink") else "",
+            str(ev.get("note", ""))[:300]) if x),
         "update": f"⬇️ {by} asks every harness to update" + (" (force)" if ev.get("force") else ""),
         "updated": ("✅" if ev.get("ok") else "❌") + f" {ev.get('machine')} update: {text[:300]}",
         "send": f"✉️ {by} → {ev.get('to')}" + (f" re #{ev['task']}" if ev.get("task") else "")

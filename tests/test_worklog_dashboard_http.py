@@ -26,7 +26,7 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
                 return web.Response(status=403, text="bad token")
             if request.path == "/":
                 return web.Response(text="<html>worklog</html>", content_type="text/html")
-            if request.path in ("/reply", "/drop"):
+            if request.path in ("/reply", "/drop", "/area"):
                 self.replies.append((request.headers.get("Content-Type"), await request.json()))
                 return web.json_response({"ok": True, "text": "sent"})
             return web.json_response({"tasks": [], "echo": request.query.get("echo")})
@@ -36,6 +36,7 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
         self.upstream.app.router.add_get("/state", upstream)
         self.upstream.app.router.add_post("/reply", upstream)
         self.upstream.app.router.add_post("/drop", upstream)
+        self.upstream.app.router.add_post("/area", upstream)
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
         self.port_patch = mock.patch.object(config, "WORKLOG_PORT", self.upstream.port)
@@ -77,6 +78,11 @@ class WorklogProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests, [("/drop", "good-token", "")])
         response = await self.client.get("/agents/_worklog/good-token/drop")
         self.assertEqual(response.status, 405)
+
+    async def test_area_forwards_json_body(self):
+        response = await self.client.post("/agents/_worklog/good-token/area", json={"area": "x", "note": "hi"})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.requests, [("/area", "good-token", "")])
 
     async def test_rejects_bad_tokens_methods_and_arbitrary_paths(self):
         response = await self.client.get("/agents/_worklog/wrong/state")
