@@ -258,5 +258,19 @@ class CommandTests(unittest.TestCase):
             run_command(Worklog(), "claim notanumber", "a", set())
 
 
+
+class BusyStatusTests(unittest.TestCase):
+    def test_ready_work_waiting_on_an_active_turn_is_visible(self):
+        log = Log()
+        log.wl(0, "a@m", 'register --desc "kimi in /x"')
+        log.wl(1, "a@m", 'add "Finish the feature" --area x')
+        activity = "turn running 40m, last output 35m ago, 240 tools"
+        text = run_command(log.state, "status", "", set(), now=T0 + 60,
+                           busy={"a@m": activity})[0]
+        self.assertIn(activity, text)
+        self.assertIn("Ready tasks waiting on active turns:", text)
+        self.assertIn("a@m: " + activity + "; ready: #1", text)
+
+
 if __name__ == "__main__":
     unittest.main()

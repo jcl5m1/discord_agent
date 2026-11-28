@@ -1062,7 +1062,7 @@ async def on_ready() -> None:
     if config.WORKLOG_ENABLED and worklog is None and (g := client.get_guild(config.GUILD_ID)):
         worklog = WorklogService(
             client, _worklog_deliver, _worklog_notify, _worklog_idle_for, _worklog_active,
-            on_update=_worklog_update,
+            on_update=_worklog_update, activity=_worklog_activity,
         )
         asyncio.get_running_loop().create_task(_start_worklog(g))
     elif worklog is not None and worklog.ready.is_set():
@@ -1283,6 +1283,22 @@ async def _health_loop() -> None:
 def _worklog_active(worker: str) -> bool:
     inst = _instance_for_worker(worker)
     return bool(inst and inst.channel_id in _active_turns)
+
+
+def _worklog_activity(worker: str) -> str | None:
+    """A short description of the worker's active turn for `wl status`."""
+    inst = _instance_for_worker(worker)
+    if inst is None:
+        return None
+    turn = _active_turns.get(inst.channel_id)
+    if turn is None:
+        lock = _channel_locks.get(inst.channel_id)
+        return "channel busy between turns" if lock is not None and lock.locked() else None
+    if turn.get("waiting_background"):
+        return None  # work can be offered into the running session
+    return (f"turn running {_fmt_duration(time.time() - turn['started_at'])}, "
+            f"last output {_fmt_duration(time.time() - turn['last_event_at'])} ago, "
+            f"{turn['tools']} tools")
 
 
 def _worklog_idle_for(worker: str) -> float | None:

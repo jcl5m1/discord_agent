@@ -64,6 +64,7 @@ class WorklogService:
         idle_for: Callable[[str], float | None] | None = None,
         active: Callable[[str], bool] | None = None,
         on_update: Callable[[int, dict], Awaitable[None]] | None = None,
+        activity: Callable[[str], str | None] | None = None,
     ):
         """deliver(worker, sender, text) hands a message to that worker's agent;
         notify(worker, text) posts a line in that worker's Discord channel;
@@ -72,6 +73,7 @@ class WorklogService:
         while its provider process still exists. on_update(request id, request) runs
         this machine's part of an `/update all` request."""
         self.on_update = on_update
+        self.activity = activity  # activity(worker): its active turn, for `wl status`
         self.idle_for = idle_for
         self.active = active
         self._offers: dict[int, tuple[str, float]] = {}  # task -> (worker, when) it was last offered
@@ -674,8 +676,13 @@ class WorklogService:
         if argv[:1] == ["wait"] and not self._has_harness(worker):
             await self._wait_for_mail(worker, argv)
         try:
+            busy = {}
+            if self.activity is not None:
+                for name in self.my_workers():
+                    if text := self.activity(name):
+                        busy[name] = text
             text, ev, read = run_command(self.state, argv, worker, self.reads(worker),
-                                         live=self.live_workers(), machine=self.machine)
+                                         live=self.live_workers(), machine=self.machine, busy=busy)
         except CommandError as e:
             return False, str(e)
         if read:

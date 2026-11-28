@@ -318,6 +318,12 @@ class TwoBotTests(unittest.IsolatedAsyncioTestCase):
             (2, "bob@m2", "jo@example.com", "(re #1) (to bob@m2/sub-1) Is this still blocked?"),
         ])
 
+    async def test_status_passes_through_active_turn_details(self):
+        self.a.activity = lambda w: "turn running 40m, last output 35m ago" if w == "alice@m1" else None
+        ok, text = await self.a.run(["status", "--all"], "")
+        self.assertIn("alice@m1", text)
+        self.assertIn("turn running 40m, last output 35m ago", text)
+
     async def test_terminal_sessions_lapsed_claim_released_once(self):
         await self.a.run(["add", "Migrate hdd"], "alice@m1")
         await self.b.run(["claim", "1"], "term@m2")  # a terminal session using bot b's wl

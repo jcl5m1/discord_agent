@@ -535,7 +535,7 @@ def _task_line(t: Task, now: float) -> str:
 
 def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[int],
                 now: float | None = None, live: set[str] | None = None,
-                machine: str = "") -> tuple[str, dict | None, list[int]]:
+                machine: str = "", busy: dict[str, str] | None = None) -> tuple[str, dict | None, list[int]]:
     """Run a `wl` command for `worker`.
 
     Returns (text to print, event to post or None, message ids now read). For a
@@ -656,7 +656,8 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         for w in sorted(shown, key=lambda w: -w.seen):
             st = "stale" if state.is_stale(w.name, now) else "active"
             where = f" on {w.machine}" if w.machine else ""
-            out.append(f"  {w.name:<34} {st:<6} seen {fmt_time(w.seen)}{where}  {w.desc}")
+            activity = f"  ({busy[w.name]})" if busy and w.name in busy else ""
+            out.append(f"  {w.name:<34} {st:<6} seen {fmt_time(w.seen)}{where}  {w.desc}{activity}")
         if hidden:
             out.append(f"  ({hidden} gone: no harness instance on {machine or 'this machine'}, or unseen "
                        f"{GONE_AFTER // 86400} days (terminal sessions {GONE_AFTER_TERMINAL // 3600} h, subagents "
@@ -670,6 +671,21 @@ def run_command(state: Worklog, argv: list[str] | str, worker: str, read: set[in
         open_ = [t for t in sorted(state.tasks.values(), key=lambda t: (t.prio, t.num))
                  if t.status not in ("done", "dropped")]
         out += [_task_line(t, now) for t in open_] or ["  (none)"]
+        # Ready work that waits only because its agent is in a long turn (from the Acer patch, #189).
+        held = []
+        if busy:
+            from . import config
+            for name, activity in sorted(busy.items()):
+                w = state.workers.get(name)
+                if w is None:
+                    continue
+                keys = area_keys(w, config.WORKLOG_AREA_ALIASES)
+                tasks = [t for t in state.ready(name) if area_matches(t.area, keys)]
+                if tasks:
+                    held.append(f"  {name}: {activity}; ready: " + ", ".join(f"#{t.num}" for t in tasks))
+        if held:
+            out.append("Ready tasks waiting on active turns:")
+            out += held
         if who:
             out.append(f"Unread for {who}: {len(state.inbox(who, read))}")
         return "\n".join(out), None, []
